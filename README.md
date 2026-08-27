@@ -2,6 +2,8 @@
 
 A **human-in-the-loop review plugin for Paseo**. When an Agent finishes a change in a Paseo workspace (worktree), reviewing the result across many files is awkward — you have to keep viewing diffs, annotate them, feed your feedback back to an Agent, and clean up afterwards. Review Deck turns a Git changeset into a **navigable review workspace**: browse files and hunks, leave comments right next to the exact diff, collect them in a project queue, and let one Agent process all of them at once.
 
+![Review Deck — human-in-the-loop review workspace for Paseo](pic/screenshot.png)
+
 ## The problem
 
 After an Agent works in a Paseo workspace, the changes are spread across many files, hunks, and commits. A careful human review means:
@@ -25,6 +27,20 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
 | Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
 | Bilingual UI | English and 中文 (Chinese) |
+
+```mermaid
+flowchart TB
+    A["Open Review Deck<br/><i>defaults to the workspace it was opened from</i>"] --> B["Choose project / workspace<br/><i>selection opens the workspace in Paseo</i>"]
+    B --> C["Browse changed files<br/>with the exact diff"]
+    C --> D["Write one file-level comment<br/><i>anchored to the reviewed hunk</i>"]
+    D --> E{"More files to review?"}
+    E -- "yes" --> C
+    E -- "no" --> F["Project comments queue<br/><i>every saved comment, grouped by file</i>"]
+    F --> G["Pick an Agent of the selected workspace"]
+    G --> H["Process all saved comments<br/>in one Agent run"]
+    H --> I["Per-comment outcomes:<br/>completed / stale / failed / unresolved"]
+    I --> J["Delete only clearly completed comments<br/><i>stale, failed and new ones are kept — never automatic</i>"]
+```
 
 ## Usage
 

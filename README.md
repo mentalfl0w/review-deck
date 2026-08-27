@@ -26,6 +26,7 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | AI review & explain | Explain a hunk with local rules or ask an Agent for an AI explanation; run a full review of the changeset with an Agent; results separate verified facts from AI inference |
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
 | Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
+| File-level actions | Mark a whole file reviewed in one tap, ask an Agent to explain a whole file, or revert all of a file's changes at once — comment-anchored hunks are skipped automatically |
 | Bilingual UI | English and 中文 (Chinese) |
 
 ```mermaid
@@ -42,6 +43,51 @@ flowchart TB
     I --> J[Delete only completed comments]
     J -.-> K[Stale, failed and new comments are kept]
 ```
+
+## Architecture
+
+The plugin is a three-layer Paseo plugin: a React Native panel, a typed RPC contract file, and a server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
+
+```mermaid
+flowchart LR
+    subgraph panel["client/ — React Native panel"]
+        Panel["ReviewDeckPanel"]
+        Hooks["hooks/ — scope · snapshot · actions<br/>agent review · comments · file view"]
+        UI["components/ — file navigator · file detail<br/>hunk card · diff view · file view"]
+        Panel --> Hooks
+        Panel --> UI
+    end
+
+    subgraph shared["review.shared.ts"]
+        RPC["zod schemas + defineRpc contracts"]
+    end
+
+    subgraph server["server/ — service layer"]
+        Wire["index.server.ts — RPC wiring"]
+        Svc["ReviewService"]
+        Git["GitRunner"]
+        Parse["DiffParser · FindingDetector"]
+        Store["StateStore"]
+        Wire --> Svc
+        Svc --> Git
+        Svc --> Parse
+        Svc --> Store
+    end
+
+    Agents["Paseo Agents"]
+    Repo[("workspace repo")]
+    State[("reviews.json")]
+
+    Panel -- "useRpc" --> RPC
+    RPC --> Wire
+    Git -- "git -C <cwd>" --> Repo
+    Store --> State
+    Svc -- "comment batch · explanation · review" --> Agents
+```
+
+- **client/** owns presentation and intent only — every mutation goes through an RPC.
+- **review.shared.ts** is the single source of truth for request/response shapes (zod), imported by both sides.
+- **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` owns atomic JSON persistence, `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
 
 ## Usage
 

@@ -118,6 +118,11 @@ export const explainHunkAi = defineRpc({
   input: reviewRequestSchema.extend({ hunkId: z.string().min(1), agentId: z.string().min(1) }),
   output: explainHunkAiResultSchema,
 });
+export const explainFile = defineRpc({
+  name: "review-deck.explain-file",
+  input: reviewRequestSchema.extend({ filePath: z.string().min(1) }),
+  output: explainHunkResultSchema,
+});
 export const hunkDecision = defineRpc({
   name: "review-deck.hunk-decision",
   input: z.object({
@@ -187,10 +192,30 @@ export const rejectHunk = defineRpc({
   }),
   output: z.object({ targetFingerprint: z.string(), removedHunkId: z.string() }),
 });
+export const revertFile = defineRpc({
+  name: "review-deck.revert-file",
+  input: reviewRequestSchema.extend({
+    filePath: z.string().min(1),
+    expectedTargetFingerprint: z.string().min(1),
+    skipPatches: z.array(z.string()).default([]),
+  }),
+  output: z.object({ reverted: z.number().int(), skipped: z.number().int(), failed: z.number().int() }),
+});
+
+export const reviewStateCurrentHunkSchema = z.object({
+  hunkId: z.string().min(1),
+  filePath: z.string().min(1),
+  hunkHeader: z.string().min(1),
+  hunkPatch: z.string().min(1),
+});
+export type ReviewStateCurrentHunk = z.infer<typeof reviewStateCurrentHunkSchema>;
 
 export const getReviewState = defineRpc({
   name: "review-deck.state",
-  input: z.object({ targetFingerprint: z.string().min(1) }),
+  input: z.object({
+    targetFingerprint: z.string().min(1),
+    currentHunks: z.array(reviewStateCurrentHunkSchema).optional(),
+  }),
   output: z.object({
     decisions: z.array(
       z.object({
@@ -201,6 +226,24 @@ export const getReviewState = defineRpc({
       }),
     ),
   }),
+});
+export const fileViewRowSchema = z.object({
+  kind: z.enum(["context", "add", "del"]),
+  text: z.string(),
+  hunkId: z.string().nullable(),
+  oldLine: z.number().int().nullable(),
+  newLine: z.number().int().nullable(),
+});
+export type FileViewRow = z.infer<typeof fileViewRowSchema>;
+
+export const getFileView = defineRpc({
+  name: "review-deck.file-view",
+  input: reviewRequestSchema.extend({
+    filePath: z.string().min(1),
+    targetFingerprint: z.string().min(1),
+    hunks: z.array(reviewStateCurrentHunkSchema),
+  }),
+  output: z.object({ binary: z.boolean(), truncated: z.boolean(), rows: z.array(fileViewRowSchema) }),
 });
 export const projectReviewCommentSchema = z.object({
   id: z.string(),

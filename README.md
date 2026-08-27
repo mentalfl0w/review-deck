@@ -30,16 +30,17 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 
 ```mermaid
 flowchart TB
-    A["Open Review Deck<br/><i>defaults to the workspace it was opened from</i>"] --> B["Choose project / workspace<br/><i>selection opens the workspace in Paseo</i>"]
-    B --> C["Browse changed files<br/>with the exact diff"]
-    C --> D["Write one file-level comment<br/><i>anchored to the reviewed hunk</i>"]
-    D --> E{"More files to review?"}
-    E -- "yes" --> C
-    E -- "no" --> F["Project comments queue<br/><i>every saved comment, grouped by file</i>"]
-    F --> G["Pick an Agent of the selected workspace"]
-    G --> H["Process all saved comments<br/>in one Agent run"]
-    H --> I["Per-comment outcomes:<br/>completed / stale / failed / unresolved"]
-    I --> J["Delete only clearly completed comments<br/><i>stale, failed and new ones are kept — never automatic</i>"]
+    A[Open Review Deck] --> B[Choose project / workspace]
+    B --> C[Browse changed files]
+    C --> D[Write one file-level comment per file]
+    D --> E{More files to review?}
+    E -- yes --> C
+    E -- no --> F[Project comments queue]
+    F --> G[Pick an Agent of the selected workspace]
+    G --> H[Process all saved comments in one Agent run]
+    H --> I[Per-comment outcomes: completed / stale / failed / unresolved]
+    I --> J[Delete only completed comments]
+    J -.-> K[Stale, failed and new comments are kept]
 ```
 
 ## Usage

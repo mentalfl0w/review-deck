@@ -3,11 +3,9 @@ import { ReviewDeckPanel } from "./client/ReviewDeckPanel.client";
 import {
   clearAllReviewStates as clearAllReviewStatesRpc,
   clearHunkState as clearHunkStateRpc,
-  clearProjectReviewComments as clearProjectReviewCommentsRpc,
   clearReviewState as clearReviewStateRpc,
   explainHunk,
   explainFile,
-  explainHunkAi,
   getReviewState,
   getFileView,
   getSnapshot,
@@ -17,7 +15,9 @@ import {
   processProjectReview as processProjectReviewRpc,
   rejectHunk,
   revertFile,
-  runReview,
+  pollAiReview,
+  startExplainHunkAi,
+  startRunReview,
 } from "./review.shared";
  import { reviewService } from "./server/index.server";
 
@@ -28,10 +28,11 @@ export default function contribute(plugin: PluginContext) {
     const snapshot = await reviewService.createSnapshot(input);
     return reviewService.explain(snapshot, reviewService.findHunk(snapshot, input.hunkId), input.locale ?? "en");
   });
-  plugin.handle(explainHunkAi, async (input, context) => reviewService.explainHunkWithAgent(input, context));
   plugin.handle(explainFile, async (input) => reviewService.explainFile(input));
   plugin.handle(revertFile, async (input) => reviewService.revertFile(input));
-  plugin.handle(runReview, async (input, context) => reviewService.runAgentReview(input, context));
+  plugin.handle(startExplainHunkAi, async (input, context) => reviewService.startExplainHunkAi(input, context));
+  plugin.handle(startRunReview, async (input, context) => reviewService.startRunReview(input, context));
+  plugin.handle(pollAiReview, async ({ requestId }) => reviewService.pollAiReview({ requestId }));
   plugin.handle(hunkDecision, async (input) => ({
     savedAt: await reviewService.recordDecision(input),
   }));
@@ -54,9 +55,6 @@ export default function contribute(plugin: PluginContext) {
     project: await reviewService.listProjectReviewComments(projectId),
   }));
   plugin.handle(processProjectReviewRpc, async (input, context) => reviewService.processProjectReview(input, context));
-  plugin.handle(clearProjectReviewCommentsRpc, async ({ projectId, commentIds }) => ({
-    cleared: await reviewService.clearProjectReviewComments(projectId, commentIds),
-  }));
   plugin.handle(rejectHunk, async (input) =>
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),
   );

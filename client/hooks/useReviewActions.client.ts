@@ -288,13 +288,19 @@ export function useReviewActions(params: {
     }
   }, [activeCommentKey, baseRef, clearHunkRpc, commentAnchorHunkId, commentBody, decisionRpc, effectiveProjectId, headRef, originalCommentHunkId, projectIdentity, refreshProjectComments, reviewCwd, scope, selected, selectedWorkspaceId, snapshot, stateRpc, t]);
 
-  const clearCurrentHunk = useCallback(async () => {
-    if (!snapshot || !selected) return;
+  /**
+   * Clears the saved comment/decision of one hunk (saved record, local
+   * decisions mirror, and the draft when it belongs to that hunk), then
+   * refreshes the project comments. Shared by the clear-hunk action and the
+   * revise flows after a comment has been handed to the agent's workflow.
+   */
+  const clearHunkComment = useCallback(async (hunkId: string) => {
+    if (!snapshot) return;
     try {
       setActionError(null);
-      await clearHunkRpc({ targetFingerprint: snapshot.targetFingerprint, hunkId: selected.id });
-      setDecisions((current) => current.filter((decision) => decision.hunkId !== selected.id));
-      if (activeCommentKey && (commentAnchorHunkId === selected.id || originalCommentHunkId === selected.id)) {
+      await clearHunkRpc({ targetFingerprint: snapshot.targetFingerprint, hunkId });
+      setDecisions((current) => current.filter((decision) => decision.hunkId !== hunkId));
+      if (activeCommentKey && (commentAnchorHunkId === hunkId || originalCommentHunkId === hunkId)) {
         setFileCommentDrafts((current) => {
           const next = { ...current };
           delete next[activeCommentKey];
@@ -306,7 +312,12 @@ export function useReviewActions(params: {
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [activeCommentKey, clearHunkRpc, commentAnchorHunkId, originalCommentHunkId, refreshProjectComments, selected, snapshot]);
+  }, [activeCommentKey, clearHunkRpc, commentAnchorHunkId, originalCommentHunkId, refreshProjectComments, snapshot]);
+
+  const clearCurrentHunk = useCallback(() => {
+    if (!snapshot || !selected) return;
+    return clearHunkComment(selected.id);
+  }, [clearHunkComment, selected, snapshot]);
 
   const clearCurrentReview = useCallback(async () => {
     if (!snapshot) return;
@@ -462,6 +473,7 @@ export function useReviewActions(params: {
     revertNotice,
     saveComment,
     clearCurrentHunk,
+    clearHunkComment,
     clearCurrentReview,
     clearSavedTarget,
     clearAllSaved,

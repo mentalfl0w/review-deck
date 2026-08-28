@@ -87,21 +87,11 @@ export const reviewSectionsSchema = z.object({
 });
 export type ReviewSections = z.infer<typeof reviewSectionsSchema>;
 
-export const runReview = defineRpc({
-  name: "review-deck.run-review",
-  input: reviewRequestSchema.extend({ agentId: z.string().min(1) }),
-  output: z.object({
-    status: z.enum(["idle", "error", "permission", "timeout"]),
-    review: z.string(),
-    sections: reviewSectionsSchema,
-  }),
-});
 export const explainHunkResultSchema = z.object({
   hunkId: z.string(),
   verifiedFacts: z.array(z.string()),
   aiInference: z.array(z.string()),
   humanVerificationRecommended: z.array(z.string()),
-  revisionPrompt: z.string(),
 });
 export type ExplainHunkResult = z.infer<typeof explainHunkResultSchema>;
 
@@ -117,10 +107,35 @@ export const explainHunkAiResultSchema = explainHunkResultSchema.extend({
 });
 export type ExplainHunkAiResult = z.infer<typeof explainHunkAiResultSchema>;
 
-export const explainHunkAi = defineRpc({
-  name: "review-deck.explain-hunk-ai",
+// Async read-only AI review: the plugin host RPC layer times out long reviews,
+// so the read-only flows (AI评审变更块 / AI评审文件) start a transient child
+// agent with a start RPC and the client polls for the result.
+export const aiReviewStatusSchema = z.enum(["running", "idle", "error", "permission", "timeout"]);
+export type AiReviewStatus = z.infer<typeof aiReviewStatusSchema>;
+
+export const pollAiReviewResultSchema = z.object({
+  status: aiReviewStatusSchema,
+  review: z.string(),
+  sections: reviewSectionsSchema,
+  provider: z.string(),
+  model: z.string(),
+});
+export type PollAiReviewResult = z.infer<typeof pollAiReviewResultSchema>;
+
+export const startExplainHunkAi = defineRpc({
+  name: "review-deck.start-explain-hunk-ai",
   input: reviewRequestSchema.extend({ hunkId: z.string().min(1), agentId: z.string().min(1) }),
-  output: explainHunkAiResultSchema,
+  output: z.object({ requestId: z.string().min(1) }),
+});
+export const startRunReview = defineRpc({
+  name: "review-deck.start-run-review",
+  input: reviewRequestSchema.extend({ agentId: z.string().min(1) }),
+  output: z.object({ requestId: z.string().min(1) }),
+});
+export const pollAiReview = defineRpc({
+  name: "review-deck.poll-ai-review",
+  input: z.object({ requestId: z.string().min(1) }),
+  output: pollAiReviewResultSchema,
 });
 export const explainFile = defineRpc({
   name: "review-deck.explain-file",
@@ -287,25 +302,16 @@ export const listProjectReviewComments = defineRpc({
   output: z.object({ project: projectReviewSummarySchema.nullable() }),
 });
 
-export const projectReviewCommentOutcomeSchema = z.object({
-  id: z.string(),
-  status: z.enum(["completed", "stale", "failed", "unresolved"]),
-  detail: z.string().optional(),
-});
-export type ProjectReviewCommentOutcome = z.infer<typeof projectReviewCommentOutcomeSchema>;
+// processProjectReview hands every comment to the selected agent's workflow
+// (fire-and-forget; results appear in the agent's conversation) and removes the
+// comments from Review Deck — the result is a submission confirmation only.
 export const processProjectReviewResultSchema = z.object({
   projectId: z.string(),
   workspaceId: z.string(),
   workspaceCwd: z.string(),
-  status: z.enum(["idle", "error", "permission", "timeout"]),
   processedCommentIds: z.array(z.string()),
-  completedCommentIds: z.array(z.string()),
-  commentOutcomes: z.array(projectReviewCommentOutcomeSchema),
   commentCount: z.number().int().nonnegative(),
-  review: z.string(),
-  sections: reviewSectionsSchema,
-  provider: z.string(),
-  model: z.string(),
+  submittedAt: z.string(),
 });
 export type ProcessProjectReviewResult = z.infer<typeof processProjectReviewResultSchema>;
 
@@ -318,13 +324,4 @@ export const processProjectReview = defineRpc({
     workspaceCwd: z.string().min(1),
   }),
   output: processProjectReviewResultSchema,
-});
-
-export const clearProjectReviewComments = defineRpc({
-  name: "review-deck.clear-project-review-comments",
-  input: z.object({
-    projectId: z.string().min(1),
-    commentIds: z.array(z.string().min(1)).optional(),
-  }),
-  output: z.object({ cleared: z.number().int().nonnegative() }),
 });

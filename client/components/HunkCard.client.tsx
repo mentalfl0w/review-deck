@@ -13,9 +13,6 @@ import {
 } from "../diffView.client";
 import {
   diffModeKeys,
-  viewModeKeys,
-  type AgentFeedbackMap,
-  type AgentInfo,
   type DiffMode,
   type FileViewResult,
   type PanelLayout,
@@ -26,13 +23,13 @@ import {
 } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { ActionButton, FindingGroup, Segmented, StringGroup } from "./ui.client";
+import { ActionButton, FindingGroup, HoverTooltip, Segmented, StringGroup } from "./ui.client";
 import { DiffView } from "./DiffView.client";
 import { FileView } from "./FileView.client";
 
 /** A single change block: navigation, diff mode, review/reject/explain
- * actions, agent delegation rows, the diff body and the findings disclosure. */
-export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agents, agentFeedback, aiExplainBusy, commentBody, commentAnchorIsCurrent, onExplainWithAgent, onSendRevision, onSendFeedback, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections }: {
+ * actions, the diff or file-context body and the findings disclosure. */
+export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -43,7 +40,6 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   diffMode: DiffMode;
   onDiffModeChange: (mode: DiffMode) => void;
   viewMode: ViewMode;
-  onViewModeChange: (mode: ViewMode) => void;
   fileViewResult: FileViewResult | null;
   fileViewLoading: boolean;
   fileViewError: string | null;
@@ -53,16 +49,11 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   onMarkReviewed: () => void;
   onExplain: () => void;
   onReject: () => void;
-  agentsOpen: boolean;
-  onToggleAgentsOpen: () => void;
-  agents: AgentInfo[];
-  agentFeedback: AgentFeedbackMap;
+  agentsLoading: boolean;
+  selectedAgentId: string | null;
   aiExplainBusy: string | null;
-  commentBody: string;
-  commentAnchorIsCurrent: boolean;
   onExplainWithAgent: (agentId: string) => void;
-  onSendRevision: (agentId: string) => void;
-  onSendFeedback: (agent: AgentInfo) => void;
+  onOpenMore: () => void;
   findingsOpen: boolean;
   onToggleFindingsOpen: () => void;
   analysisStale: boolean;
@@ -73,8 +64,11 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
 }) {
   const selectedHeader = hunkHeaderParts(hunk.header);
   const selectedHunkIndex = file.hunks.findIndex((candidate) => candidate.id === hunk.id);
-  const diffModeOptions = useMemo(() => diffModeKeys.map((option) => ({ value: option.value, label: t(option.key) })), [t]);
-  const viewModeOptions = useMemo(() => viewModeKeys.map((option) => ({ value: option.value, label: t(option.key) })), [t]);
+  const diffModeOptions = useMemo(() => diffModeKeys.map((option) => ({
+    value: option.value,
+    label: t(option.key),
+    tooltip: t(option.value === "split" ? "diffModeSplitHint" : "diffModeUnifiedHint"),
+  })), [t]);
   const selectedPairs = useMemo(() => derivePairs(hunk), [hunk]);
   const unifiedRows = useMemo(() => deriveUnifiedRows(selectedPairs), [selectedPairs]);
   const effectiveDiffMode: DiffMode = layout.compact ? "unified" : diffMode;
@@ -82,13 +76,15 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   const verifiedFindings = selectedFindings.filter((finding) => finding.evidenceKind === "verified_fact");
   const inferenceFindings = selectedFindings.filter((finding) => finding.evidenceKind === "ai_inference");
   const humanFindings = selectedFindings.filter((finding) => finding.evidenceKind === "human_verification_recommended");
+  // The block-level agent actions always target the agent selected in More;
+  // there is no per-block agent list and no arbitrary array fallback.
   const agentHasSections = Boolean(
     agentSections &&
     (agentSections.verifiedFacts.length > 0 ||
       agentSections.aiInference.length > 0 ||
       agentSections.humanVerificationRecommended.length > 0),
   );
-  const diffContent = viewMode === "file" ? (
+  const diffContent = viewMode === "blockFile" ? (
     <FileView
       t={t}
       styles={styles}
@@ -104,17 +100,13 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
     <View>
       <View style={styles.blockToolbar}>
         <View style={styles.fileHeaderTop}>
-          <Text style={[styles.sectionEyebrow, { flex: 1 }]}>{t("currentDiff")}</Text>
-          <Segmented options={viewModeOptions} value={viewMode} onChange={onViewModeChange} theme={theme} layout={layout} />
-          {viewMode === "diff" && !layout.compact ? (
-            <Segmented options={diffModeOptions} value={effectiveDiffMode} onChange={onDiffModeChange} theme={theme} layout={layout} />
-          ) : null}
+          <Text style={styles.sectionEyebrow}>{t("currentDiff")}</Text>
         </View>
         <View style={styles.blockNavigation}>
           <ActionButton
             variant="ghost"
             label="‹"
-            hint={t("previousChangeBlock")}
+            tooltip={t("previousChangeBlock")}
             disabled={selectedHunkIndex <= 0}
             onPress={() => {
               const previous = file.hunks[selectedHunkIndex - 1];
@@ -132,7 +124,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
           <ActionButton
             variant="ghost"
             label="›"
-            hint={t("nextChangeBlock")}
+            tooltip={t("nextChangeBlock")}
             disabled={selectedHunkIndex < 0 || selectedHunkIndex >= file.hunks.length - 1}
             onPress={() => {
               const next = file.hunks[selectedHunkIndex + 1];
@@ -142,80 +134,56 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
             layout={layout}
           />
         </View>
-        <View style={styles.secondaryActions}>
-          <ScrollView
-            style={styles.agentActionsScroll}
-            contentContainerStyle={styles.agentActionsContent}
-            nestedScrollEnabled
-            showsVerticalScrollIndicator
-          >
-            <View style={styles.actionRow}>
+        <View style={styles.group}>
+          <Text style={styles.groupLabel}>{t("changeBlockActions")}</Text>
+          <View style={styles.actionRow}>
+            <ActionButton
+              variant="secondary"
+              label={reviewed ? t("markReviewedDone") : t("markReviewed")}
+              tooltip={currentHunkHasComment ? t("markReviewedUnavailable") : t("markReviewedHint")}
+              disabled={reviewed || currentHunkHasComment}
+              onPress={onMarkReviewed}
+              theme={theme}
+              layout={layout}
+            />
+            <ActionButton
+              variant="secondary"
+              label={t("ruleAnalyzeBlock")}
+              tooltip={t("ruleAnalyzeBlockHint")}
+              onPress={onExplain}
+              theme={theme}
+              layout={layout}
+            />
+            <ActionButton
+              variant="secondary"
+              label={aiExplainBusy !== null && aiExplainBusy === selectedAgentId ? t("aiReviewBlockBusyLabel") : t("aiReviewBlockLabel")}
+              tooltip={agentsLoading ? t("agentsLoading") : selectedAgentId ? t("aiReviewBlockHint") : t("agentActionNoAgentHint")}
+              disabled={agentsLoading || aiExplainBusy !== null}
+              onPress={() => {
+                if (selectedAgentId) void onExplainWithAgent(selectedAgentId);
+                else onOpenMore();
+              }}
+              theme={theme}
+              layout={layout}
+            />
+            {scope === "working" || scope === "staged" ? (
               <ActionButton
-                variant="secondary"
-                label={reviewed ? t("markReviewedDone") : t("markReviewed")}
-                hint={currentHunkHasComment ? t("markReviewedUnavailable") : undefined}
-                disabled={reviewed || currentHunkHasComment}
-                onPress={onMarkReviewed}
+                variant="danger"
+                label={t("rejectHunk")}
+                tooltip={t("rejectHunkHint")}
+                onPress={onReject}
                 theme={theme}
                 layout={layout}
               />
-              <ActionButton
-                variant="secondary"
-                label={t("explainHunk")}
-                onPress={onExplain}
-                theme={theme}
-                layout={layout}
-              />
-              {scope === "working" || scope === "staged" ? (
-                <ActionButton
-                  variant="danger"
-                  label={t("rejectHunk")}
-                  onPress={onReject}
-                  theme={theme}
-                  layout={layout}
-                />
-              ) : null}
-            </View>
-            {agents.length > 0 ? agents.map((agent) => {
-              const feedback = agentFeedback[agent.id] ?? { phase: "idle" as const };
-              return (
-                <View key={agent.id} style={styles.agentRow}>
-                  <Text numberOfLines={1} style={styles.routeFile}>{agent.title ?? agent.id}</Text>
-                  <Text numberOfLines={1} style={styles.routeMeta}>
-                    {agent.provider ?? "?"} · {agent.model ?? t("noAgentModel")}
-                  </Text>
-                  <View style={styles.actionRow}>
-                    <ActionButton
-                      variant="secondary"
-                      label={aiExplainBusy === agent.id ? t("aiExplaining") : t("aiExplainWithAgent", { agent: agent.title ?? agent.id })}
-                      disabled={aiExplainBusy !== null}
-                      onPress={() => void onExplainWithAgent(agent.id)}
-                      theme={theme}
-                      layout={layout}
-                    />
-                    <ActionButton
-                      variant="ghost"
-                      label={t("reviseWithAgent", { agentId: agent.id })}
-                      onPress={() => void onSendRevision(agent.id)}
-                      theme={theme}
-                      layout={layout}
-                    />
-                    <ActionButton
-                      variant="ghost"
-                      label={feedback.phase === "sending" ? t("sendingFeedback") : t("sendFeedbackToAgent", { agent: agent.title ?? agent.id })}
-                      disabled={!commentBody.trim() || !commentAnchorIsCurrent || feedback.phase === "sending"}
-                      onPress={() => void onSendFeedback(agent)}
-                      theme={theme}
-                      layout={layout}
-                    />
-                  </View>
-                  {feedback.phase === "sent" ? <Text style={styles.feedbackSent}>{t("feedbackSent")}</Text> : null}
-                  {feedback.phase === "error" ? <Text style={styles.feedbackError}>{feedback.message ?? t("feedbackSendFailed")}</Text> : null}
-                </View>
-              );
-            }) : <Text style={styles.muted}>{t("noAgents")}</Text>}
-          </ScrollView>
+            ) : null}
+          </View>
         </View>
+        {viewMode === "diff" && !layout.compact ? (
+          <View style={styles.diffLayoutRow}>
+            <Text style={styles.label}>{t("diffLayout")}</Text>
+            <Segmented options={diffModeOptions} value={effectiveDiffMode} onChange={onDiffModeChange} theme={theme} layout={layout} />
+          </View>
+        ) : null}
         {selectedHeader ? (
           <View style={styles.diffHeaderStrip}>
             <Text selectable style={styles.diffHeaderRange}>{selectedHeader.range}</Text>
@@ -234,13 +202,15 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
         {diffContent}
       </ScrollView>
 
-      <Pressable accessibilityRole="button" onPress={onToggleFindingsOpen} style={styles.findingsDisclosure}>
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={styles.sectionTitle}>{t("analysis")}</Text>
-          <Text style={styles.sectionSummary}>{t("findingsSummary", { count: selectedFindings.length })}</Text>
-        </View>
-        <Text style={styles.topButtonText}>{findingsOpen ? t("hideFindings") : t("showFindings")} {findingsOpen ? "▴" : "▾"}</Text>
-      </Pressable>
+      <HoverTooltip text={t("findingsToggleHint")} theme={theme} layout={layout}>
+        <Pressable accessibilityRole="button" onPress={onToggleFindingsOpen} style={styles.findingsDisclosure}>
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={styles.sectionTitle}>{t("analysis")}</Text>
+            <Text style={styles.sectionSummary}>{t("findingsSummary", { count: selectedFindings.length })}</Text>
+          </View>
+          <Text style={styles.topButtonText}>{findingsOpen ? t("hideFindings") : t("showFindings")} {findingsOpen ? "▴" : "▾"}</Text>
+        </Pressable>
+      </HoverTooltip>
       {findingsOpen ? (
         <View style={styles.findingsContent}>
           {analysisStale ? (
@@ -260,9 +230,9 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
             )}
             {explanation ? (
               <View style={styles.analysisBlock}>
-                <Text style={styles.label}>{t("deterministicExplainLabel")}</Text>
+                <Text style={styles.label}>{t("ruleAnalysisLabel")}</Text>
                 <StringGroup label={t("findingsVerified")} items={explanation.verifiedFacts} t={t} styles={styles} />
-                <StringGroup label={t("findingsInference")} items={explanation.aiInference} t={t} styles={styles} />
+                <StringGroup label={t("findingsUnproven")} items={explanation.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={explanation.humanVerificationRecommended} t={t} styles={styles} />
                 {explanation.verifiedFacts.length === 0 && explanation.aiInference.length === 0 && explanation.humanVerificationRecommended.length === 0 ? (
                   <Text style={styles.muted}>{t("noAdditionalAnalysis")}</Text>
@@ -271,7 +241,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
             ) : null}
             {aiExplanation ? (
               <View style={styles.analysisBlock}>
-                <Text style={styles.label}>{t("aiExplanationLabel", { provider: aiExplanation.provider, model: aiExplanation.model })}</Text>
+                <Text style={styles.label}>{t("aiReviewLabel", { provider: aiExplanation.provider, model: aiExplanation.model })}</Text>
                 <StringGroup label={t("findingsVerified")} items={aiExplanation.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsInference")} items={aiExplanation.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={aiExplanation.humanVerificationRecommended} t={t} styles={styles} />

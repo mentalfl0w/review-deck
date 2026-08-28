@@ -1,5 +1,5 @@
 import { ReviewService } from "./ReviewService.server";
-import type { AgentReviewResult, ReviewServiceDependencies } from "./ReviewService.server";
+import type { ReviewServiceDependencies } from "./ReviewService.server";
 
 /**
  * Process-wide singleton behind the plugin's RPC surface. Method signatures
@@ -13,4 +13,4 @@ const stopMaintenance = reviewService.startMaintenance(MAINTENANCE_INTERVAL_MS);
 process.once("beforeExit", stopMaintenance);
 
 export { ReviewService };
-export type { AgentReviewResult, ReviewServiceDependencies };
+export type { ReviewServiceDependencies };

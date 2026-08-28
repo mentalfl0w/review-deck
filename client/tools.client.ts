@@ -93,13 +93,6 @@ export const severityLabelKeys: Record<Severity, StringKey> = {
   informational: "severityInformational",
 };
 
-export const outcomeStatusKeys: Record<string, StringKey> = {
-  completed: "processResultOutcomeCompleted",
-  stale: "processResultOutcomeStale",
-  failed: "processResultOutcomeFailed",
-  unresolved: "processResultOutcomeUnresolved",
-};
-
 export const statusLabelKeys: Record<string, StringKey> = {
   idle: "statusIdle",
   running: "statusRunning",
@@ -149,12 +142,12 @@ export type ProjectCommentsByTarget = Array<{
   targetFingerprint: string;
   files: Array<{ filePath: string; comments: ProjectReviewComment[] }>;
 }>;
-
-export type ViewMode = "diff" | "file";
+export type ViewMode = "diff" | "blockFile" | "fullChanges";
 
 export const viewModeKeys: Array<{ value: ViewMode; key: StringKey }> = [
   { value: "diff", key: "diffViewMode" },
-  { value: "file", key: "fileViewMode" },
+  { value: "blockFile", key: "blockFileViewMode" },
+  { value: "fullChanges", key: "fullChangesViewMode" },
 ];
 
 export type FileViewRow = { kind: "context" | "add" | "del"; text: string; hunkId: string | null; oldLine?: number | null; newLine?: number | null };

@@ -6,6 +6,7 @@ import {
   severityLabelKeys,
   severityOrder,
   type CommentDraftsMap,
+  type PanelLayout,
   type PanelTheme,
   type ReviewDecision,
   type ReviewFile,
@@ -13,14 +14,15 @@ import {
 } from "../tools.client";
 import type { StringKey, TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { SeverityBadge } from "./ui.client";
+import { HoverTooltip, SeverityBadge } from "./ui.client";
 
 /** Left-hand file list split into unreviewed (default open) and reviewed
  * (default closed) collapsible sections; per-file severity, change summary
  * and comment status (draft/saved/uncommented) unchanged. Both section
  * headers remain visible even when their group is empty. */
-export function FileNavigator({ theme, t, styles, paneHeight, snapshot, decisions, fileCommentDrafts, selectedFile, selected, onSelectHunk, onClose }: {
+export function FileNavigator({ theme, layout, t, styles, paneHeight, snapshot, decisions, fileCommentDrafts, selectedFile, selected, onSelectHunk, onClose }: {
   theme: PanelTheme;
+  layout: PanelLayout;
   t: TFunc;
   styles: PanelStyles;
   paneHeight?: number;
@@ -122,16 +124,18 @@ export function FileNavigator({ theme, t, styles, paneHeight, snapshot, decision
       onHeightChange: (height: number) => void;
     },
   ) => (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityState={{ expanded: open }}
-      onLayout={(event) => onHeightChange(event.nativeEvent.layout.height)}
-      onPress={onToggle}
-      style={styles.fileSectionHeader}
-    >
-      <Text style={styles.fileSectionHeaderText}>{label}</Text>
-      <Text style={styles.fileMeta}>{open ? "▾" : "▸"}</Text>
-    </Pressable>
+    <HoverTooltip text={t("fileSectionToggleHint")} theme={theme} layout={layout}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        onLayout={(event) => onHeightChange(event.nativeEvent.layout.height)}
+        onPress={onToggle}
+        style={styles.fileSectionHeader}
+      >
+        <Text style={styles.fileSectionHeaderText}>{label}</Text>
+        <Text style={styles.fileMeta}>{open ? "▾" : "▸"}</Text>
+      </Pressable>
+    </HoverTooltip>
   );
   const renderFileList = (files: ReviewFile[], height?: number, showEmpty = false) => (
     <ScrollView
@@ -149,46 +153,54 @@ export function FileNavigator({ theme, t, styles, paneHeight, snapshot, decision
   );
   return (
     <View style={[styles.fileNavigator, paneHeight && paneHeight > 0 ? { height: paneHeight } : null]}>
-      <View
-        style={styles.navigatorHeader}
-        onLayout={(event) => {
-          const height = event.nativeEvent.layout.height;
-          setNavigatorHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
-        }}
+      <ScrollView
+        style={styles.fileNavigatorScroll}
+        contentContainerStyle={styles.fileNavigatorContent}
+        nestedScrollEnabled
+        scrollEnabled
+        showsVerticalScrollIndicator
       >
-        <Text style={styles.sectionEyebrow}>{t("fileNavigator")}</Text>
-        <Text style={styles.sectionSummary}>
-          {t("fileNavigatorSummary", { files: snapshot.files.length, hunks: snapshot.totalHunks })}
-        </Text>
-      </View>
-      <View style={pendingOpen ? styles.fileSection : styles.fileSectionCollapsed}>
-        {renderSectionHeader(t("pendingFilesSection", { count: unreviewedFiles.length }), {
-          open: pendingOpen,
-          onToggle: () => setPendingOpen((open) => !open),
-          onHeightChange: (height) => {
-            setPendingHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
-          },
-        })}
-        {pendingOpen && (!desktop || pendingListHeight > 0)
-          ? renderFileList(
-              unreviewedFiles,
-              desktop ? pendingListHeight : undefined,
-              snapshot.files.length === 0,
-            )
-          : null}
-      </View>
-      <View style={reviewedOpen ? styles.fileSection : styles.fileSectionCollapsed}>
-        {renderSectionHeader(t("reviewedFilesSection", { count: reviewedFiles.length }), {
-          open: reviewedOpen,
-          onToggle: () => setReviewedOpen((open) => !open),
-          onHeightChange: (height) => {
-            setReviewedHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
-          },
-        })}
-        {reviewedOpen && (!desktop || reviewedListHeight > 0)
-          ? renderFileList(reviewedFiles, desktop ? reviewedListHeight : undefined)
-          : null}
-      </View>
+        <View
+          style={styles.navigatorHeader}
+          onLayout={(event) => {
+            const height = event.nativeEvent.layout.height;
+            setNavigatorHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
+          }}
+        >
+          <Text style={styles.sectionEyebrow}>{t("fileNavigator")}</Text>
+          <Text style={styles.sectionSummary}>
+            {t("fileNavigatorSummary", { files: snapshot.files.length, hunks: snapshot.totalHunks })}
+          </Text>
+        </View>
+        <View style={pendingOpen ? styles.fileSection : styles.fileSectionCollapsed}>
+          {renderSectionHeader(t("pendingFilesSection", { count: unreviewedFiles.length }), {
+            open: pendingOpen,
+            onToggle: () => setPendingOpen((open) => !open),
+            onHeightChange: (height) => {
+              setPendingHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
+            },
+          })}
+          {pendingOpen && (!desktop || pendingListHeight > 0)
+            ? renderFileList(
+                unreviewedFiles,
+                desktop ? pendingListHeight : undefined,
+                snapshot.files.length === 0,
+              )
+            : null}
+        </View>
+        <View style={reviewedOpen ? styles.fileSection : styles.fileSectionCollapsed}>
+          {renderSectionHeader(t("reviewedFilesSection", { count: reviewedFiles.length }), {
+            open: reviewedOpen,
+            onToggle: () => setReviewedOpen((open) => !open),
+            onHeightChange: (height) => {
+              setReviewedHeaderHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
+            },
+          })}
+          {reviewedOpen && (!desktop || reviewedListHeight > 0)
+            ? renderFileList(reviewedFiles, desktop ? reviewedListHeight : undefined)
+            : null}
+        </View>
+      </ScrollView>
     </View>
   );
 }

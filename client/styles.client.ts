@@ -63,6 +63,13 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
       borderRightWidth: compact ? 0 : 1,
       borderRightColor: withAlpha(c.foregroundMuted, 0.18),
     },
+    // Shared outer scroll: the navigator header and both section siblings
+    // travel together and any content beyond the bounded pane height stays
+    // reachable. The parent fileNavigator View carries the real height
+    // (paneHeight on desktop, parent flex on compact), so this scroller is
+    // bounded; the content container only lays out, never sizes children.
+    fileNavigatorScroll: { flex: 1, minHeight: 0 },
+    fileNavigatorContent: { flexDirection: "column", flexGrow: 1 },
     navigatorHeader: { flexShrink: 0, gap: 3, padding: compact ? 12 : 16, borderBottomWidth: 1, borderBottomColor: withAlpha(c.foregroundMuted, 0.16) },
     sectionEyebrow: { color: c.foregroundMuted, fontSize: 10.5, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.5 },
     sectionTitle: { color: c.foreground, fontSize: compact ? 14 : 16, lineHeight: compact ? 19 : 22, fontWeight: "700" },
@@ -97,9 +104,10 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
     blockRangeText: { color: c.foregroundMuted, fontFamily: "monospace", fontSize: 10.5 },
     diffHeaderStrip: { backgroundColor: withAlpha(c.accent, 0.07), borderRadius: 6, paddingVertical: 4, paddingHorizontal: 8, flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
     diffHeaderRange: { fontFamily: "monospace", color: c.foreground, fontSize: compact ? 10.5 : 11 },
+    diffLayoutRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
     diffHeaderContext: { fontFamily: "monospace", color: c.accent, fontSize: compact ? 10.5 : 11, fontWeight: "600" },
     diffBox: { borderWidth: 1, borderColor: withAlpha(c.foregroundMuted, 0.16), borderRadius: 8, overflow: "hidden" },
-    diffScroll: { height: compact ? 256 : 336, flexGrow: 0, flexShrink: 0 },
+    diffScroll: { maxHeight: compact ? 256 : 336, flexGrow: 0, flexShrink: 0 },
     diffScrollContent: { paddingVertical: 4, gap: 8 },
     diffColHeader: { paddingVertical: 6, paddingHorizontal: 8, backgroundColor: withAlpha(c.foreground, 0.025), borderBottomWidth: 1, borderBottomColor: withAlpha(c.foregroundMuted, 0.16) },
     diffColHeaderText: { color: c.foregroundMuted, fontSize: 9.5, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.6 },
@@ -132,9 +140,6 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
     diffSignDel: { color: c.statusDanger },
     diffSignContext: { color: c.foregroundMuted },
     actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
-    secondaryActions: { gap: 8 },
-    agentActionsScroll: { maxHeight: 144, flexGrow: 0, flexShrink: 1 },
-    agentActionsContent: { gap: 6, paddingBottom: 2 },
     body: { color: c.foreground, fontSize: compact ? 12 : 13, lineHeight: compact ? 17 : 19 },
     muted: { color: c.foregroundMuted, fontSize: compact ? 12 : 13, lineHeight: compact ? 17 : 19 },
     label: { color: c.foregroundMuted, fontSize: compact ? 10 : 11, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.5 },
@@ -179,8 +184,11 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
     queueGroup: { gap: 8, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: withAlpha(c.foregroundMuted, 0.14) },
     queueFile: { gap: 6, paddingTop: 8, paddingLeft: compact ? 8 : 12 },
     queueComment: { gap: 3, paddingLeft: 10, borderLeftWidth: 2, borderLeftColor: withAlpha(c.accent, 0.35) },
-    queueOutcome: { gap: 3, paddingVertical: 6 },
     agentRow: { gap: 6, paddingVertical: 10, borderTopWidth: 1, borderTopColor: withAlpha(c.foregroundMuted, 0.14) },
+    agentSelectRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 8, paddingHorizontal: 10, borderWidth: 1, borderColor: withAlpha(c.foregroundMuted, 0.16), borderRadius: 8 },
+    agentSelectRowActive: { borderColor: withAlpha(c.accent, 0.55), backgroundColor: withAlpha(c.accent, 0.06) },
+    agentSelectMarkActive: { color: c.accent, fontSize: 14, lineHeight: 18 },
+    agentSelectMarkIdle: { color: c.foregroundMuted, fontSize: 14, lineHeight: 18 },
     routeFile: { color: c.foreground, fontSize: compact ? 12 : 12.5, fontWeight: "600" },
     routeMeta: { color: c.foregroundMuted, fontSize: compact ? 10.5 : 11, lineHeight: 15 },
     feedbackSent: { color: c.accent, fontSize: 11, lineHeight: 15, fontWeight: "600" },

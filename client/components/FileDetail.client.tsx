@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import type {
   ExplainHunkAiResult,
   ExplainHunkResult,
@@ -20,18 +20,19 @@ import {
   type PanelTheme,
   type ReviewFile,
   type SelectedHunk,
-  type Severity,
   type ViewMode,
 } from "../tools.client";
+import { viewModeKeys } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { ActionButton, SeverityBadge } from "./ui.client";
+import { ActionButton, Segmented, SeverityBadge } from "./ui.client";
 import { HunkCard } from "./HunkCard.client";
+import { FileView } from "./FileView.client";
 import { CommentSheet } from "./CommentSheet.client";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRevertFile, revertNotice, onExplain, onReject, agentsOpen, onToggleAgentsOpen, agents, agentFeedback, aiExplainBusy, commentBody, commentAnchorIsCurrent, onExplainWithAgent, onSendRevision, onSendFeedback, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -55,20 +56,17 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   onMarkReviewed: () => void;
   onMarkFileReviewed: () => void;
   onExplainFile: () => void;
+  onRunAgentReview: (agentId: string, filePath: string) => void;
   onRevertFile: () => void;
   revertNotice: string | null;
   onExplain: () => void;
   onReject: () => void;
-  agentsOpen: boolean;
-  onToggleAgentsOpen: () => void;
-  agents: AgentInfo[];
-  agentFeedback: AgentFeedbackMap;
-  aiExplainBusy: string | null;
+  agentsLoading: boolean;
+  selectedAgentId: string | null;
+  onOpenMore: () => void;
   commentBody: string;
-  commentAnchorIsCurrent: boolean;
+  aiExplainBusy: string | null;
   onExplainWithAgent: (agentId: string) => void;
-  onSendRevision: (agentId: string) => void;
-  onSendFeedback: (agent: AgentInfo) => void;
   findingsOpen: boolean;
   onToggleFindingsOpen: () => void;
   analysisStale: boolean;
@@ -83,6 +81,7 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   commentNotice: string | null;
   commentAnchorHunk: SelectedHunk | null;
   commentAnchorHunkId: string;
+  commentAnchorIsCurrent: boolean;
   commentAnchorMoveArmed: boolean;
   onReturnToAnchor: (hunkId: string) => void;
   onMoveAnchor: () => void;
@@ -91,6 +90,10 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   onToggleOtherComments: () => void;
   onEditSavedComment: (hunkId: string) => void;
   onSaveComment: () => void;
+  agentFeedback: AgentFeedbackMap;
+  fileReviseFeedback: AgentFeedbackMap;
+  onReviseCurrentFromComment: (agentId: string) => void;
+  onReviseFileFromComment: (agentId: string) => void;
 }) {
   const [confirmRevert, setConfirmRevert] = useState(false);
   useEffect(() => {
@@ -146,8 +149,27 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             />
             <ActionButton
               variant="secondary"
-              label={t("explainFile")}
+              label={t("ruleAnalyzeFile")}
+              tooltip={t("ruleAnalyzeFileHint")}
               onPress={onExplainFile}
+              theme={theme}
+              layout={layout}
+            />
+            <ActionButton
+              variant="secondary"
+              label={t("agentFileReviewLabel")}
+              tooltip={agentsLoading ? t("agentsLoading") : selectedAgentId ? t("agentFileReviewHint") : t("agentActionNoAgentHint")}
+              disabled={agentsLoading || !selectedAgentId}
+              onPress={() => { if (selectedAgentId) void onRunAgentReview(selectedAgentId, selectedFile.path); }}
+              theme={theme}
+              layout={layout}
+            />
+            <ActionButton
+              variant="secondary"
+              disabled={agentsLoading || !selectedAgentId || fileReviseFeedback[selectedAgentId]?.phase === "sending" || commentBody.trim().length === 0}
+              label={fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sending" ? t("reviseFileCommentBusyLabel") : t("reviseFileCommentLabel")}
+              tooltip={agentsLoading ? t("agentsLoading") : !selectedAgentId ? t("agentActionNoAgentHint") : commentBody.trim().length === 0 ? t("reviseFileCommentNoCommentHint") : t("reviseFileCommentHint")}
+              onPress={() => { if (selectedAgentId) void onReviseFileFromComment(selectedAgentId); }}
               theme={theme}
               layout={layout}
             />
@@ -167,6 +189,10 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             />
           </View>
           {revertNotice ? <Text style={styles.fileStatusAccent}>{revertNotice}</Text> : null}
+          {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sent" ? <Text style={styles.feedbackSent}>✓ {t("reviseFileSent")}</Text> : null}
+          {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "error" ? (
+            <Text style={styles.feedbackError}>{fileReviseFeedback[selectedAgentId ?? ""]?.message ?? t("reviseFileSendFailed")}</Text>
+          ) : null}
           {selectedMeta?.functionHint || selectedMeta?.language || selectedFile.language ? (
             <View style={styles.tagRow}>
               {selectedMeta?.language || selectedFile.language ? <Text style={styles.tagPill}>{selectedMeta?.language ?? selectedFile.language}</Text> : null}
@@ -174,46 +200,60 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             </View>
           ) : null}
         </View>
+        <View style={styles.diffLayoutRow}>
+          <Text style={styles.label}>{t("diffLayout")}</Text>
+          <Segmented
+            options={viewModeKeys.map((option) => ({
+              value: option.value,
+              label: t(option.key),
+              tooltip: t(option.value === "diff" ? "viewModeDiffHint" : option.value === "blockFile" ? "viewModeBlockFileHint" : "viewModeFullChangesHint"),
+            }))}
+            value={viewMode}
+            onChange={onViewModeChange}
+            theme={theme}
+            layout={layout}
+          />
+        </View>
 
-        <HunkCard
-          theme={theme}
-          layout={layout}
-          t={t}
-          styles={styles}
-          file={selectedFile}
-          hunk={selected}
-          onSelectHunk={onSelectHunk}
-          diffMode={diffMode}
-          onDiffModeChange={onDiffModeChange}
-          viewMode={viewMode}
-          onViewModeChange={onViewModeChange}
-          fileViewResult={fileViewResult}
-          fileViewLoading={fileViewLoading}
-          fileViewError={fileViewError}
-          scope={scope}
-          currentHunkHasComment={currentHunkHasComment}
-          reviewed={reviewed}
-          onMarkReviewed={onMarkReviewed}
-          onExplain={onExplain}
-          onReject={onReject}
-          agents={agents}
-          agentsOpen={agentsOpen}
-          onToggleAgentsOpen={onToggleAgentsOpen}
-          agentFeedback={agentFeedback}
-          aiExplainBusy={aiExplainBusy}
-          commentBody={commentBody}
-          commentAnchorIsCurrent={commentAnchorIsCurrent}
-          onExplainWithAgent={onExplainWithAgent}
-          onSendRevision={onSendRevision}
-          onSendFeedback={onSendFeedback}
-          findingsOpen={findingsOpen}
-          onToggleFindingsOpen={onToggleFindingsOpen}
-          analysisStale={analysisStale}
-          explanation={explanation}
-          aiExplanation={aiExplanation}
-          agentReview={agentReview}
-          agentSections={agentSections}
-        />
+        {viewMode === "fullChanges" ? (
+          <ScrollView style={styles.diffScroll} contentContainerStyle={styles.diffScrollContent} nestedScrollEnabled showsVerticalScrollIndicator>
+            <FileView t={t} styles={styles} result={fileViewResult} loading={fileViewLoading} error={fileViewError} selectedHunkId={selected.id} />
+          </ScrollView>
+        ) : (
+          <HunkCard
+            theme={theme}
+            layout={layout}
+            t={t}
+            styles={styles}
+            file={selectedFile}
+            hunk={selected}
+            onSelectHunk={onSelectHunk}
+            diffMode={diffMode}
+            onDiffModeChange={onDiffModeChange}
+            viewMode={viewMode}
+            fileViewResult={fileViewResult}
+            fileViewLoading={fileViewLoading}
+            fileViewError={fileViewError}
+            scope={scope}
+            currentHunkHasComment={currentHunkHasComment}
+            reviewed={reviewed}
+            onMarkReviewed={onMarkReviewed}
+            onExplain={onExplain}
+            onReject={onReject}
+            agentsLoading={agentsLoading}
+            selectedAgentId={selectedAgentId}
+            aiExplainBusy={aiExplainBusy}
+            onExplainWithAgent={onExplainWithAgent}
+            onOpenMore={onOpenMore}
+            findingsOpen={findingsOpen}
+            onToggleFindingsOpen={onToggleFindingsOpen}
+            analysisStale={analysisStale}
+            explanation={explanation}
+            aiExplanation={aiExplanation}
+            agentReview={agentReview}
+            agentSections={agentSections}
+          />
+        )}
 
         <View style={styles.commentArea}>
         <CommentSheet
@@ -239,7 +279,11 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
           onToggleOtherComments={onToggleOtherComments}
           onEditSavedComment={onEditSavedComment}
           onSaveComment={onSaveComment}
-        />
+          agentsLoading={agentsLoading}
+          selectedAgentId={selectedAgentId}
+          agentFeedback={agentFeedback}
+          onReviseCurrentFromComment={onReviseCurrentFromComment}
+          />
         </View>
       </View>
     </View>

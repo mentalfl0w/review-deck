@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin";
 import { ScrollView, Text, View } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n.client";
@@ -29,6 +29,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [compactFilesOpen, setCompactFilesOpen] = useState(layout.compact);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [detailHeight, setDetailHeight] = useState(0);
   const handleDetailHeightChange = useCallback((height: number) => {
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
@@ -88,6 +89,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     snapshot: snapshotApi.snapshot,
     commentBody: actionsApi.commentBody,
     setStale: snapshotApi.setStale,
+    activeSavedComment: actionsApi.activeSavedComment,
+    clearHunkComment: actionsApi.clearHunkComment,
+    refreshProjectComments: commentsApi.refreshProjectComments,
   });
   const fileViewApi = useFileView({
     reviewCwd: scopeApi.reviewCwd,
@@ -97,7 +101,8 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     snapshot: snapshotApi.snapshot,
     selectedFile: snapshotApi.selectedFile,
     selectedHunkId: snapshotApi.selectedHunkId,
-    enabled: viewMode === "file",
+    enabled: viewMode === "blockFile" || viewMode === "fullChanges",
+    fullChanges: viewMode === "fullChanges",
   });
 
   // Selecting a hunk discards analysis and comment UI that belonged to the
@@ -117,6 +122,20 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
   }, [actionsApi.activeCommentKey, actionsApi.selectedFileComments, actionsApi.stageSavedCommentDraft, selectHunk]);
 
   const styles = useMemo(() => buildPanelStyles(theme, layout), [layout.compact, theme]);
+  // Agent selection policy: More is the sole selection surface. A single
+  // eligible agent is selected automatically; with several, keep a still-valid
+  // prior selection or select none — never silently target the first agent.
+  useEffect(() => {
+    if (agentsApi.agentsLoading) return;
+    if (agentsApi.agents.length === 0) {
+      setSelectedAgentId(null);
+    } else if (agentsApi.agents.length === 1) {
+      setSelectedAgentId(agentsApi.agents[0].id);
+    } else {
+      const validIds = new Set(agentsApi.agents.map((agent) => agent.id));
+      setSelectedAgentId((current) => (current !== null && validIds.has(current) ? current : null));
+    }
+  }, [agentsApi.agents, agentsApi.agentsLoading]);
   const scopeOptions = useMemo(() => scopeKeys.map((option) => ({ value: option.value, label: t(option.key) })), [t]);
 
   const activeWorkspaceName = scopeApi.workspace?.name ?? "";
@@ -146,6 +165,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     <FileNavigator
       key="file-navigator"
       theme={theme}
+      layout={layout}
       t={t}
       styles={styles}
       paneHeight={layout.compact ? undefined : detailHeight}
@@ -184,21 +204,23 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
       fileReviewed={snapshotApi.selectedFile ? snapshotApi.selectedFile.hunks.every((hunk) => snapshotApi.decisions.some((decision) => decision.hunkId === hunk.id)) : false}
       onMarkFileReviewed={() => void actionsApi.markFileReviewed()}
       onExplainFile={() => void agentApi.explainWholeFile()}
+      onRunAgentReview={(agentId, filePath) => void agentApi.runAgentReview(agentId, filePath)}
       onRevertFile={() => void actionsApi.revertFileReview()}
       revertNotice={actionsApi.revertNotice}
       onMarkReviewed={() => void actionsApi.markReviewed()}
       onExplain={() => void agentApi.explainSelected()}
       onReject={() => void actionsApi.rejectSelected()}
-      agentsOpen={agentApi.agentsOpen}
-      onToggleAgentsOpen={() => agentApi.setAgentsOpen((open) => !open)}
-      agents={agentsApi.agents}
+      agentsLoading={agentsApi.agentsLoading}
+      selectedAgentId={selectedAgentId}
+      onOpenMore={() => setMoreOpen(true)}
       agentFeedback={agentApi.agentFeedback}
+      fileReviseFeedback={agentApi.fileReviseFeedback}
       aiExplainBusy={agentApi.aiExplainBusy}
       commentBody={actionsApi.commentBody}
       commentAnchorIsCurrent={actionsApi.commentAnchorIsCurrent}
       onExplainWithAgent={agentApi.explainWithAgent}
-      onSendRevision={agentApi.sendRevision}
-      onSendFeedback={agentApi.sendFeedbackToAgent}
+      onReviseCurrentFromComment={agentApi.reviseCurrentFromComment}
+      onReviseFileFromComment={agentApi.reviseFileFromComment}
       findingsOpen={agentApi.findingsOpen}
       onToggleFindingsOpen={() => agentApi.setFindingsOpen((open) => !open)}
       analysisStale={analysisStale}
@@ -228,6 +250,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     <ContextBar
       key="context"
       theme={theme}
+      layout={layout}
       t={t}
       styles={styles}
       onToggleLocale={() => {
@@ -311,13 +334,11 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
         selectedProcessAgent={commentsApi.selectedProcessAgent}
         onSelectProcessAgent={commentsApi.setSelectedProcessAgent}
         projectAgentCount={agentsApi.projectAgents.length}
+        agentsLoading={agentsApi.agentsLoading}
         canProcessProject={commentsApi.canProcessProject}
         processingProject={commentsApi.processingProject}
         onProcess={() => void commentsApi.processProject()}
         processResult={commentsApi.processResult}
-        canDeleteProcessed={commentsApi.canDeleteProcessed}
-        deletingProcessed={commentsApi.deletingProcessed}
-        onDelete={() => void commentsApi.deleteProcessed()}
         processError={commentsApi.processError}
         projectNotice={commentsApi.projectNotice}
       />
@@ -331,6 +352,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
         onClose={() => setMoreOpen(false)}
         scopeOptions={scopeOptions}
         scope={scopeApi.scope}
+        agents={agentsApi.agents}
+        agentsLoading={agentsApi.agentsLoading}
+        selectedAgentId={selectedAgentId}
+        onSelectAgent={setSelectedAgentId}
         onScopeChange={scopeApi.setScope}
         filePath={scopeApi.filePath}
         onFilePathChange={scopeApi.setFilePath}
@@ -340,9 +365,6 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
         onHeadRefChange={scopeApi.setHeadRef}
         loading={snapshotApi.loading}
         onRefresh={() => void snapshotApi.refresh()}
-        agents={agentsApi.agents}
-        onRunAgentReview={agentApi.runAgentReview}
-        onSendRevision={agentApi.sendRevision}
         selected={snapshotApi.selected}
         decisions={snapshotApi.decisions}
         snapshot={snapshotApi.snapshot}

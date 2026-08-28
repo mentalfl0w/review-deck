@@ -7,7 +7,7 @@ import {
 } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { ActionButton } from "./ui.client";
+import { ActionButton, HoverTooltip } from "./ui.client";
 
 /** Centered modal listing saved review records per target fingerprint with
  * per-target clear and the guarded clear-everything flow. */
@@ -32,9 +32,11 @@ export function ManageModal({ theme, layout, t, styles, open, onClose, stateErro
         <Pressable onPress={(event) => event.stopPropagation()} style={styles.centeredModal}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>{t("savedReviewsTitle")}</Text>
-            <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
-              <Text style={styles.topButtonText}>{t("close")}</Text>
-            </Pressable>
+            <HoverTooltip text={t("closeHint")} theme={theme} layout={layout}>
+              <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
+                <Text style={styles.topButtonText}>{t("close")}</Text>
+              </Pressable>
+            </HoverTooltip>
           </View>
           <ScrollView contentContainerStyle={styles.modalBody}>
             <Text selectable style={styles.scopeDesc}>{t("reviewStateLocation")}</Text>
@@ -50,6 +52,7 @@ export function ManageModal({ theme, layout, t, styles, open, onClose, stateErro
                   <ActionButton
                     variant="danger"
                     label={t("clearTarget")}
+                    tooltip={t("clearTargetHint")}
                     onPress={() => void onClearTarget(review.targetFingerprint)}
                     theme={theme}
                     layout={layout}
@@ -73,6 +76,7 @@ export function ManageModal({ theme, layout, t, styles, open, onClose, stateErro
                   <ActionButton
                     variant="danger"
                     label={t("confirm")}
+                    tooltip={t("confirmClearAllHint")}
                     onPress={onClearAll}
                     theme={theme}
                     layout={layout}
@@ -80,6 +84,7 @@ export function ManageModal({ theme, layout, t, styles, open, onClose, stateErro
                   <ActionButton
                     variant="ghost"
                     label={t("cancel")}
+                    tooltip={t("cancelClearAllHint")}
                     onPress={onCancelClearAll}
                     theme={theme}
                     layout={layout}
@@ -90,7 +95,7 @@ export function ManageModal({ theme, layout, t, styles, open, onClose, stateErro
               <ActionButton
                 variant="danger"
                 label={t("clearAllSavedReviews")}
-                hint={t("clearAllSavedReviewsHint")}
+                tooltip={t("clearAllSavedReviewsHint")}
                 onPress={onRequestClearAll}
                 theme={theme}
                 layout={layout}

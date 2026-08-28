@@ -3,11 +3,10 @@ import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin";
 import type {
-  ExplainHunkAiResult,
   ExplainHunkResult,
+  PollAiReviewResult,
   ProcessProjectReviewResult,
   ProjectReviewComment,
-  ProjectReviewCommentOutcome,
   ProjectReviewSummary,
   ReviewLocale,
   ReviewRequest,
@@ -32,20 +31,27 @@ export interface ReviewServiceDependencies {
   gitFactory?: (cwd: string) => GitRunner;
 }
 
-export interface AgentReviewResult {
-  status: "idle" | "error" | "permission" | "timeout";
-  review: string;
-  sections: ReviewSections;
-}
+/** Short wait window per poll; the daemon reports "timeout" while the turn is
+ * still running, so a poll never blocks the plugin RPC layer. */
+const READONLY_REVIEW_POLL_WAIT_MS = 2_000;
+/** Abandoned review entries (client gave up polling) are evicted after this. */
+const READONLY_REVIEW_ENTRY_TTL_MS = 10 * 60_000;
 
-const COMMENT_OUTCOME_STATUSES: Record<string, true> = {
-  completed: true,
-  stale: true,
-  failed: true,
-  unresolved: true,
+function emptyReviewSections(): ReviewSections {
+  return { verifiedFacts: [], aiInference: [], humanVerificationRecommended: [] };
+}
+/** The transient child handle surface pollAiReview needs: waitForFinish plus
+ * timeline access for the last-assistant-text recovery fallback. */
+type TransientReviewChildHandle = {
+  id: string;
+  waitForFinish(timeoutMs?: number): Promise<{ status: "idle" | "error" | "permission" | "timeout"; error: string | null; lastMessage: string | null }>;
+  timeline?: { refetch(options?: { limit?: number }): Promise<unknown> };
 };
-const COMMENT_OUTCOME_STATUS = ["completed", "stale", "failed", "unresolved"] as const;
-type CommentOutcomeStatus = (typeof COMMENT_OUTCOME_STATUS)[number];
+/** Structural slice of the daemon's fetch_agent_timeline payload. */
+type TransientTimelinePayload = {
+  entries?: Array<{ item?: { type?: string; text?: unknown; content?: unknown } }>;
+};
+
 const FILE_VIEW_MAX_ROWS = 20_000;
 const STATE_BUCKET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -67,13 +73,6 @@ type DeterministicCopy = {
   changedLines: (added: number, removed: number) => string;
   fallbackHumanCheck: string;
   fallbackCategoryCheck: (category: string) => string;
-  reviseHunk: (hunkId: string, filePath: string) => string;
-  reviseFile: (filePath: string) => string;
-  snapshotFingerprint: (fingerprint: string) => string;
-  hunkFingerprint: (fingerprint: string) => string;
-  doNotModify: string;
-  beforeEditing: string;
-  humanChecks: string;
   fileHunk: (header: string) => string;
 };
 
@@ -87,13 +86,6 @@ const DETERMINISTIC_COPY: Record<ReviewLocale, DeterministicCopy> = {
     changedLines: (added, removed) => `The hunk adds ${added} lines and removes ${removed} lines.`,
     fallbackHumanCheck: "Confirm the changed behavior against its callers and its nearest focused test.",
     fallbackCategoryCheck: (category) => `Confirm the ${category} implications.`,
-    reviseHunk: (hunkId, filePath) => `Revise only ${hunkId} in ${filePath}.`,
-    reviseFile: (filePath) => `Revise only ${filePath} according to the review above.`,
-    snapshotFingerprint: (fingerprint) => `Review snapshot fingerprint: ${fingerprint}.`,
-    hunkFingerprint: (fingerprint) => `Hunk fingerprint: ${fingerprint}.`,
-    doNotModify: "Do not modify unrelated files or hunks.",
-    beforeEditing: "Before editing, stop and report if the current target fingerprint differs.",
-    humanChecks: "Human checks:",
     fileHunk: (header) => `Hunk ${header}:`,
   },
   zh: {
@@ -105,13 +97,6 @@ const DETERMINISTIC_COPY: Record<ReviewLocale, DeterministicCopy> = {
     changedLines: (added, removed) => `此变更块新增 ${added} 行，删除 ${removed} 行。`,
     fallbackHumanCheck: "请结合调用方和最近的针对性测试，确认变更后的行为。",
     fallbackCategoryCheck: (category) => `请确认 ${category} 相关影响。`,
-    reviseHunk: (hunkId, filePath) => `仅修改 ${filePath} 中的 ${hunkId}。`,
-    reviseFile: (filePath) => `请根据上述评审结果，仅修改文件 ${filePath}。`,
-    snapshotFingerprint: (fingerprint) => `评审快照指纹：${fingerprint}。`,
-    hunkFingerprint: (fingerprint) => `变更块指纹：${fingerprint}。`,
-    doNotModify: "不要修改无关文件或变更块。",
-    beforeEditing: "编辑前，如果当前目标指纹不一致，请停止并报告。",
-    humanChecks: "人工检查：",
     fileHunk: (header) => `变更块 ${header}：`,
   },
 };
@@ -133,11 +118,12 @@ function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "e
         "每条发现必须包含对应的变更块 ID。",
       ]
       : [
-        "请用简体中文向人工评审者解释这一个变更块。",
-        "不要修改文件。",
+        "请用简体中文向人工评审者评审这一个变更块。",
+        "不要修改文件。使用只读工具检查调用方、被调用方、相关测试和当前文件。",
         "请严格使用以下标题：已确认事实、AI 推断、建议人工确认。",
         "仅报告直接由提供的 diff 或你实际执行的命令支持的已确认事实。",
         "除非实际运行过，否则不要声称测试或构建已通过。",
+        "每条发现必须包含对应的变更块 ID。",
         "代码、文件路径、函数名、Git 标头和命令输出保持原文。",
       ];
   }
@@ -151,12 +137,12 @@ function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "e
       "Every finding must include a hunk id. Never claim that tests or builds passed unless you ran them.",
     ]
     : [
-      "Explain this single hunk for a human reviewer.",
-      "Do not edit files.",
+      "Review this single change block for a human reviewer.",
+      "Do not edit files. Inspect callers, callees, related tests, and the current files with your read-only tools.",
       "Respond in English. Keep code, file paths, symbol names, Git headers, and command output unchanged.",
       "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
       "Only report VERIFIED FACTS that are directly supported by the supplied diff or commands you actually ran.",
-      "Never claim that tests or builds passed unless you ran them.",
+      "Every finding must include the hunk id. Never claim that tests or builds passed unless you ran them.",
     ];
 }
 
@@ -172,6 +158,27 @@ export class ReviewService {
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
   private readonly gitFactory: (cwd: string) => GitRunner;
+  // Read-only reviews started by startRunReview/startExplainHunkAi, keyed by
+  // child agent id (= the requestId the client polls). Entries live until the
+  // turn finishes (pollAiReview deletes them) or the TTL sweep evicts
+  // abandoned ones. Nothing here ever runs on the selected workspace Agent's
+  // stream.
+  private readonly transientReviewAgents = new Map<
+    string,
+    {
+      handle: TransientReviewChildHandle;
+      locale: ReviewLocale | undefined;
+      provider: string;
+      model: string | null;
+      startedAt: number;
+    }
+  >();
+  private sweepTransientReviewAgents(): void {
+    const now = Date.now();
+    for (const [id, entry] of this.transientReviewAgents) {
+      if (now - entry.startedAt > READONLY_REVIEW_ENTRY_TTL_MS) this.transientReviewAgents.delete(id);
+    }
+  }
 
   constructor(dependencies: ReviewServiceDependencies = {}) {
     this.store = dependencies.store ?? new StateStore();
@@ -558,15 +565,12 @@ export class ReviewService {
    * and its own worktree context (cwd, scope, refs, workspace id). Project
    * comments may span multiple worktrees; the agent must only touch the listed
    * files/hunks inside the comment's own cwd/worktree, verify fingerprints item by
-   * item, and stop (reporting stale) any item whose target drifted. The agent must
-   * end its response with a strict machine-parseable COMMENT OUTCOMES section.
-   * processedCommentIds lists the comment ids actually sent — returned even when
-   * the agent exits non-idle so the client can keep the records instead of
-   * auto-clearing. completedCommentIds lists only ids the agent explicitly marked
-   * COMPLETED and that survived server-side validation (parsed exactly once, known
-   * id, agent idle); commentOutcomes covers every sent id in send order, defaulting
-   * missing/duplicate/unknown entries to "unresolved". The result carries the
-   * validated workspaceId/workspaceCwd so output ownership is unambiguous.
+   * item, and stop (reporting stale) any item whose target drifted.
+   * Submit-and-cleanup semantics: the whole prompt is handed to the agent's
+   * workflow fire-and-forget (never waited on — processing time is unbounded),
+   * then every submitted comment is removed from Review Deck. The returned
+   * processedCommentIds/commentCount/submittedAt are the submission
+   * confirmation; results appear in the agent's conversation, not here.
    */
   async processProjectReview(
     input: { projectId: string; agentId: string; workspaceId: string; workspaceCwd: string },
@@ -641,58 +645,40 @@ export class ReviewService {
       `Comments (${comments.length}):`,
       commentBlocks.join("\n\n"),
     ].join("\n\n");
-    const result = await handle.run(prompt, { timeoutMs: 120_000 });
-    const review = result.lastMessage ?? result.error ?? "The processing agent returned no text.";
-    const { completedCommentIds, commentOutcomes } = this.parseCommentOutcomes(
-      review,
-      processedCommentIds,
-      result.status === "idle",
-      result.status,
-    );
-    const cleanReview = this.stripCommentOutcomes(review);
-    let provider = input.agentId;
-    let model = "unknown";
-    try {
-      const fresh = await handle.refresh();
-      const freshAgent = fresh?.agent ?? handle.current();
-      if (freshAgent) {
-        provider = freshAgent.provider || input.agentId;
-        model = freshAgent.model || "unknown";
-      }
-    } catch {
-      // Provider/model keep their fallback values.
-    }
+    // Fire-and-forget submit: the prompt is handed to the agent's workflow via
+    // handle.send (send_agent_message_request — the same RPC the workspace UI
+    // uses, so the prompt lands in the selected workspace Agent's message
+    // stream). Processing time is unbounded, so we never wait for the agent:
+    // results appear in the agent's conversation and the user copies them from
+    // there. Only after the daemon accepts the prompt are the submitted
+    // comments removed from Review Deck (every commented record of the project;
+    // reviewed records are preserved); on send failure the comments are left
+    // untouched and the error propagates.
+    await handle.send(prompt);
+    await this.clearProjectReviewComments(input.projectId);
     return {
       projectId: input.projectId,
       workspaceId: input.workspaceId,
       workspaceCwd: input.workspaceCwd,
-      status: result.status,
       processedCommentIds,
-      completedCommentIds,
-      commentOutcomes,
       commentCount: processedCommentIds.length,
-      review: cleanReview,
-      sections: this.parseReviewSections(cleanReview),
-      provider,
-      model,
+      submittedAt: new Date().toISOString(),
     };
   }
 
   /**
-   * Remove saved project review comments. With commentIds only the listed comment
-   * ids are removed (comments saved while processing keep their own ids and are
-   * never touched); without commentIds every commented/has-comment record of the
-   * project is removed. Reviewed records are preserved. Returns the number of
-   * records actually cleared.
+   * Remove every commented/has-comment record of the project (used by
+   * processProjectReview after the comments were handed to the agent's
+   * workflow); reviewed records are preserved. Returns the number of records
+   * actually cleared.
    */
-  async clearProjectReviewComments(projectId: string, commentIds?: readonly string[]): Promise<number> {
+  async clearProjectReviewComments(projectId: string): Promise<number> {
     return this.store.runExclusive(async () => {
       const file = await this.store.load();
       let cleared = 0;
       for (const [targetFingerprint, entries] of Object.entries(file)) {
         const next = entries.filter((entry) => {
           if (entry.projectId !== projectId) return true;
-          if (commentIds !== undefined) return !(entry.id !== undefined && commentIds.includes(entry.id));
           return !(entry.decision === "commented" || (entry.comment?.trim() ?? "") !== "");
         });
         if (next.length === entries.length) continue;
@@ -810,7 +796,6 @@ export class ReviewService {
     verifiedFacts: string[];
     aiInference: string[];
     humanVerificationRecommended: string[];
-    revisionPrompt: string;
   } {
     const copy = deterministicCopy(locale);
     const addedLines = hunk.lines.filter((line) => line.startsWith("+")).length;
@@ -830,18 +815,7 @@ export class ReviewService {
     const inference = locale === "zh"
       ? ["仅凭 diff 无法证明确切动机；在接受此变更前，请检查任务上下文和周边调用方。"]
       : ["The exact motivation is not proven by the diff alone; inspect the task context and surrounding call sites before accepting this change."];
-    const revisionPrompt = [
-      copy.reviseHunk(hunk.id, hunk.filePath),
-      ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
-      ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
-      copy.snapshotFingerprint(snapshot.targetFingerprint),
-      copy.hunkFingerprint(hunk.fingerprint),
-      copy.doNotModify,
-      copy.beforeEditing,
-      copy.humanChecks,
-      ...humanChecks.map((check) => `- ${check}`),
-    ].join("\n");
-    return { hunkId: hunk.id, verifiedFacts: facts, aiInference: inference, humanVerificationRecommended: humanChecks, revisionPrompt };
+    return { hunkId: hunk.id, verifiedFacts: facts, aiInference: inference, humanVerificationRecommended: humanChecks };
   }
   /**
    * Rule-level explanation of a whole file: per-hunk explain() output merged
@@ -869,21 +843,11 @@ export class ReviewService {
       copy.fileHunk(hunk.header),
       ...sections[index].humanVerificationRecommended.map((item) => `- ${item}`),
     ]);
-    const revisionPrompt = [
-      copy.reviseFile(input.filePath),
-      copy.snapshotFingerprint(snapshot.targetFingerprint),
-      ...file.hunks.map((hunk) => locale === "zh"
-        ? `变更块 ${hunk.id}（${hunk.header}）：指纹 ${hunk.fingerprint}。`
-        : `Hunk ${hunk.id} (${hunk.header}): fingerprint ${hunk.fingerprint}.`),
-      copy.doNotModify,
-      copy.beforeEditing,
-    ].join("\n");
     return {
       hunkId: input.filePath,
       verifiedFacts,
       aiInference,
       humanVerificationRecommended,
-      revisionPrompt,
     };
   }
 
@@ -911,10 +875,17 @@ export class ReviewService {
     return sections;
   }
 
-  async runAgentReview(
+  /**
+   * Starts the AI评审文件 (whole-file read-only review) flow: builds the locale
+   * review prompt, creates the transient child agent WITHOUT waiting, and
+   * returns the child id as the requestId the client polls. The result is
+   * delivered through pollAiReview so the plugin RPC layer is never blocked
+   * past its timeout.
+   */
+  async startRunReview(
     input: ReviewRequest & { agentId: string },
     context: PluginHandlerContext,
-  ): Promise<AgentReviewResult> {
+  ): Promise<{ requestId: string }> {
     const snapshot = await this.createSnapshot(input);
     const locale = input.locale ?? "en";
     const hunkContext = snapshot.files
@@ -929,25 +900,214 @@ export class ReviewService {
       locale === "zh" ? "变更块：" : "Hunks:",
       hunkContext || (locale === "zh" ? "（没有找到文本变更块。）" : "(No text hunks found.)"),
     ].join("\n\n");
-    const result = await context.paseo.agents.ref(input.agentId).run(prompt, { timeoutMs: 120_000 });
-    const review = result.lastMessage ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
+    const requestId = await this.startTransientReviewAgent(
+      { agentId: input.agentId, worktreePath: snapshot.worktreePath, locale: input.locale, prompt },
+      context,
+    );
+    return { requestId };
+  }
+
+  /**
+   * Resolves the transient review child's create config from the SELECTED
+   * workspace Agent's own snapshot. The daemon's create_agent_request schema
+   * requires config.provider in combined "provider/model" format, so the
+   * resolved provider joins the parent's provider and model into a single
+   * "<provider>/<model>" string; the parent's own values are returned
+   * separately as display labels for Review Deck. Never hardcodes a model and
+   * never falls back to running on the parent's stream — when the parent
+   * snapshot cannot be resolved a clear locale-aware error is thrown.
+   */
+  private async resolveParentAgentConfig(
+    input: { agentId: string; locale: ReviewLocale | undefined },
+    context: PluginHandlerContext,
+  ): Promise<{
+    /** Combined "provider/model" string for the daemon create config. */
+    provider: string;
+    /** Parent provider id reported back to Review Deck. */
+    agentProvider: string;
+    /** Parent model id (or null when the parent has none) for Review Deck. */
+    agentModel: string | null;
+    thinkingOptionId: string | null;
+  }> {
+    const handle = context.paseo.agents.ref(input.agentId);
+    let agent: {
+      provider?: string;
+      model?: string | null;
+      thinkingOptionId?: string | null;
+      effectiveThinkingOptionId?: string | null;
+    } | null | undefined;
+    try {
+      const fresh = await handle.refresh();
+      agent = fresh?.agent ?? handle.current();
+    } catch {
+      agent = handle.current();
+    }
+    if (!agent || !agent.provider) {
+      throw new Error(
+        input.locale === "zh"
+          ? `无法解析所选工作区 Agent（${input.agentId}）的配置，不能创建只读评审子 Agent。评审未运行在所选工作区 Agent 的会话流上。`
+          : `Could not resolve the selected workspace Agent (${input.agentId}) configuration, so the read-only review child agent could not be created. The review did not run on the selected workspace Agent's stream.`,
+      );
+    }
     return {
-      status: result.status,
-      review,
-      sections: this.parseReviewSections(review),
+      provider: agent.model ? `${agent.provider}/${agent.model}` : agent.provider,
+      agentProvider: agent.provider,
+      agentModel: agent.model ?? null,
+      thinkingOptionId: agent.thinkingOptionId ?? agent.effectiveThinkingOptionId ?? null,
     };
   }
 
   /**
-   * AI-powered explanation of a single hunk, delegated to a concrete agent.
-   * The prompt only asks for analysis of the given hunk — never to edit files.
-   * Provider/model are read back from the agent handle; when unavailable the
-   * provider falls back to the agent id and the model to "unknown".
+   * Creates the transient read-only review child agent (combined
+   * "provider/model" derived from the selected workspace Agent, no separate
+   * model key, optional thinkingOptionId) and registers it in
+   * transientReviewAgents keyed by child id — the requestId the client polls.
+   * Does NOT wait: the wait happens in pollAiReview so the plugin RPC layer is
+   * never blocked past its timeout. On create failure a clear locale-aware
+   * error is thrown; the review NEVER falls back to running on the selected
+   * workspace Agent's stream.
    */
-  async explainHunkWithAgent(
+  private async startTransientReviewAgent(
+    input: { agentId: string; worktreePath: string; locale: ReviewLocale | undefined; prompt: string },
+    context: PluginHandlerContext,
+  ): Promise<string> {
+    this.sweepTransientReviewAgents();
+    const resolved = await this.resolveParentAgentConfig({ agentId: input.agentId, locale: input.locale }, context);
+    // config.provider already carries the combined "provider/model" string the
+    // daemon requires; a separate model key must NOT be sent.
+    const agentConfig = {
+      provider: resolved.provider,
+      ...(resolved.thinkingOptionId ? { thinkingOptionId: resolved.thinkingOptionId } : {}),
+    };
+    let child: TransientReviewChildHandle;
+    try {
+      child = await context.paseo.agents.create({
+        config: agentConfig,
+        cwd: input.worktreePath,
+        parent: input.agentId,
+        title: input.locale === "zh" ? "Review Deck 只读评审" : "Review Deck read-only review",
+        autoArchive: true,
+        prompt: input.prompt,
+      });
+    } catch (error) {
+      throw new Error(
+        input.locale === "zh"
+          ? `只读评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未运行在所选工作区 Agent 的会话流上。`
+          : `Failed to create the read-only review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
+      );
+    }
+    this.transientReviewAgents.set(child.id, {
+      handle: child,
+      locale: input.locale,
+      provider: resolved.agentProvider,
+      model: resolved.agentModel,
+      startedAt: Date.now(),
+    });
+    return child.id;
+  }
+
+  /**
+   * Recovers the last assistant text from a transient child's timeline when
+   * waitForFinish settles without a final lastMessage (the turn ended after a
+   * tool call, with the actual reply earlier in the timeline). Walks the
+   * timeline entries in reverse and returns the newest assistant text content;
+   * null when the timeline is unavailable, has no assistant message, or the
+   * text is empty. Read-only — never touches the selected workspace Agent's
+   * stream.
+   */
+  private async extractLastAssistantText(handle: TransientReviewChildHandle): Promise<string | null> {
+    if (!handle.timeline) return null;
+    let payload: TransientTimelinePayload | null = null;
+    try {
+      payload = (await handle.timeline.refetch({ limit: 50 })) as TransientTimelinePayload | null;
+    } catch {
+      return null;
+    }
+    const entries = payload?.entries;
+    if (!Array.isArray(entries)) return null;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const item = entries[index]?.item;
+      if (!item || item.type !== "assistant_message") continue;
+      // Normalize the assistant text: the daemon's AgentTimelineItem carries a
+      // plain `text` string; a content-block array ({ type: "text", text }) is
+      // accepted defensively and joined.
+      let text = "";
+      if (typeof item.text === "string") {
+        text = item.text;
+      } else if (Array.isArray(item.content)) {
+        const blocks: string[] = [];
+        for (const block of item.content) {
+          if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") blocks.push(block.text);
+        }
+        text = blocks.join("");
+      }
+      const trimmed = text.trim();
+      if (trimmed) return trimmed;
+    }
+    return null;
+  }
+
+  /**
+   * Polls a running read-only review. Each poll waits on the transient child
+   * for a short window; the daemon reports "timeout" while the turn is still
+   * running, so only idle/error/permission resolve the final result (review
+   * text, sections, status, parent display labels — exactly like the old
+   * blocking flow) and delete the entry. Unknown request ids return a clear
+   * error; a wait RPC failure is transient and keeps the poll running.
+   */
+  async pollAiReview(input: { requestId: string }): Promise<PollAiReviewResult> {
+    this.sweepTransientReviewAgents();
+    const entry = this.transientReviewAgents.get(input.requestId);
+    if (!entry) {
+      return {
+        status: "error",
+        review: "The AI review request is no longer available.",
+        sections: emptyReviewSections(),
+        provider: "",
+        model: "",
+      };
+    }
+    let result: { status: "idle" | "error" | "permission" | "timeout"; error: string | null; lastMessage: string | null };
+    try {
+      result = await entry.handle.waitForFinish(READONLY_REVIEW_POLL_WAIT_MS);
+    } catch {
+      // Transient wait failure: the child is still alive; keep polling.
+      return { status: "running", review: "", sections: emptyReviewSections(), provider: entry.provider, model: entry.model ?? "unknown" };
+    }
+    if (result.status === "timeout") {
+      // The daemon reports "timeout" when the wait window elapsed while the
+      // turn was still running — keep polling.
+      return { status: "running", review: "", sections: emptyReviewSections(), provider: entry.provider, model: entry.model ?? "unknown" };
+    }
+    this.transientReviewAgents.delete(input.requestId);
+    const locale = entry.locale ?? "en";
+    // waitForFinish can settle (idle) with no final lastMessage when the turn
+    // ended after a tool call while the actual reply sits earlier in the
+    // timeline — recover it before falling back to the wait error/text.
+    const review =
+      result.lastMessage?.trim()
+        ? result.lastMessage
+        : ((await this.extractLastAssistantText(entry.handle)) ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text."));
+    return {
+      status: result.status,
+      review,
+      sections: this.parseReviewSections(review),
+      provider: entry.provider,
+      model: entry.model ?? "unknown",
+    };
+  }
+
+  /**
+   * Starts the AI评审变更块 (single change block) read-only review: the prompt
+   * only asks for a read-only review of the given hunk — never to edit files.
+   * Creates the transient child agent WITHOUT waiting and returns the child id
+   * as the requestId the client polls; the result (including the parent
+   * display provider/model) arrives through pollAiReview.
+   */
+  async startExplainHunkAi(
     input: ReviewRequest & { hunkId: string; agentId: string },
     context: PluginHandlerContext,
-  ): Promise<ExplainHunkAiResult> {
+  ): Promise<{ requestId: string }> {
     const snapshot = await this.createSnapshot(input);
     const locale = input.locale ?? "en";
     const copy = deterministicCopy(locale);
@@ -963,37 +1123,11 @@ export class ReviewService {
       ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
       ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
     ].join("\n\n");
-    const result = await context.paseo.agents.ref(input.agentId).run(prompt, { timeoutMs: 120_000 });
-    const review = result.lastMessage ?? result.error ?? (locale === "zh" ? "解释 Agent 未返回文本。" : "The explain agent returned no text.");
-    let provider = input.agentId;
-    let model = "unknown";
-    try {
-      const handle = context.paseo.agents.ref(input.agentId);
-      const fresh = await handle.refresh();
-      const agent = fresh?.agent ?? handle.current();
-      if (agent) {
-        provider = agent.provider || input.agentId;
-        model = agent.model || "unknown";
-      }
-    } catch {
-      // Provider/model keep their fallback values.
-    }
-    return {
-      hunkId: hunk.id,
-      ...this.parseReviewSections(review),
-      revisionPrompt: [
-        locale === "zh"
-          ? `根据上面的 AI 解释，仅修改 ${hunk.filePath} 中的 ${hunk.id}。`
-          : `Revise only ${hunk.id} in ${hunk.filePath} according to the AI explanation above.`,
-        copy.snapshotFingerprint(snapshot.targetFingerprint),
-        copy.hunkFingerprint(hunk.fingerprint),
-        copy.doNotModify,
-        copy.beforeEditing,
-      ].join("\n"),
-      status: result.status,
-      provider,
-      model,
-    };
+    const requestId = await this.startTransientReviewAgent(
+      { agentId: input.agentId, worktreePath: snapshot.worktreePath, locale: input.locale, prompt },
+      context,
+    );
+    return { requestId };
   }
 
   private async resolveReviewTarget(request: ReviewRequest): Promise<ReviewTarget> {
@@ -1314,71 +1448,6 @@ export class ReviewService {
     }
   }
 
-  private parseCommentOutcomes(
-    text: string,
-    knownIds: readonly string[],
-    agentIdle: boolean,
-    agentStatus: string,
-  ): { completedCommentIds: string[]; commentOutcomes: ProjectReviewCommentOutcome[] } {
-    const known = new Set(knownIds);
-    const parsed = new Map<string, Array<{ status: CommentOutcomeStatus; detail?: string }>>();
-    let inOutcomes = false;
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      const heading = normalizedHeading(trimmed);
-      if (heading === "COMMENT OUTCOMES") {
-        inOutcomes = true;
-        continue;
-      }
-      if (!inOutcomes) continue;
-      if (heading === "VERIFIED FACTS" || heading === "AI INFERENCE" || heading === "HUMAN VERIFICATION RECOMMENDED") {
-        inOutcomes = false;
-        continue;
-      }
-      const match = /^[-*]\s*(\S+)\s*\|\s*(\w+)(?:\s*\|\s*(.*))?$/.exec(trimmed);
-      if (!match) continue;
-      const id = match[1];
-      const status = match[2].toLowerCase();
-      if (!known.has(id) || COMMENT_OUTCOME_STATUSES[status] !== true) continue;
-      const detail = match[3]?.trim() || undefined;
-      const entries = parsed.get(id);
-      if (entries) entries.push({ status: status as CommentOutcomeStatus, detail });
-      else parsed.set(id, [{ status: status as CommentOutcomeStatus, detail }]);
-    }
-    const completedCommentIds: string[] = [];
-    const commentOutcomes: ProjectReviewCommentOutcome[] = knownIds.map((id) => {
-      const entries = parsed.get(id);
-      if (!entries) return { id, status: "unresolved", detail: "No COMMENT OUTCOMES entry" };
-      if (entries.length > 1) {
-        return { id, status: "unresolved", detail: `Duplicate COMMENT OUTCOMES entry (${entries.length} lines); ignored` };
-      }
-      const entry = entries[0];
-      if (entry.status === "completed" && !agentIdle) {
-        return { id, status: "unresolved", detail: `Agent did not finish (status: ${agentStatus}); completed claim ignored` };
-      }
-      return { id, status: entry.status, ...(entry.detail ? { detail: entry.detail } : {}) };
-    });
-    for (const outcome of commentOutcomes) {
-      if (outcome.status === "completed") completedCommentIds.push(outcome.id);
-    }
-    return { completedCommentIds, commentOutcomes };
-  }
-
-  /**
-   * Remove the COMMENT OUTCOMES section from an agent response so the returned
-   * review stays human-readable prose; the section is machine output consumed by
-   * parseCommentOutcomes and never shown in the UI.
-   */
-  private stripCommentOutcomes(text: string): string {
-    const lines = text.split("\n");
-    const start = lines.findIndex((line) => normalizedHeading(line) === "COMMENT OUTCOMES");
-    if (start === -1) return text;
-    return lines.slice(0, start).join("\n").trimEnd();
-  }
-}
-
-function normalizedHeading(line: string): string {
-  return line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/:$/, "");
 }
 
 function sortProjectComments(comments: ProjectReviewComment[]): ProjectReviewComment[] {

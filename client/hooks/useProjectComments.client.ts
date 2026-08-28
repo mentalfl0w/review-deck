@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRpc } from "@getpaseo/plugin";
 import {
-  clearProjectReviewComments,
   listProjectReviewComments,
   processProjectReview,
   type ProcessProjectReviewResult,
@@ -27,7 +26,6 @@ export function useProjectComments(params: {
   const { effectiveProjectId, selectedWorkspaceId, reviewCwd, projectAgents, t } = params;
   const listProjectCommentsRpc = useRpc(listProjectReviewComments);
   const processProjectCommentsRpc = useRpc(processProjectReview);
-  const clearProjectCommentsRpc = useRpc(clearProjectReviewComments);
   const [selectedProcessAgent, setSelectedProcessAgent] = useState("");
   const [projectComments, setProjectComments] = useState<ProjectReviewSummary | null>(null);
   const [projectCommentsLoading, setProjectCommentsLoading] = useState(false);
@@ -35,7 +33,6 @@ export function useProjectComments(params: {
   const [processingProject, setProcessingProject] = useState(false);
   const [processResult, setProcessResult] = useState<ProcessProjectReviewResult | null>(null);
   const [processError, setProcessError] = useState<string | null>(null);
-  const [deletingProcessed, setDeletingProcessed] = useState(false);
   const [projectNotice, setProjectNotice] = useState<string | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const projectRunRef = useRef(0);
@@ -90,7 +87,6 @@ export function useProjectComments(params: {
     setProcessError(null);
     setProjectNotice(null);
     setProcessingProject(false);
-    setDeletingProcessed(false);
     setProjectComments(null);
     setProjectCommentsError(null);
     setProjectCommentsLoading(false);
@@ -108,7 +104,6 @@ export function useProjectComments(params: {
     setProcessError(null);
     setProjectNotice(null);
     setProcessingProject(false);
-    setDeletingProcessed(false);
   }, [selectedWorkspaceId]);
 
   const processProject = useCallback(async () => {
@@ -152,32 +147,6 @@ export function useProjectComments(params: {
     }
   }, [effectiveProjectId, processProjectCommentsRpc, projectAgents, projectComments, projectCommentsLoading, refreshProjectComments, reviewCwd, selectedProcessAgent, selectedWorkspaceId, t]);
 
-  const deleteProcessed = useCallback(async () => {
-    const run = projectRunRef.current;
-    if (!effectiveProjectId || !processResult || processResult.status !== "idle") return;
-    // Only comments explicitly completed by the agent are deletable; stale,
-    // failed and unresolved ones must survive and stay visible.
-    if (processResult.completedCommentIds.length === 0) return;
-    setDeletingProcessed(true);
-    setProcessError(null);
-    setProjectNotice(null);
-    try {
-      const result = await clearProjectCommentsRpc({
-        projectId: effectiveProjectId,
-        commentIds: processResult.completedCommentIds,
-      });
-      if (run !== projectRunRef.current) return;
-      setProcessResult(null);
-      setProjectNotice(t("processedDeletedNotice", { count: result.cleared }));
-      void refreshProjectComments();
-    } catch (error) {
-      if (run !== projectRunRef.current) return;
-      setProcessError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDeletingProcessed(false);
-    }
-  }, [clearProjectCommentsRpc, effectiveProjectId, processResult, refreshProjectComments, t]);
-
   const openProjectQueue = useCallback(() => {
     setQueueOpen(true);
     void refreshProjectComments();
@@ -189,12 +158,6 @@ export function useProjectComments(params: {
     !projectCommentsLoading &&
     projectComments.commentCount > 0 &&
     projectAgents.length > 0 &&
-    !processingProject;
-  const canDeleteProcessed = processResult !== null &&
-    processResult.status === "idle" &&
-    processResult.projectId === effectiveProjectId &&
-    processResult.completedCommentIds.length > 0 &&
-    !deletingProcessed &&
     !processingProject;
   const commentsByTarget = useMemo(() => {
     const targets = new Map<string, {
@@ -229,7 +192,6 @@ export function useProjectComments(params: {
     processingProject,
     processResult,
     processError,
-    deletingProcessed,
     projectNotice,
     selectedProcessAgent,
     setSelectedProcessAgent,
@@ -237,10 +199,8 @@ export function useProjectComments(params: {
     setQueueOpen,
     refreshProjectComments,
     processProject,
-    deleteProcessed,
     openProjectQueue,
     canProcessProject,
-    canDeleteProcessed,
     commentsByTarget,
     projectAgentOptions,
   };

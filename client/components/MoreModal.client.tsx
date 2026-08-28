@@ -10,17 +10,21 @@ import {
 } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { ActionButton, Segmented } from "./ui.client";
+import { ActionButton, HoverTooltip, Segmented } from "./ui.client";
 
-/** Centered "More & management" modal: scope/refs/path inputs, whole-diff
- * agent review actions and the safety (review-state) actions. */
-export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, agents, onRunAgentReview, onSendRevision, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
+/** Centered "More & management" modal: scope/refs/path inputs, the Agent
+ * registry/selection surface and the safety (review-state) actions. */
+export function MoreModal({ theme, layout, t, styles, open, onClose, agents, agentsLoading, selectedAgentId, onSelectAgent, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
   styles: PanelStyles;
   open: boolean;
   onClose: () => void;
+  agents: AgentInfo[];
+  agentsLoading: boolean;
+  selectedAgentId: string | null;
+  onSelectAgent: (agentId: string) => void;
   scopeOptions: ReadonlyArray<{ value: ReviewScope; label: string }>;
   scope: ReviewScope;
   onScopeChange: (scope: ReviewScope) => void;
@@ -32,9 +36,6 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
   onHeadRefChange: (ref: string) => void;
   loading: boolean;
   onRefresh: () => void;
-  agents: AgentInfo[];
-  onRunAgentReview: (agentId: string) => void;
-  onSendRevision: (agentId: string) => void;
   selected: SelectedHunk | null;
   decisions: ReviewDecision[];
   snapshot: ReviewSnapshot | null;
@@ -48,15 +49,17 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
         <Pressable onPress={(event) => event.stopPropagation()} style={styles.centeredModal}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>{t("moreTitle")}</Text>
-            <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
-              <Text style={styles.topButtonText}>{t("close")}</Text>
-            </Pressable>
+            <HoverTooltip text={t("closeHint")} theme={theme} layout={layout}>
+              <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
+                <Text style={styles.topButtonText}>{t("close")}</Text>
+              </Pressable>
+            </HoverTooltip>
           </View>
           <ScrollView contentContainerStyle={styles.modalBody}>
             <View style={styles.modalSection}>
               <Text style={styles.sectionTitle}>{t("moreContextTitle")}</Text>
               <Text style={styles.label}>{t("scopeLabel")}</Text>
-              <Segmented options={scopeOptions} value={scope} onChange={onScopeChange} theme={theme} layout={layout} stretch />
+              <Segmented options={scopeOptions.map((option) => ({ ...option, tooltip: t(scopeDescKeys[option.value]) }))} value={scope} onChange={onScopeChange} theme={theme} layout={layout} stretch />
               <Text style={styles.scopeDesc}>{t(scopeDescKeys[scope])}</Text>
               <View style={styles.inputRow}>
                 <Text style={styles.label}>{t("path")}</Text>
@@ -89,6 +92,7 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
               <ActionButton
                 variant="secondary"
                 label={loading ? t("refreshing") : t("refresh")}
+                tooltip={t("refreshHint")}
                 onPress={onRefresh}
                 theme={theme}
                 layout={layout}
@@ -96,37 +100,35 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
             </View>
 
             <View style={styles.modalSection}>
-              <Text style={styles.sectionTitle}>{t("moreAgentsTitle")}</Text>
-              {agents.length > 0 ? agents.map((agent) => (
-                <View key={agent.id} style={styles.agentRow}>
-                  <Text numberOfLines={1} style={styles.routeFile}>{agent.title ?? agent.id}</Text>
-                  <Text numberOfLines={1} style={styles.routeMeta}>{agent.provider ?? "?"} · {agent.model ?? t("noAgentModel")}</Text>
-                  <View style={styles.actionRow}>
-                    <ActionButton
-                      variant="secondary"
-                      label={t("reviewWithAgent", { agentId: agent.id })}
-                      onPress={() => {
-                        onClose();
-                        void onRunAgentReview(agent.id);
-                      }}
-                      theme={theme}
-                      layout={layout}
-                    />
-                    {selected ? (
-                      <ActionButton
-                        variant="ghost"
-                        label={t("reviseWithAgent", { agentId: agent.id })}
-                        onPress={() => {
-                          onClose();
-                          void onSendRevision(agent.id);
-                        }}
-                        theme={theme}
-                        layout={layout}
-                      />
-                    ) : null}
-                  </View>
-                </View>
-              )) : <Text style={styles.muted}>{t("noAgents")}</Text>}
+              <Text style={styles.sectionTitle}>{t("moreAgentTitle")}</Text>
+              <Text style={styles.scopeDesc}>{t("moreAgentDesc")}</Text>
+              {agentsLoading ? (
+                <Text style={styles.muted}>{t("agentsLoading")}</Text>
+              ) : agents.length === 0 ? (
+                <Text style={styles.muted}>{t("noAgents")}</Text>
+              ) : (
+                agents.map((agent) => {
+                  const selected = agent.id === selectedAgentId;
+                  return (
+                    <Pressable
+                      key={agent.id}
+                      accessibilityRole="radio"
+                      accessibilityState={{ checked: selected }}
+                      onPress={() => onSelectAgent(agent.id)}
+                      style={[styles.agentSelectRow, selected ? styles.agentSelectRowActive : null]}
+                    >
+                      <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                        {agent.title ? <Text numberOfLines={2} style={styles.routeFile}>{agent.title}</Text> : null}
+                        <Text selectable numberOfLines={1} style={styles.routeMeta}>{agent.id}</Text>
+                        <Text selectable numberOfLines={1} style={styles.routeMeta}>
+                          {t("agentProviderModel", { provider: agent.provider ?? t("unknownAgentProvider"), model: agent.model ?? t("noAgentModel") })}
+                        </Text>
+                      </View>
+                      <Text style={selected ? styles.agentSelectMarkActive : styles.agentSelectMarkIdle}>{selected ? "●" : "○"}</Text>
+                    </Pressable>
+                  );
+                })
+              )}
             </View>
 
             <View style={{ gap: 10 }}>
@@ -143,6 +145,7 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
                 <ActionButton
                   variant="danger"
                   label={t("clearCurrentHunk")}
+                  tooltip={t("clearCurrentHunkHint")}
                   disabled={!selected}
                   onPress={onClearCurrentHunk}
                   theme={theme}
@@ -151,6 +154,7 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
                 <ActionButton
                   variant="danger"
                   label={t("clearCurrentReview")}
+                  tooltip={t("clearCurrentReviewHint")}
                   disabled={!snapshot}
                   onPress={onClearCurrentReview}
                   theme={theme}
@@ -159,6 +163,7 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, scopeOption
                 <ActionButton
                   variant="ghost"
                   label={t("manageSavedReviews")}
+                  tooltip={t("manageSavedReviewsHint")}
                   onPress={() => {
                     onClose();
                     onManage();

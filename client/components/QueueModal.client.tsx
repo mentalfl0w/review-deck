@@ -1,7 +1,6 @@
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
 import type { ProcessProjectReviewResult, ProjectReviewSummary } from "../../review.shared";
 import {
-  outcomeStatusKeys,
   scopeLabelKeys,
   type PanelLayout,
   type PanelTheme,
@@ -10,11 +9,13 @@ import {
 } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { ActionButton, DropdownSelect, StringGroup } from "./ui.client";
+import { ActionButton, DropdownSelect, HoverTooltip } from "./ui.client";
 
-/** Drawer with the project's saved comments, the processing agent picker, the
- * batch process action and the per-comment result/cleanup flow. */
-export function QueueModal({ theme, layout, t, styles, open, onClose, projectComments, projectCommentsLoading, projectCommentsError, onRefresh, commentsByTarget, projectIdentity, effectiveProjectId, activeWorkspaceName, reviewCwd, projectAgentOptions, selectedProcessAgent, onSelectProcessAgent, projectAgentCount, canProcessProject, processingProject, onProcess, processResult, canDeleteProcessed, deletingProcessed, onDelete, processError, projectNotice }: {
+/** Drawer with the project's saved comments, the processing agent picker and
+ * the batch submit action: comments are handed to the selected agent's
+ * workflow (results appear in the agent's conversation) and removed from
+ * Review Deck. */
+export function QueueModal({ theme, layout, t, styles, open, onClose, projectComments, projectCommentsLoading, projectCommentsError, onRefresh, commentsByTarget, projectIdentity, effectiveProjectId, activeWorkspaceName, reviewCwd, projectAgentOptions, selectedProcessAgent, onSelectProcessAgent, projectAgentCount, agentsLoading, canProcessProject, processingProject, onProcess, processResult, processError, projectNotice }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -34,13 +35,11 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
   selectedProcessAgent: string;
   onSelectProcessAgent: (agentId: string) => void;
   projectAgentCount: number;
+  agentsLoading: boolean;
   canProcessProject: boolean;
   processingProject: boolean;
   onProcess: () => void;
   processResult: ProcessProjectReviewResult | null;
-  canDeleteProcessed: boolean;
-  deletingProcessed: boolean;
-  onDelete: () => void;
   processError: string | null;
   projectNotice: string | null;
 }) {
@@ -61,9 +60,11 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
                   : t("projectCommentsLoading")}
               </Text>
             </View>
-            <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
-              <Text style={styles.topButtonText}>{t("close")}</Text>
-            </Pressable>
+            <HoverTooltip text={t("closeHint")} theme={theme} layout={layout}>
+              <Pressable accessibilityRole="button" onPress={onClose} style={styles.topButton}>
+                <Text style={styles.topButtonText}>{t("close")}</Text>
+              </Pressable>
+            </HoverTooltip>
           </View>
           <ScrollView contentContainerStyle={styles.modalBody}>
             <View style={styles.queueIdentity}>
@@ -77,6 +78,7 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
             <ActionButton
               variant="ghost"
               label={t("projectCommentsRefresh")}
+              tooltip={t("projectCommentsRefreshHint")}
               onPress={onRefresh}
               theme={theme}
               layout={layout}
@@ -133,22 +135,35 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
                   onChange={onSelectProcessAgent}
                   placeholder={t("projectAgentPlaceholder")}
                   closeLabel={t("closeDropdown")}
+                  triggerHint={t("projectAgentSelectHint")}
+                  closeHint={t("closeHint")}
                   theme={theme}
                   layout={layout}
                 />
-              ) : <Text style={styles.muted}>{t("processProjectNoAgentHint")}</Text>}
+              ) : agentsLoading ? <Text style={styles.muted}>{t("agentsLoading")}</Text> : <Text style={styles.muted}>{t("processProjectNoAgentHint")}</Text>}
               <ActionButton
                 variant="primary"
                 stretch
                 disabled={!canProcessProject}
                 label={processingProject ? t("processingProject") : t("processProjectLabel")}
+                tooltip={
+                  processingProject
+                    ? t("processingProjectHint", { count: projectComments?.commentCount ?? 0 })
+                    : agentsLoading
+                      ? t("agentsLoading")
+                      : !projectComments || projectComments.commentCount === 0
+                        ? t("processProjectNoCommentsHint")
+                        : projectAgentCount === 0
+                          ? t("processProjectNoAgentHint")
+                          : t("processProjectHint")
+                }
                 onPress={onProcess}
                 theme={theme}
                 layout={layout}
               />
               {!projectComments || projectComments.commentCount === 0 ? (
                 <Text style={styles.scopeDesc}>{t("processProjectNoCommentsHint")}</Text>
-              ) : projectAgentCount === 0 ? (
+              ) : projectAgentCount === 0 && !agentsLoading ? (
                 <Text style={styles.scopeDesc}>{t("processProjectNoAgentHint")}</Text>
               ) : null}
               {processingProject ? (
@@ -162,65 +177,16 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
             {processResult ? (
               <View style={styles.analysisBlock}>
                 <Text style={styles.sectionTitle}>{t("processResultTitle")}</Text>
-                {processResult.status !== "idle" ? (
-                  <View style={styles.errorCard}>
-                    <Text style={styles.errorText}>{t("processResultStatusBad", { status: processResult.status })}</Text>
-                  </View>
-                ) : null}
-                <Text style={styles.routeMeta}>
-                  {t("processResultProviderModel", { provider: processResult.provider, model: processResult.model })}
+                <Text style={styles.routeMeta}>{t("processResultCommentsSent", { count: processResult.commentCount })}</Text>
+                <Text selectable numberOfLines={2} ellipsizeMode="middle" style={styles.routeMeta}>
+                  {t("processResultAgent", {
+                    agent: projectAgentOptions.find((option) => option.value === selectedProcessAgent)?.label ?? selectedProcessAgent,
+                  })}
                 </Text>
                 <Text selectable numberOfLines={2} ellipsizeMode="middle" style={styles.routeMeta}>
                   {t("executionWorkspaceLine", { name: activeWorkspaceName || t("noWorkspaceDirectory"), cwd: processResult.workspaceCwd })}
                 </Text>
-                <Text selectable style={styles.routeMeta}>{t("executionWorkspaceId", { id: processResult.workspaceId })}</Text>
-                <Text style={styles.routeMeta}>{t("processResultCommentsSent", { count: processResult.commentCount })}</Text>
-                {processResult.commentOutcomes.length > 0 ? (
-                  <View style={styles.analysisBlock}>
-                    <Text style={styles.label}>{t("processResultOutcomesTitle")}</Text>
-                    <Text style={styles.routeMeta}>
-                      {t("processResultOutcomeSummary", {
-                        completed: processResult.commentOutcomes.filter((outcome) => outcome.status === "completed").length,
-                        pending: processResult.commentOutcomes.filter((outcome) => outcome.status !== "completed").length,
-                      })}
-                    </Text>
-                    {processResult.commentOutcomes.map((outcome) => {
-                      const completed = outcome.status === "completed";
-                      const symbol = completed ? "✓" : outcome.status === "stale" ? "!" : "—";
-                      return (
-                        <View key={outcome.id} style={styles.queueOutcome}>
-                          <Text selectable numberOfLines={2} style={completed ? styles.statusText : styles.errorText}>
-                            {symbol} {t("processResultOutcomeLine", {
-                              id: outcome.id,
-                              status: t(outcomeStatusKeys[outcome.status] ?? "processResultOutcomeUnknown"),
-                            })}
-                          </Text>
-                          {outcome.detail ? <Text selectable style={styles.body}>{outcome.detail}</Text> : null}
-                        </View>
-                      );
-                    })}
-                  </View>
-                ) : null}
-                {processResult.sections.verifiedFacts.length > 0 ||
-                processResult.sections.aiInference.length > 0 ||
-                processResult.sections.humanVerificationRecommended.length > 0 ? (
-                  <>
-                    <StringGroup label={t("findingsVerified")} items={processResult.sections.verifiedFacts} t={t} styles={styles} />
-                    <StringGroup label={t("findingsInference")} items={processResult.sections.aiInference} t={t} styles={styles} />
-                    <StringGroup label={t("findingsHuman")} items={processResult.sections.humanVerificationRecommended} t={t} styles={styles} />
-                  </>
-                ) : <Text selectable style={styles.rawReview}>{processResult.review}</Text>}
-                {canDeleteProcessed ? (
-                  <ActionButton
-                    variant="danger"
-                    disabled={deletingProcessed}
-                    label={deletingProcessed ? t("deletingProcessed") : t("deleteProcessedLabel")}
-                    hint={t("deleteProcessedHint", { count: processResult.completedCommentIds.length })}
-                    onPress={onDelete}
-                    theme={theme}
-                    layout={layout}
-                  />
-                ) : null}
+                <Text selectable style={styles.scopeDesc}>{t("processResultConversationNote")}</Text>
               </View>
             ) : null}
           </ScrollView>

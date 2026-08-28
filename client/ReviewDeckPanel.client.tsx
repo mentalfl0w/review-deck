@@ -11,7 +11,6 @@ import { useProjectComments } from "./hooks/useProjectComments.client";
 import { useReviewActions } from "./hooks/useReviewActions.client";
 import { useAgentReview } from "./hooks/useAgentReview.client";
 import { useFileView } from "./hooks/useFileView.client";
-import { ActionButton } from "./components/ui.client";
 import { ContextBar } from "./components/ContextBar.client";
 import { FileNavigator } from "./components/FileNavigator.client";
 import { FileDetail } from "./components/FileDetail.client";
@@ -34,15 +33,14 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
   const handleDetailHeightChange = useCallback((height: number) => {
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
   }, []);
-
-  const scopeApi = useReviewScope(workspaceId, setActionError);
+  const scopeApi = useReviewScope(workspaceId);
   const snapshotApi = useReviewSnapshot({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
     baseRef: scopeApi.baseRef,
-    locale,
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
+    locale,
     setActionError,
   });
   const agentsApi = useAgents({
@@ -80,9 +78,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
     baseRef: scopeApi.baseRef,
-    locale,
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
+    locale,
     selectedFile: snapshotApi.selectedFile,
     t,
     setActionError,
@@ -121,47 +119,27 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
   const styles = useMemo(() => buildPanelStyles(theme, layout), [layout.compact, theme]);
   const scopeOptions = useMemo(() => scopeKeys.map((option) => ({ value: option.value, label: t(option.key) })), [t]);
 
-  const activeWorkspaceName = scopeApi.selectedWorkspaceEntry?.name ?? scopeApi.workspace?.name ?? "";
-  const activeWorkspaceStatus = scopeApi.selectedWorkspaceEntry?.status ?? scopeApi.workspace?.status ?? "";
+  const activeWorkspaceName = scopeApi.workspace?.name ?? "";
+  const activeWorkspaceStatus = scopeApi.workspace?.status ?? "";
   const projectCommentCount = commentsApi.projectComments?.commentCount ?? 0;
   const analysisStale = snapshotApi.stale && (agentApi.explanation !== null || agentApi.aiExplanation !== null || agentApi.agentReview !== null);
 
   if (!scopeApi.workspace) {
-    // No live workspace context for this panel: never fake one. While the list
-    // is empty (still loading, or loaded and genuinely empty) show an
-    // actionable state instead of a dead-end; once entries are available the
-    // full deck below renders the project → workspace dropdowns, and an
-    // explicit selection opens the workspace in the Paseo foreground and
-    // starts the review against it.
-    if (scopeApi.workspaceEntries.length === 0) {
-      return (
-        <View style={styles.root}>
-          <View style={styles.contextBar}>
-            <View style={styles.contextTop}>
-              <Text style={styles.title}>{t("panelTitle")}</Text>
-            </View>
-          </View>
-          <View style={styles.emptyState}>
-            {scopeApi.workspacesLoaded ? (
-              <>
-                <Text style={styles.empty}>{t("noWorkspacesAvailable")}</Text>
-                <ActionButton
-                  variant="secondary"
-                  label={t("retry")}
-                  onPress={() => void scopeApi.loadWorkspaces()}
-                  theme={theme}
-                  layout={layout}
-                />
-              </>
-            ) : (
-              <Text style={styles.empty}>{t("loadingWorkspaces")}</Text>
-            )}
+    // No live workspace context for this panel: never fake one and never offer
+    // a picker — the panel is bound to its workspaceId, so without the
+    // workspace snapshot there is nothing to review.
+    return (
+      <View style={styles.root}>
+        <View style={styles.contextBar}>
+          <View style={styles.contextTop}>
+            <Text style={styles.title}>{t("panelTitle")}</Text>
           </View>
         </View>
-      );
-    }
-    // Entries are available: fall through to the full deck so the user can pick
-    // a project/workspace from the dropdowns above; selection opens it.
+        <View style={styles.emptyState}>
+          <Text style={styles.empty}>{t("noWorkspacesAvailable")}</Text>
+        </View>
+      </View>
+    );
   }
 
   const fileNavigator = snapshotApi.snapshot ? (
@@ -250,7 +228,6 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     <ContextBar
       key="context"
       theme={theme}
-      layout={layout}
       t={t}
       styles={styles}
       onToggleLocale={() => {
@@ -261,14 +238,8 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
       projectCommentCount={projectCommentCount}
       onOpenQueue={commentsApi.openProjectQueue}
       onOpenMore={() => setMoreOpen(true)}
-      workspaceEntries={scopeApi.workspaceEntries}
-      projectOptions={scopeApi.projectOptions}
-      effectiveProjectId={scopeApi.effectiveProjectId}
-      onSelectProject={scopeApi.selectProject}
-      workspaceOptions={scopeApi.workspaceOptions}
-      workspaceValue={scopeApi.workspaceValue}
-      onSelectWorkspace={scopeApi.selectWorkspace}
       projectIdentity={scopeApi.projectIdentity}
+      effectiveProjectId={scopeApi.effectiveProjectId}
       activeWorkspaceName={activeWorkspaceName}
       scope={scopeApi.scope}
       stale={snapshotApi.stale}

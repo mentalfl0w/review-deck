@@ -1,16 +1,14 @@
 import { Pressable, Text, View } from "react-native";
 import type { ReviewScope, ReviewSnapshot } from "../../review.shared";
-import { scopeLabelKeys, statusLabelKeys, type PanelLayout, type PanelTheme, type ProjectIdentity, type WorkspaceEntry } from "../tools.client";
+import { scopeLabelKeys, statusLabelKeys, type PanelTheme, type ProjectIdentity } from "../tools.client";
 import type { TFunc } from "../i18n.client";
 import type { PanelStyles } from "../styles.client";
-import { DropdownSelect } from "./ui.client";
 
 /** Top context bar: panel title/status, locale + queue + more actions, and
- * the project/workspace/scope/snapshot meta row (with dropdowns when the
- * workspace registry is available). */
-export function ContextBar({ theme, layout, t, styles, onToggleLocale, activeWorkspaceStatus, projectCommentCount, onOpenQueue, onOpenMore, workspaceEntries, projectOptions, effectiveProjectId, onSelectProject, workspaceOptions, workspaceValue, onSelectWorkspace, projectIdentity, activeWorkspaceName, scope, stale, loading, snapshot }: {
+ * the read-only project/workspace/scope/snapshot meta row. The panel is bound
+ * to its workspace, so project and workspace are labels, not selectors. */
+export function ContextBar({ theme, t, styles, onToggleLocale, activeWorkspaceStatus, projectCommentCount, onOpenQueue, onOpenMore, projectIdentity, effectiveProjectId, activeWorkspaceName, scope, stale, loading, snapshot }: {
   theme: PanelTheme;
-  layout: PanelLayout;
   t: TFunc;
   styles: PanelStyles;
   onToggleLocale: () => void;
@@ -18,14 +16,8 @@ export function ContextBar({ theme, layout, t, styles, onToggleLocale, activeWor
   projectCommentCount: number;
   onOpenQueue: () => void;
   onOpenMore: () => void;
-  workspaceEntries: WorkspaceEntry[];
-  projectOptions: ReadonlyArray<{ value: string; label: string }>;
-  effectiveProjectId: string;
-  onSelectProject: (projectId: string) => void;
-  workspaceOptions: ReadonlyArray<{ value: string; label: string }>;
-  workspaceValue: string;
-  onSelectWorkspace: (workspaceId: string) => void;
   projectIdentity: ProjectIdentity | null;
+  effectiveProjectId: string;
   activeWorkspaceName: string;
   scope: ReviewScope;
   stale: boolean;
@@ -61,47 +53,16 @@ export function ContextBar({ theme, layout, t, styles, onToggleLocale, activeWor
         </View>
       </View>
       <View style={styles.contextMeta}>
-        {workspaceEntries.length > 0 ? (
-          <>
-            <View style={styles.contextSelector}>
-              <DropdownSelect
-                label={t("projectLabel")}
-                value={effectiveProjectId}
-                options={projectOptions}
-                onChange={onSelectProject}
-                placeholder={t("selectProject")}
-                closeLabel={t("closeDropdown")}
-                theme={theme}
-                layout={layout}
-              />
-            </View>
-            <View style={styles.contextSelector}>
-              <DropdownSelect
-                label={t("workspaceLabel")}
-                value={workspaceValue}
-                options={workspaceOptions}
-                onChange={onSelectWorkspace}
-                placeholder={t("noWorkspaceOptions")}
-                closeLabel={t("closeDropdown")}
-                theme={theme}
-                layout={layout}
-              />
-            </View>
-          </>
-        ) : (
-          <>
-            <View style={styles.contextItem}>
-              <Text style={styles.contextLabel}>{t("projectLabel")}</Text>
-              <Text numberOfLines={1} style={styles.contextValue}>
-                {projectIdentity?.displayName ?? effectiveProjectId ?? t("noProjectSelected")}
-              </Text>
-            </View>
-            <View style={styles.contextItem}>
-              <Text style={styles.contextLabel}>{t("workspaceLabel")}</Text>
-              <Text numberOfLines={1} style={styles.contextValue}>{activeWorkspaceName}</Text>
-            </View>
-          </>
-        )}
+        <View style={styles.contextItem}>
+          <Text style={styles.contextLabel}>{t("projectLabel")}</Text>
+          <Text numberOfLines={1} style={styles.contextValue}>
+            {projectIdentity?.displayName ?? effectiveProjectId ?? t("noProjectSelected")}
+          </Text>
+        </View>
+        <View style={styles.contextItem}>
+          <Text style={styles.contextLabel}>{t("workspaceLabel")}</Text>
+          <Text numberOfLines={1} style={styles.contextValue}>{activeWorkspaceName}</Text>
+        </View>
         <View style={styles.contextItem}>
           <Text style={styles.contextLabel}>{t("scopeLabel")}</Text>
           <Text style={styles.contextValue}>{t(scopeLabelKeys[scope])}</Text>

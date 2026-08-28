@@ -21,11 +21,6 @@ import {
 } from "./review.shared";
  import { reviewService } from "./server/index.server";
 
-type WorkspaceListEntry = {
-  workspaceDirectory?: string;
-  projectRootPath: string;
-  archivingAt: string | null;
-};
 export default function contribute(plugin: PluginContext) {
   plugin.handle(getSnapshot, async (input) => reviewService.createSnapshot(input));
   plugin.handle(getFileView, async (input) => reviewService.fileView(input));
@@ -81,44 +76,6 @@ export default function contribute(plugin: PluginContext) {
     context: "workspace",
     onSelect({ openPanel }) {
       openPanel("review-deck");
-    },
-  });
-  plugin.addCommandCenterItem({
-    id: "review-active-agent-changes",
-    title: "Review active agent changes",
-    icon: "ScanSearch",
-    keywords: ["review", "agent", "diff", "hunk", "risk"],
-    context: "agent",
-    onSelect({ openPanel }) {
-      openPanel("review-deck");
-    },
-  });
-  plugin.addCommandCenterItem({
-    id: "choose-workspace-for-review-deck",
-    title: "Choose workspace for Review Deck",
-    icon: "ScanSearch",
-    keywords: ["review", "workspace", "diff", "hunk", "risk"],
-    context: "global",
-    async onSelect({ paseo }) {
-      // The global command context exposes no openPanel, so the workspace-scoped
-      // Review Deck panel cannot be opened from here. Safe fallback: enumerate
-      // real workspaces and bring the most recently active one to the front via
-      // its actual directory. Never synthesize a workspace id.
-      try {
-        const { entries } = await paseo.workspaces.list({
-          sort: [{ key: "activity_at", direction: "desc" }],
-        });
-        const candidate =
-          entries.find(
-            (ws: WorkspaceListEntry) => ws.archivingAt == null && Boolean(ws.workspaceDirectory ?? ws.projectRootPath),
-          ) ?? entries.find((ws: WorkspaceListEntry) => ws.archivingAt == null);
-        if (!candidate) return;
-        await paseo.workspaces.open({ cwd: candidate.workspaceDirectory ?? candidate.projectRootPath });
-      } catch {
-        // Best-effort convenience: opening a workspace is optional, and the
-        // workspace-scoped "Open Review Deck" command stays reachable in any
-        // open workspace.
-      }
     },
   });
   return () => {};

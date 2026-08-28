@@ -4,9 +4,13 @@ import { z } from "zod";
 export const reviewScopeSchema = z.enum(["working", "staged", "branch", "commits"]);
 export type ReviewScope = z.infer<typeof reviewScopeSchema>;
 
+export const reviewLocaleSchema = z.enum(["zh", "en"]);
+export type ReviewLocale = z.infer<typeof reviewLocaleSchema>;
+
 export const reviewRequestSchema = z.object({
   cwd: z.string().min(1),
   scope: reviewScopeSchema.default("working"),
+  locale: reviewLocaleSchema.optional(),
   baseRef: z.string().trim().min(1).optional(),
   headRef: z.string().trim().min(1).optional(),
   filePath: z.string().trim().min(1).optional(),

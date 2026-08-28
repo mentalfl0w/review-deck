@@ -31,7 +31,7 @@ export default function contribute(plugin: PluginContext) {
   plugin.handle(getFileView, async (input) => reviewService.fileView(input));
   plugin.handle(explainHunk, async (input) => {
     const snapshot = await reviewService.createSnapshot(input);
-    return reviewService.explain(snapshot, reviewService.findHunk(snapshot, input.hunkId));
+    return reviewService.explain(snapshot, reviewService.findHunk(snapshot, input.hunkId), input.locale ?? "en");
   });
   plugin.handle(explainHunkAi, async (input, context) => reviewService.explainHunkWithAgent(input, context));
   plugin.handle(explainFile, async (input) => reviewService.explainFile(input));

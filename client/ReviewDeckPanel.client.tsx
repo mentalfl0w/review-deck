@@ -40,6 +40,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
     baseRef: scopeApi.baseRef,
+    locale,
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
     setActionError,
@@ -79,6 +80,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
     baseRef: scopeApi.baseRef,
+    locale,
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
     selectedFile: snapshotApi.selectedFile,
@@ -251,7 +253,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId }: PluginWorkspaceP
       layout={layout}
       t={t}
       styles={styles}
-      onToggleLocale={() => setManualLocale(locale === "zh" ? "en" : "zh")}
+      onToggleLocale={() => {
+        setManualLocale(locale === "zh" ? "en" : "zh");
+        agentApi.resetAnalysis();
+      }}
       activeWorkspaceStatus={activeWorkspaceStatus}
       projectCommentCount={projectCommentCount}
       onOpenQueue={commentsApi.openProjectQueue}

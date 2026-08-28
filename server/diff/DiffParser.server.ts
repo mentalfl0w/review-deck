@@ -1,4 +1,4 @@
-import type { ReviewSnapshot } from "../../review.shared";
+import type { ReviewLocale, ReviewSnapshot } from "../../review.shared";
 import { canonicalJson, sha256 } from "../util/crypto.server";
 import { detectFindings } from "./FindingDetector.server";
 import { functionHintForHunk, languageFromPath } from "../lang/languages.server";
@@ -88,7 +88,7 @@ function filePathFromDiffHeader(line: string): { oldPath?: string; path: string 
  * target fingerprint plus the hunk's own content.
  */
 export class DiffParser {
-  parse(raw: string, targetFingerprint: string): ReviewSnapshot["files"] {
+  parse(raw: string, targetFingerprint: string, locale: ReviewLocale = "en"): ReviewSnapshot["files"] {
     const files: ReviewSnapshot["files"] = [];
     const lines = raw.split("\n");
     let current: { path: string; oldPath?: string; prefix: string[]; hunks: Hunk[] } | null = null;
@@ -112,7 +112,7 @@ export class DiffParser {
         header: hunkHeader,
         patch,
         lines: [...hunkLines],
-        findings: detectFindings(hunkLines),
+        findings: detectFindings(hunkLines, locale),
         ...(functionHint ? { functionHint } : {}),
         ...(language ? { language } : {}),
       });

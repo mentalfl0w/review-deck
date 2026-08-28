@@ -3,6 +3,7 @@ import { useRpc } from "@getpaseo/plugin";
 import {
   getReviewState,
   getSnapshot,
+  type ReviewLocale,
   type ReviewScope,
   type ReviewSnapshot,
 } from "../../review.shared";
@@ -20,9 +21,10 @@ export function useReviewSnapshot(params: {
   baseRef: string;
   headRef: string;
   filePath: string;
+  locale: ReviewLocale;
   setActionError: (message: string | null) => void;
 }) {
-  const { reviewCwd, scope, baseRef, headRef, filePath, setActionError } = params;
+  const { reviewCwd, scope, baseRef, headRef, filePath, locale, setActionError } = params;
   const snapshotRpc = useRpc(getSnapshot);
   const stateRpc = useRpc(getReviewState);
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null);
@@ -45,6 +47,7 @@ export function useReviewSnapshot(params: {
       const next = await snapshotRpc({
         cwd: reviewCwd,
         scope,
+        locale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
       });
@@ -79,7 +82,7 @@ export function useReviewSnapshot(params: {
     } finally {
       setLoading(false);
     }
-  }, [baseRef, filePath, headRef, reviewCwd, scope, snapshotRpc, stateRpc]);
+  }, [baseRef, filePath, headRef, locale, reviewCwd, scope, snapshotRpc, stateRpc]);
 
   useEffect(() => {
     void refresh();
@@ -92,6 +95,7 @@ export function useReviewSnapshot(params: {
         const next = await snapshotRpc({
           cwd: reviewCwd,
           scope,
+          locale,
           ...(scope === "commits" ? { baseRef, headRef } : {}),
           ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         });
@@ -124,7 +128,7 @@ export function useReviewSnapshot(params: {
       active = false;
       clearInterval(timer);
     };
-  }, [baseRef, filePath, headRef, reviewCwd, scope, snapshot, snapshotRpc, stateRpc]);
+  }, [baseRef, filePath, headRef, locale, reviewCwd, scope, snapshot, snapshotRpc, stateRpc]);
 
   const selected = useMemo(() => {
     if (!snapshot || !selectedHunkId) return null;

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { usePaseo, useRpc } from "@getpaseo/plugin";
 import {
@@ -8,6 +8,7 @@ import {
   runReview,
   type ExplainHunkAiResult,
   type ExplainHunkResult,
+  type ReviewLocale,
   type ReviewScope,
   type ReviewSections,
   type ReviewSnapshot,
@@ -28,6 +29,7 @@ export function useAgentReview(params: {
   baseRef: string;
   headRef: string;
   filePath: string;
+  locale: ReviewLocale;
   selectedFile: ReviewFile | null;
   setActionError: (message: string | null) => void;
   t: TFunc;
@@ -42,6 +44,7 @@ export function useAgentReview(params: {
     baseRef,
     headRef,
     filePath,
+    locale,
     selectedFile,
     setActionError,
     t,
@@ -63,107 +66,145 @@ export function useAgentReview(params: {
   const [agentFeedback, setAgentFeedback] = useState<AgentFeedbackMap>({});
   const [agentsOpen, setAgentsOpen] = useState(true);
   const [findingsOpen, setFindingsOpen] = useState(true);
-
+  // Monotonic guard for analysis requests, mirroring the snapshot pipeline's
+  // snapshotRunRef: every request bumps the counter and resetAnalysis
+  // invalidates it, so a slow response from an earlier hunk or an earlier
+  // locale can never overwrite state that a newer request owns or that the
+  // locale toggle cleared. localeRef carries the latest locale so a response
+  // can be dropped when it no longer matches the active language.
+  const analysisRunRef = useRef(0);
+  const localeRef = useRef(locale);
+  localeRef.current = locale;
   const explainSelected = useCallback(async () => {
     if (!reviewCwd || !selected) return;
+    const run = ++analysisRunRef.current;
+    const requestedLocale = localeRef.current;
     try {
       setActionError(null);
       const result = await explainRpc({
         cwd: reviewCwd,
         scope,
+        locale: requestedLocale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         hunkId: selected.id,
       });
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setExplanation(result);
       setFindingsOpen(true);
       setStale(false);
     } catch (error) {
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [baseRef, explainRpc, filePath, headRef, reviewCwd, scope, selected]);
+  }, [baseRef, explainRpc, filePath, headRef, locale, reviewCwd, scope, selected]);
 
   /** Whole-file deterministic explain: mirrors explainSelected but targets
    * every hunk of the file; the result reuses the explanation pipeline. */
   const explainWholeFile = useCallback(async () => {
     if (!reviewCwd || !selectedFile) return;
+    const run = ++analysisRunRef.current;
+    const requestedLocale = localeRef.current;
     try {
       setActionError(null);
       const result = await explainFileRpc({
         cwd: reviewCwd,
         scope,
+        locale: requestedLocale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         filePath: selectedFile.path,
       });
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setExplanation(result);
       setFindingsOpen(true);
       setStale(false);
     } catch (error) {
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [baseRef, explainFileRpc, filePath, headRef, reviewCwd, scope, selectedFile]);
+  }, [baseRef, explainFileRpc, filePath, headRef, locale, reviewCwd, scope, selectedFile]);
   const explainWithAgent = useCallback(async (agentId: string) => {
     if (!reviewCwd || !selected) return;
+    const run = ++analysisRunRef.current;
+    const requestedLocale = localeRef.current;
     setActionError(null);
     setAiExplainBusy(agentId);
     try {
       const result = await explainHunkAiRpc({
         cwd: reviewCwd,
         scope,
+        locale: requestedLocale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         hunkId: selected.id,
         agentId,
       });
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setAiExplanation(result);
       setFindingsOpen(true);
       setStale(false);
       if (result.status !== "idle") setActionError(t("agentFinishedStatus", { status: result.status }));
     } catch (error) {
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
-      setAiExplainBusy(null);
+      // Only the latest request owns the busy indicator; a superseded slow
+      // response must not clear the newer request's busy state.
+      if (run === analysisRunRef.current) setAiExplainBusy(null);
     }
-  }, [baseRef, explainHunkAiRpc, filePath, headRef, reviewCwd, scope, selected, t]);
+  }, [baseRef, explainHunkAiRpc, filePath, headRef, locale, reviewCwd, scope, selected, t]);
 
   const runAgentReview = useCallback(async (agentId: string) => {
     if (!reviewCwd) return;
+    const run = ++analysisRunRef.current;
+    const requestedLocale = localeRef.current;
     try {
       setActionError(null);
       const result = await runReviewRpc({
         cwd: reviewCwd,
         scope,
+        locale: requestedLocale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         agentId,
       });
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setAgentReview(result.review);
       setAgentSections(result.sections);
       setFindingsOpen(true);
       setStale(false);
       if (result.status !== "idle") setActionError(t("agentFinishedStatus", { status: result.status }));
     } catch (error) {
+      if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [baseRef, filePath, headRef, reviewCwd, runReviewRpc, scope, t]);
+  }, [baseRef, filePath, headRef, locale, reviewCwd, runReviewRpc, scope, t]);
 
   const sendRevision = useCallback(async (agentId: string) => {
     if (!selected) return;
-    const prompt = explanation?.revisionPrompt ?? [
-      `Revise only ${selected.id} in ${selected.filePath}.`,
-      `Review snapshot fingerprint: ${snapshot?.targetFingerprint ?? "unknown"}.`,
-      `Hunk fingerprint: ${selected.fingerprint}.`,
-      "Do not modify unrelated files or hunks.",
-      "Stop and report if the current target no longer matches the fingerprint.",
-    ].join("\n");
+    const prompt = explanation?.revisionPrompt ?? (locale === "zh"
+      ? [
+        `仅修改 ${selected.filePath} 中的 ${selected.id}。`,
+        `评审快照指纹：${snapshot?.targetFingerprint ?? "未知"}。`,
+        `变更块指纹：${selected.fingerprint}。`,
+        "不要修改无关文件或变更块。",
+        "如果当前目标与指纹不再匹配，请停止并报告。",
+      ].join("\n")
+      : [
+        `Revise only ${selected.id} in ${selected.filePath}.`,
+        `Review snapshot fingerprint: ${snapshot?.targetFingerprint ?? "unknown"}.`,
+        `Hunk fingerprint: ${selected.fingerprint}.`,
+        "Do not modify unrelated files or hunks.",
+        "Stop and report if the current target no longer matches the fingerprint.",
+      ].join("\n"));
     try {
       setActionError(null);
       await paseo.agents.ref(agentId).send(prompt);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [explanation?.revisionPrompt, paseo.agents, selected, snapshot?.targetFingerprint]);
+  }, [explanation?.revisionPrompt, locale, paseo.agents, selected, snapshot?.targetFingerprint]);
   const sendFeedbackToAgent = useCallback(async (agent: AgentInfo) => {
     if (!selected || !snapshot) return;
     const comment = commentBody.trim();
@@ -193,8 +234,12 @@ export function useAgentReview(params: {
   }, [commentBody, paseo.agents, selected, snapshot]);
 
   // Everything analysis-related that a hunk switch discards. Called by the
-  // panel's composed selectHunk; also clears the findings disclosure.
+  // panel's composed selectHunk; the findings disclosure stays expanded.
   const resetAnalysis = useCallback(() => {
+    // Supersede every in-flight analysis request (hunk switch, locale
+    // toggle): a slow old-language response must not repopulate the cleared
+    // explanation/AI/review state.
+    analysisRunRef.current += 1;
     setExplanation(null);
     setAiExplanation(null);
     setAgentReview(null);
@@ -202,7 +247,7 @@ export function useAgentReview(params: {
     setStale(false);
     setAgentFeedback({});
     setAiExplainBusy(null);
-    setFindingsOpen(false);
+    setFindingsOpen(true);
   }, [setStale]);
 
   return {

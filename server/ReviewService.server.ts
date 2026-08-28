@@ -9,6 +9,7 @@ import type {
   ProjectReviewComment,
   ProjectReviewCommentOutcome,
   ProjectReviewSummary,
+  ReviewLocale,
   ReviewRequest,
   ReviewSections,
   ReviewScope,
@@ -57,6 +58,108 @@ interface ReviewTarget {
   baseSha: string | null;
   headSha: string | null;
 }
+type DeterministicCopy = {
+  file: string;
+  formatLabel: (label: string, value: string) => string;
+  enclosingSymbol: string;
+  language: string;
+  changedRange: string;
+  changedLines: (added: number, removed: number) => string;
+  fallbackHumanCheck: string;
+  fallbackCategoryCheck: (category: string) => string;
+  reviseHunk: (hunkId: string, filePath: string) => string;
+  reviseFile: (filePath: string) => string;
+  snapshotFingerprint: (fingerprint: string) => string;
+  hunkFingerprint: (fingerprint: string) => string;
+  doNotModify: string;
+  beforeEditing: string;
+  humanChecks: string;
+  fileHunk: (header: string) => string;
+};
+
+const DETERMINISTIC_COPY: Record<ReviewLocale, DeterministicCopy> = {
+  en: {
+    file: "File",
+    formatLabel: (label, value) => `${label}: ${value}.`,
+    enclosingSymbol: "Enclosing symbol",
+    language: "Language",
+    changedRange: "Changed range",
+    changedLines: (added, removed) => `The hunk adds ${added} lines and removes ${removed} lines.`,
+    fallbackHumanCheck: "Confirm the changed behavior against its callers and its nearest focused test.",
+    fallbackCategoryCheck: (category) => `Confirm the ${category} implications.`,
+    reviseHunk: (hunkId, filePath) => `Revise only ${hunkId} in ${filePath}.`,
+    reviseFile: (filePath) => `Revise only ${filePath} according to the review above.`,
+    snapshotFingerprint: (fingerprint) => `Review snapshot fingerprint: ${fingerprint}.`,
+    hunkFingerprint: (fingerprint) => `Hunk fingerprint: ${fingerprint}.`,
+    doNotModify: "Do not modify unrelated files or hunks.",
+    beforeEditing: "Before editing, stop and report if the current target fingerprint differs.",
+    humanChecks: "Human checks:",
+    fileHunk: (header) => `Hunk ${header}:`,
+  },
+  zh: {
+    file: "文件",
+    formatLabel: (label, value) => `${label}：${value}。`,
+    enclosingSymbol: "所在符号",
+    language: "语言",
+    changedRange: "变更范围",
+    changedLines: (added, removed) => `此变更块新增 ${added} 行，删除 ${removed} 行。`,
+    fallbackHumanCheck: "请结合调用方和最近的针对性测试，确认变更后的行为。",
+    fallbackCategoryCheck: (category) => `请确认 ${category} 相关影响。`,
+    reviseHunk: (hunkId, filePath) => `仅修改 ${filePath} 中的 ${hunkId}。`,
+    reviseFile: (filePath) => `请根据上述评审结果，仅修改文件 ${filePath}。`,
+    snapshotFingerprint: (fingerprint) => `评审快照指纹：${fingerprint}。`,
+    hunkFingerprint: (fingerprint) => `变更块指纹：${fingerprint}。`,
+    doNotModify: "不要修改无关文件或变更块。",
+    beforeEditing: "编辑前，如果当前目标指纹不一致，请停止并报告。",
+    humanChecks: "人工检查：",
+    fileHunk: (header) => `变更块 ${header}：`,
+  },
+};
+
+function deterministicCopy(locale: ReviewLocale | undefined): DeterministicCopy {
+  return DETERMINISTIC_COPY[locale === "zh" ? "zh" : "en"];
+}
+
+function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "explain"): string[] {
+  if (locale === "zh") {
+    return mode === "review"
+      ? [
+        "请为人工评审者审查当前 Git 变更。",
+        "不要修改文件。使用只读工具检查调用方、被调用方、相关测试和当前文件。",
+        "请使用简体中文回答；代码、文件路径、函数名、Git 标头和命令输出保持原文。",
+        "请严格使用以下标题：已确认事实、AI 推断、建议人工确认。",
+        "仅报告直接由提供的快照或你实际执行的命令支持的已确认事实。",
+        "除非实际运行过，否则不要声称测试或构建已通过。",
+        "每条发现必须包含对应的变更块 ID。",
+      ]
+      : [
+        "请用简体中文向人工评审者解释这一个变更块。",
+        "不要修改文件。",
+        "请严格使用以下标题：已确认事实、AI 推断、建议人工确认。",
+        "仅报告直接由提供的 diff 或你实际执行的命令支持的已确认事实。",
+        "除非实际运行过，否则不要声称测试或构建已通过。",
+        "代码、文件路径、函数名、Git 标头和命令输出保持原文。",
+      ];
+  }
+  return mode === "review"
+    ? [
+      "Review the current Git changeset for a human reviewer.",
+      "Do not edit files. Inspect callers, callees, related tests, and the current files with your read-only tools.",
+      "Respond in English. Keep code, file paths, symbol names, Git headers, and command output unchanged.",
+      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
+      "Only report VERIFIED FACTS that are directly supported by the supplied snapshot or commands you actually ran.",
+      "Every finding must include a hunk id. Never claim that tests or builds passed unless you ran them.",
+    ]
+    : [
+      "Explain this single hunk for a human reviewer.",
+      "Do not edit files.",
+      "Respond in English. Keep code, file paths, symbol names, Git headers, and command output unchanged.",
+      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
+      "Only report VERIFIED FACTS that are directly supported by the supplied diff or commands you actually ran.",
+      "Never claim that tests or builds passed unless you ran them.",
+    ];
+}
+
 
 /**
  * Composes the Git runner, diff parser, language heuristics, and state store
@@ -99,7 +202,7 @@ export class ReviewService {
       worktreeStateHash: sha256(`${status}\u0000${worktreeDiff}\u0000${untrackedStateHash}`),
       filePath: request.filePath ?? null,
     }));
-    const files = this.diffParser.parse(await this.diffFor(request, target, untracked), targetFingerprint);
+    const files = this.diffParser.parse(await this.diffFor(request, target, untracked), targetFingerprint, request.locale ?? "en");
     const totalHunks = files.reduce((total, file) => total + file.hunks.length, 0);
     const priorityHunks = files.reduce(
       (total, file) => total + file.hunks.filter((hunk) => hunk.findings.some((finding) => severityRank(finding.severity) >= 4)).length,
@@ -702,35 +805,40 @@ export class ReviewService {
     });
   }
 
-  explain(snapshot: ReviewSnapshot, hunk: Hunk): {
+  explain(snapshot: ReviewSnapshot, hunk: Hunk, locale: ReviewLocale = "en"): {
     hunkId: string;
     verifiedFacts: string[];
     aiInference: string[];
     humanVerificationRecommended: string[];
     revisionPrompt: string;
   } {
+    const copy = deterministicCopy(locale);
+    const addedLines = hunk.lines.filter((line) => line.startsWith("+")).length;
+    const removedLines = hunk.lines.filter((line) => line.startsWith("-")).length;
     const facts = [
-      `File: ${hunk.filePath}.`,
-      ...(hunk.functionHint ? [`Enclosing symbol: ${hunk.functionHint}.`] : []),
-      ...(hunk.language ? [`Language: ${displayLanguage(hunk.language)}.`] : []),
-      `Changed range: ${hunk.header}.`,
-      `The hunk adds ${hunk.lines.filter((line) => line.startsWith("+")).length} lines and removes ${hunk.lines.filter((line) => line.startsWith("-")).length} lines.`,
+      copy.formatLabel(copy.file, hunk.filePath),
+      ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
+      ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
+      copy.formatLabel(copy.changedRange, hunk.header),
+      copy.changedLines(addedLines, removedLines),
       ...hunk.findings.filter((finding) => finding.evidenceKind === "verified_fact").map((finding) => finding.detail),
     ];
     const highRisk = hunk.findings.filter((finding) => severityRank(finding.severity) >= 4);
     const humanChecks = highRisk.length > 0
-      ? highRisk.map((finding) => finding.suggestedCheck ?? `Confirm the ${finding.category} implications.`)
-      : ["Confirm the changed behavior against its callers and its nearest focused test."];
-    const inference = ["The exact motivation is not proven by the diff alone; inspect the task context and surrounding call sites before accepting this change."];
+      ? highRisk.map((finding) => finding.suggestedCheck ?? copy.fallbackCategoryCheck(finding.category))
+      : [copy.fallbackHumanCheck];
+    const inference = locale === "zh"
+      ? ["仅凭 diff 无法证明确切动机；在接受此变更前，请检查任务上下文和周边调用方。"]
+      : ["The exact motivation is not proven by the diff alone; inspect the task context and surrounding call sites before accepting this change."];
     const revisionPrompt = [
-      `Revise only ${hunk.id} in ${hunk.filePath}.`,
-      ...(hunk.functionHint ? [`Enclosing symbol: ${hunk.functionHint}.`] : []),
-      ...(hunk.language ? [`Language: ${displayLanguage(hunk.language)}.`] : []),
-      `Review snapshot fingerprint: ${snapshot.targetFingerprint}.`,
-      `Hunk fingerprint: ${hunk.fingerprint}.`,
-      "Do not modify unrelated files or hunks.",
-      "Before editing, stop and report if the current target fingerprint differs.",
-      "Human checks:",
+      copy.reviseHunk(hunk.id, hunk.filePath),
+      ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
+      ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
+      copy.snapshotFingerprint(snapshot.targetFingerprint),
+      copy.hunkFingerprint(hunk.fingerprint),
+      copy.doNotModify,
+      copy.beforeEditing,
+      copy.humanChecks,
       ...humanChecks.map((check) => `- ${check}`),
     ].join("\n");
     return { hunkId: hunk.id, verifiedFacts: facts, aiInference: inference, humanVerificationRecommended: humanChecks, revisionPrompt };
@@ -741,30 +849,34 @@ export class ReviewService {
    * carries the file path so the client's findings pipeline can render it.
    */
   async explainFile(input: ReviewRequest & { filePath: string }): Promise<ExplainHunkResult> {
+    const locale = input.locale ?? "en";
+    const copy = deterministicCopy(locale);
     const snapshot = await this.createSnapshot(input);
     const file = snapshot.files.find((candidate) => candidate.path === input.filePath);
     if (!file) {
       throw new Error(`File ${input.filePath} is no longer present in this review snapshot.`);
     }
-    const sections = file.hunks.map((hunk) => this.explain(snapshot, hunk));
+    const sections = file.hunks.map((hunk) => this.explain(snapshot, hunk, locale));
     const verifiedFacts = file.hunks.flatMap((hunk, index) => [
-      `Hunk ${hunk.header}:`,
+      copy.fileHunk(hunk.header),
       ...sections[index].verifiedFacts.map((fact) => `- ${fact}`),
     ]);
     const aiInference = file.hunks.flatMap((hunk, index) => [
-      `Hunk ${hunk.header}:`,
+      copy.fileHunk(hunk.header),
       ...sections[index].aiInference.map((item) => `- ${item}`),
     ]);
     const humanVerificationRecommended = file.hunks.flatMap((hunk, index) => [
-      `Hunk ${hunk.header}:`,
+      copy.fileHunk(hunk.header),
       ...sections[index].humanVerificationRecommended.map((item) => `- ${item}`),
     ]);
     const revisionPrompt = [
-      `Revise only ${input.filePath} according to the review above.`,
-      `Review snapshot fingerprint: ${snapshot.targetFingerprint}.`,
-      ...file.hunks.map((hunk) => `Hunk ${hunk.id} (${hunk.header}): fingerprint ${hunk.fingerprint}.`),
-      "Do not modify unrelated files or hunks.",
-      "Before editing, stop and report if the current target fingerprint differs.",
+      copy.reviseFile(input.filePath),
+      copy.snapshotFingerprint(snapshot.targetFingerprint),
+      ...file.hunks.map((hunk) => locale === "zh"
+        ? `变更块 ${hunk.id}（${hunk.header}）：指纹 ${hunk.fingerprint}。`
+        : `Hunk ${hunk.id} (${hunk.header}): fingerprint ${hunk.fingerprint}.`),
+      copy.doNotModify,
+      copy.beforeEditing,
     ].join("\n");
     return {
       hunkId: input.filePath,
@@ -783,10 +895,14 @@ export class ReviewService {
     };
     let active: keyof ReviewSections | null = null;
     for (const line of text.split("\n")) {
-      const heading = line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/:$/, "");
-      if (heading === "VERIFIED FACTS") active = "verifiedFacts";
-      else if (heading === "AI INFERENCE") active = "aiInference";
-      else if (heading === "HUMAN VERIFICATION RECOMMENDED") active = "humanVerificationRecommended";
+      const heading = line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/[:：]$/, "");
+      if (heading === "VERIFIED FACTS" || heading === "已确认事实" || heading === "已验证事实") active = "verifiedFacts";
+      else if (heading === "AI INFERENCE" || heading === "AI 推断" || heading === "AI推断") active = "aiInference";
+      else if (
+        heading === "HUMAN VERIFICATION RECOMMENDED"
+        || heading === "建议人工确认"
+        || heading === "人工验证建议"
+      ) active = "humanVerificationRecommended";
       else if (active && line.trim()) sections[active].push(line.trim().replace(/^[-*]\s+/, ""));
     }
     if (sections.verifiedFacts.length === 0 && sections.aiInference.length === 0 && sections.humanVerificationRecommended.length === 0 && text.trim()) {
@@ -800,24 +916,21 @@ export class ReviewService {
     context: PluginHandlerContext,
   ): Promise<AgentReviewResult> {
     const snapshot = await this.createSnapshot(input);
+    const locale = input.locale ?? "en";
     const hunkContext = snapshot.files
       .flatMap((file) => file.hunks)
       .map((hunk) => `${hunk.id} ${hunk.filePath} ${hunk.header}${hunk.functionHint ? ` (enclosing: ${hunk.functionHint})` : ""}\n${hunk.patch}`)
       .join("\n")
       .slice(0, 160_000);
     const prompt = [
-      "Review the current Git changeset for a human reviewer.",
-      "Do not edit files. Inspect callers, callees, related tests, and the current files with your read-only tools.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "Only report VERIFIED FACTS that are directly supported by the supplied snapshot or commands you actually ran.",
-      "Every finding must include a hunk id. Never claim that tests or builds passed unless you ran them.",
-      `Workspace: ${snapshot.worktreePath}`,
-      `Review fingerprint: ${snapshot.targetFingerprint}`,
-      "Hunks:",
-      hunkContext || "(No text hunks found.)",
+      ...agentInstructions(locale, "review"),
+      locale === "zh" ? `工作区：${snapshot.worktreePath}` : `Workspace: ${snapshot.worktreePath}`,
+      locale === "zh" ? `评审指纹：${snapshot.targetFingerprint}` : `Review fingerprint: ${snapshot.targetFingerprint}`,
+      locale === "zh" ? "变更块：" : "Hunks:",
+      hunkContext || (locale === "zh" ? "（没有找到文本变更块。）" : "(No text hunks found.)"),
     ].join("\n\n");
     const result = await context.paseo.agents.ref(input.agentId).run(prompt, { timeoutMs: 120_000 });
-    const review = result.lastMessage ?? result.error ?? "The review agent returned no text.";
+    const review = result.lastMessage ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
     return {
       status: result.status,
       review,
@@ -836,24 +949,22 @@ export class ReviewService {
     context: PluginHandlerContext,
   ): Promise<ExplainHunkAiResult> {
     const snapshot = await this.createSnapshot(input);
+    const locale = input.locale ?? "en";
+    const copy = deterministicCopy(locale);
     const hunk = this.findHunk(snapshot, input.hunkId);
     const prompt = [
-      "Explain this single hunk for a human reviewer.",
-      "Do not edit any files.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "Only report VERIFIED FACTS that are directly supported by the supplied diff or commands you actually ran.",
-      "Never claim that tests or builds passed unless you ran them.",
-      `Workspace: ${snapshot.worktreePath}`,
-      `Review fingerprint: ${snapshot.targetFingerprint}`,
-      `Hunk id: ${hunk.id}`,
-      `File: ${hunk.filePath}`,
-      `Hunk header: ${hunk.header}`,
-      `Exact hunk diff:\n${hunk.patch}`,
-      ...(hunk.functionHint ? [`Enclosing symbol: ${hunk.functionHint}.`] : []),
-      ...(hunk.language ? [`Language: ${displayLanguage(hunk.language)}.`] : []),
+      ...agentInstructions(locale, "explain"),
+      locale === "zh" ? `工作区：${snapshot.worktreePath}` : `Workspace: ${snapshot.worktreePath}`,
+      locale === "zh" ? `评审指纹：${snapshot.targetFingerprint}` : `Review fingerprint: ${snapshot.targetFingerprint}`,
+      locale === "zh" ? `变更块 ID：${hunk.id}` : `Hunk id: ${hunk.id}`,
+      copy.formatLabel(copy.file, hunk.filePath),
+      locale === "zh" ? `变更块标头：${hunk.header}` : `Hunk header: ${hunk.header}`,
+      locale === "zh" ? `完整变更块 diff：\n${hunk.patch}` : `Exact hunk diff:\n${hunk.patch}`,
+      ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
+      ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
     ].join("\n\n");
     const result = await context.paseo.agents.ref(input.agentId).run(prompt, { timeoutMs: 120_000 });
-    const review = result.lastMessage ?? result.error ?? "The explain agent returned no text.";
+    const review = result.lastMessage ?? result.error ?? (locale === "zh" ? "解释 Agent 未返回文本。" : "The explain agent returned no text.");
     let provider = input.agentId;
     let model = "unknown";
     try {
@@ -871,11 +982,13 @@ export class ReviewService {
       hunkId: hunk.id,
       ...this.parseReviewSections(review),
       revisionPrompt: [
-        `Revise only ${hunk.id} in ${hunk.filePath} according to the AI explanation above.`,
-        `Review snapshot fingerprint: ${snapshot.targetFingerprint}.`,
-        `Hunk fingerprint: ${hunk.fingerprint}.`,
-        "Do not modify unrelated files or hunks.",
-        "Before editing, stop and report if the current target fingerprint differs.",
+        locale === "zh"
+          ? `根据上面的 AI 解释，仅修改 ${hunk.filePath} 中的 ${hunk.id}。`
+          : `Revise only ${hunk.id} in ${hunk.filePath} according to the AI explanation above.`,
+        copy.snapshotFingerprint(snapshot.targetFingerprint),
+        copy.hunkFingerprint(hunk.fingerprint),
+        copy.doNotModify,
+        copy.beforeEditing,
       ].join("\n"),
       status: result.status,
       provider,

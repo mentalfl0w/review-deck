@@ -23,6 +23,9 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Inline comments | Write a file-level main comment beside the change details and save it; the comment stays anchored to the change you reviewed |
 | Project comments queue | The top queue aggregates every saved comment for the current project, grouped by workspace, scope, and file |
 | AI processing | Select the Agent of the current workspace and process all saved comments for the project in one batch |
+| Agent-context Review Deck | Open Review Deck bound to the Agent of the current workspace — its own panel entry, the Command Center item **Open Review Deck for this Agent**, or the **`/review-deck`** slash command in an Agent chat; the Agent is preselected as the review target |
+| Submission timeline row | Handing a comment batch to an Agent adds one row to that Agent's timeline — *"{count} review comments submitted"*. The row records only the submission: it never claims completion and never carries comment, patch, path, or identifier content |
+| Review defaults | Panel language (Auto / 中文 / English) and default diff layout (Auto / Unified / Split), configured under **Settings → Plugins → Review defaults** and stored per host |
 | AI review & explain | Explain a hunk with local rules or ask an Agent for an AI explanation; run a full review of the changeset with an Agent; results separate verified facts from AI inference |
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
 | Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
@@ -38,15 +41,15 @@ flowchart TB
     E -- yes --> C
     E -- no --> F[Project comments queue]
     F --> G[Pick an Agent of the selected workspace]
-    G --> H[Process all saved comments in one Agent run]
-    H --> I[Per-comment outcomes: completed / stale / failed / unresolved]
-    I --> J[Delete only completed comments]
-    J -.-> K[Stale, failed and new comments are kept]
+    G --> H[Hand every saved comment to that Agent's workflow]
+    H --> I[Queue clears once the Agent accepts the batch]
+    I --> J[Agent works through the comments and reports outcomes in its conversation]
+    I -.-> K[The Agent's timeline gets one row: comments submitted — never completion]
 ```
 
 ## Architecture
 
-The plugin is a three-layer Paseo plugin: a React Native panel, a typed RPC contract file, and a server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.8.x** plugin built on the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -58,50 +61,60 @@ flowchart LR
         Panel --> UI
     end
 
-    subgraph shared["review.shared.ts"]
-        RPC["zod schemas + defineRpc contracts"]
+    subgraph shared["shared/ — contracts"]
+        RPC["zod schemas + defineRpc contracts<br/>review defaults · handoff row data"]
     end
 
     subgraph server["server/ — service layer"]
-        Wire["index.server.ts — RPC wiring"]
         Svc["ReviewService"]
         Git["GitRunner"]
         Parse["DiffParser · FindingDetector"]
         Store["StateStore"]
-        Wire --> Svc
         Svc --> Git
         Svc --> Parse
         Svc --> Store
     end
 
+    ClientEntry["index.client.tsx (repo root)<br/>registers panels (workspace + Agent)<br/>Command Center items · /review-deck<br/>timeline row · Review defaults screen"]
+    ServerEntry["index.server.ts (repo root)<br/>creates ReviewService · registers<br/>RPCs · starts maintenance"]
     Agents["Paseo Agents"]
     Repo[("workspace repo")]
     State[("reviews.json")]
 
+    ClientEntry --> Panel
     Panel -- "useRpc" --> RPC
-    RPC --> Wire
+    RPC --> ServerEntry
+    ServerEntry --> Svc
     Git -- "git -C <cwd>" --> Repo
     Store --> State
     Svc -- "comment batch · explanation · review" --> Agents
 ```
 
+- **index.client.tsx** is the v0.8 client runtime entry — it registers both Review Deck panels (the workspace panel and the Agent-context panel that preselects the current Agent), the **Open Review Deck** and **Open Review Deck for this Agent** Command Center items, the **`/review-deck`** slash command, the timeline renderer for the submission row, and the **Review defaults** settings screen with the Paseo client runtime.
+- **index.server.ts** is the v0.8 server runtime entry — it constructs the `ReviewService`, registers the RPC handlers from the shared contract, and starts the maintenance sweep; its returned cleanup stops maintenance on unload.
 - **client/** owns presentation and intent only — every mutation goes through an RPC.
-- **review.shared.ts** is the single source of truth for request/response shapes (zod), imported by both sides.
+- **shared/review.ts** is the single source of truth for request/response shapes (zod), imported by both sides.
+- **shared/review-settings.ts** defines the host-scoped v1 Review Deck defaults — panel locale (`auto`/`zh`/`en`) and default diff layout (`auto`/`unified`/`split`). Only harmless display preferences are settings; agent identity, scopes, paths, comments, and review state are never persisted there.
+- **shared/review-handoff.ts** defines the version-1 `review-deck-handoff` timeline row: exactly a positive comment count and the ISO submission timestamp, parsed strictly so a row can never carry review content, patch text, file paths, or workspace/project/agent identifiers.
 - **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` owns atomic JSON persistence, `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
+
+Requires **Paseo 0.8.x** (`>=0.8.0 <0.9.0`).
 
 ## Usage
 
-1. **Open the panel.** From the Command Center (⌘K / Ctrl+K), run **Open Review Deck**. The panel opens on the workspace you started from and defaults to it.
+1. **Open the panel.** From the Command Center (⌘K / Ctrl+K), run **Open Review Deck**. The panel opens on the workspace you started from and defaults to it. From inside an Agent, use **Open Review Deck for this Agent** or type **`/review-deck`** to open the deck bound to that Agent — it is preselected as the review target.
 2. **Pick a project and workspace.** Use the pickers at the top of the panel. Selecting a project or workspace brings that workspace to the Paseo foreground.
 3. **Browse the changes.** Work through the changed files; each file shows its hunks with the exact diff next to the change details.
 4. **Leave a comment.** Write a file-level main comment beside the change details and save it.
 5. **Watch the queue.** The project comments queue at the top summarizes all saved comments for the current project.
-6. **Process with an Agent.** Select an Agent from the current workspace and process all saved comments for the project in one batch.
-7. **Clean up.** After processing, delete the comments that were clearly marked as completed. Failed, stale, or unresolved comments are kept.
+6. **Process with an Agent.** Select an Agent from the current workspace and process all saved comments for the project in one batch. The batch is handed to that Agent's workflow and the queue clears at handoff — Review Deck never waits for the Agent and never tracks completion.
+7. **Read the results in the Agent's conversation.** The Agent works through the comments and reports per-comment outcomes (completed / stale / failed / unresolved) in its own reply; its timeline also shows one *"{count} review comments submitted"* row as the handoff record. Re-add any comment the Agent could not complete if you want it revisited.
+8. **Tune the defaults.** Under **Settings → Plugins → Review defaults**, choose the panel language (Auto / 中文 / English) and the default diff layout (Auto / Unified / Split); these host-scoped settings apply everywhere Review Deck opens.
 
 ## Safety & limitations
 
-- **No automatic deletion.** Comments are never deleted automatically. Only comments an Agent explicitly marked as completed (while idle) can be cleared — failed, stale, and unresolved comments are always kept.
+- **Comments leave the deck at handoff, not at completion.** Processing a project hands every saved comment to the selected Agent's workflow fire-and-forget; once the Agent accepts the batch, those comments are removed from the queue (reviewed records are kept). Review Deck never tracks whether the Agent's work completed — the Agent reports per-comment outcomes in its own conversation, and you re-add anything it could not finish.
+- **The timeline row records only the submission.** The *"{count} review comments submitted"* row on the Agent's timeline is an audit record of the handoff, not a completion tracker: it never claims the work finished and carries no comment or patch content, file paths, or identifiers.
 - **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
 - **Batch processing is delegated.** Project batch processing is executed by the selected workspace Agent, so outcomes depend on that Agent; AI explanations and reviews are labeled with the provider/model that produced them.
 - **Commit scopes are read-only.** Branch and commit scopes support commenting and feedback, but hunk rejection is available only for working-tree and staged changes.
@@ -124,7 +137,7 @@ paseo plugin reload review-deck            # reload after source edits
 paseo plugin ls                            # verify the plugin is running
 ```
 
-Open the panel from the Command Center (**⌘K** on macOS, **Ctrl+K** on Windows/Linux) with **Open Review Deck**.
+Open the panel from the Command Center (**⌘K** on macOS, **Ctrl+K** on Windows/Linux) with **Open Review Deck** — or, from inside an Agent, use **Open Review Deck for this Agent** or the **`/review-deck`** slash command for the Agent-bound deck.
 
 The plugin depends on an existing Paseo workspace and Agent. No additional model configuration is required — models are configured in the Paseo Agent settings, and Review Deck uses the model of the Agent you select.
 

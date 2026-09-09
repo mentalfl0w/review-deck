@@ -16,13 +16,10 @@ package-lock.json
 dist/
 build/
 
-# Generated JavaScript (TypeScript compile output)
+# Generated TypeScript compile output
 *.js
 *.js.map
-
-# Keep the Paseo plugin type definitions required by the source
 *.d.ts
-!paseo-plugin.d.ts
 
 # Logs
 *.log

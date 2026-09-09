@@ -2,12 +2,12 @@
  * Deterministic jitter regression tests for the tooltip layer.
  *
  * Runs under plain Node (no React, no react-native): only the pure logic in
- * client/components/tooltip.client.ts is exercised, with injected fake
+ * client/components/tooltip.ts is exercised, with injected fake
  * timers so every assertion is deterministic.
  *
  * Run: npx tsc --outDir /tmp/tj-out --module commonjs --target ES2020
  *   --moduleResolution node --esModuleInterop --skipLibCheck --types node
- *   --lib ES2020 client/components/tooltip.client.ts tests/tooltip-jitter.test.ts
+ *   --lib ES2020 client/components/tooltip.ts tests/tooltip-jitter.test.ts
  *   && node /tmp/tj-out/tests/tooltip-jitter.test.js
  */
 import assert from "node:assert/strict";
@@ -18,7 +18,7 @@ import {
   windowFrameEquals,
   type TooltipTimerHost,
   type TooltipVisibilityMachine,
-} from "../client/components/tooltip.client";
+} from "../client/components/tooltip";
 
 /** Fake timer host: advance() runs due timers in order, deterministically. */
 function fakeTimers() {

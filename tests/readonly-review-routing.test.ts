@@ -5,14 +5,20 @@
  * startRunReview) must run on a TRANSIENT child agent (context.paseo.agents.create
  * + child.waitForFinish + autoArchive) so nothing pollutes the selected workspace
  * Agent's message stream. Because the plugin host RPC layer times out long
- * reviews, the flow is split: a start RPC creates the child and returns its id
- * (NO waiting in the handler), and a poll RPC waits in short windows and resolves
- * the result. The daemon's create_agent_request schema requires config.provider
- * in combined "provider/model" format with NO separate model key, derived from
- * the selected workspace Agent's snapshot. Editing flows hand the prompt to the
+ * reviews, the flow is split: a start RPC validates the workspace-bound agent
+ * gate, creates the child, and returns a per-request capability (randomUUID —
+ * NEVER the child's globally discoverable agent id) as the requestId (NO
+ * waiting in the handler); a poll RPC repeats the start-time workspace/agent
+ * binding and waits in short windows, resolving the result. The daemon's
+ * create_agent_request schema requires config.provider in combined
+ * "provider/model" format with NO separate model key, derived from the
+ * selected workspace Agent's snapshot. Editing flows hand the prompt to the
  * selected Agent's workflow fire-and-forget (processProjectReview handle.send,
  * client reviseCurrentFromComment/reviseFileFromComment send) — never waited on
- * — and remove the handed-over comments from Review Deck.
+ * — remove the handed-over comments from Review Deck, and append one
+ * content-minimal version-1 "review-deck-handoff" timeline row (send first,
+ * best-effort append, queue clear last; the row records only the submission,
+ * never completion, and carries no review content or identifiers).
  *
  * The fake-daemon harness (tests/agent-message-stream.test.ts) does not answer
  * create_agent_request, so this file asserts the routing contract at source level
@@ -28,10 +34,10 @@ import { CreateAgentRequestMessageSchema } from "@getpaseo/protocol/messages";
 
 // Tests run from the repository root (same model as agent-message-stream.test.ts).
 const repoRoot = process.cwd();
-const serviceSource = readFileSync(join(repoRoot, "server/ReviewService.server.ts"), "utf8");
-const clientHookSource = readFileSync(join(repoRoot, "client/hooks/useAgentReview.client.ts"), "utf8");
-const i18nSource = readFileSync(join(repoRoot, "client/i18n.client.ts"), "utf8");
-const sharedSource = readFileSync(join(repoRoot, "review.shared.ts"), "utf8");
+const serviceSource = readFileSync(join(repoRoot, "server/ReviewService.ts"), "utf8");
+const clientHookSource = readFileSync(join(repoRoot, "client/hooks/useAgentReview.ts"), "utf8");
+const i18nSource = readFileSync(join(repoRoot, "client/i18n.ts"), "utf8");
+const sharedSource = readFileSync(join(repoRoot, "shared/review.ts"), "utf8");
 
 // 0. The superseded blocking RPCs are gone from the shared contract; the async
 //    start/poll RPCs and the schemas/types the new flow still builds are kept.
@@ -42,6 +48,23 @@ assert.ok(!sharedSource.includes("review-deck.explain-hunk-ai"), "old explain-hu
 assert.match(sharedSource, /export const startExplainHunkAi = defineRpc\(/, "startExplainHunkAi RPC must exist");
 assert.match(sharedSource, /export const startRunReview = defineRpc\(/, "startRunReview RPC must exist");
 assert.match(sharedSource, /export const pollAiReview = defineRpc\(/, "pollAiReview RPC must exist");
+// The async read-only RPCs carry an explicit workspace binding; the poll
+// repeats the start-time workspace/agent binding next to the capability.
+assert.match(
+  sharedSource,
+  /input: reviewRequestSchema\.extend\(\{\n\s+hunkId: z\.string\(\)\.min\(1\),\n\s+agentId: z\.string\(\)\.min\(1\),\n\s+workspaceId: z\.string\(\)\.min\(1\),\n\s+\}\)/,
+  "startExplainHunkAi input must bind workspaceId",
+);
+assert.match(
+  sharedSource,
+  /input: reviewRequestSchema\.extend\(\{ agentId: z\.string\(\)\.min\(1\), workspaceId: z\.string\(\)\.min\(1\) \}\)/,
+  "startRunReview input must bind workspaceId",
+);
+assert.match(
+  sharedSource,
+  /input: z\.object\(\{\n\s+requestId: z\.string\(\)\.min\(1\),\n\s+workspaceId: z\.string\(\)\.min\(1\),\n\s+agentId: z\.string\(\)\.min\(1\),\n\s+\}\)/,
+  "pollAiReview input must carry the request capability plus the workspace/agent binding",
+);
 assert.ok(!sharedSource.includes("commentOutcomes"), "process result schema must drop commentOutcomes");
 assert.ok(!sharedSource.includes("completedCommentIds"), "process result schema must drop completedCommentIds");
 assert.ok(!sharedSource.includes("projectReviewCommentOutcome"), "outcome schema/type must be removed from the shared contract");
@@ -76,17 +99,32 @@ assert.match(
 );
 assert.match(
   serviceSource,
-  /this\.transientReviewAgents\.set\(child\.id, \{\n\s+handle: child,/,
-  "start must register the child handle keyed by child id (the requestId)",
+  /const requestId = randomUUID\(\);\n\s+this\.transientReviewAgents\.set\(requestId, \{\n\s+handle: child,/,
+  "start must register the child handle under a fresh per-request capability (randomUUID), never the child id",
 );
-assert.match(serviceSource, /return child\.id;/, "start must return the child id as the requestId");
+assert.match(
+  serviceSource,
+  /workspaceId: input\.workspaceId,\n\s+agentId: input\.agentId,\n\s+startedAt: Date\.now\(\)/,
+  "the registered entry must carry the workspace/agent binding recorded at start time",
+);
+assert.match(serviceSource, /return requestId;/, "start must return the capability as the requestId");
+assert.ok(!serviceSource.includes("return child.id;"), "the child id (globally discoverable) must never be returned as the requestId");
 const waitForFinishCalls = serviceSource.match(/\.waitForFinish\(/g) ?? [];
 assert.equal(
   waitForFinishCalls.length,
   1,
   "waitForFinish must be called exactly once in the whole service — inside pollAiReview, never in the start handler",
 );
-assert.match(serviceSource, /async pollAiReview\(input: \{ requestId: string \}\)/, "poll method must exist");
+assert.match(
+  serviceSource,
+  /async pollAiReview\(input: \{ requestId: string; workspaceId: string; agentId: string \}\)/,
+  "poll method must take the request capability plus the workspace/agent binding",
+);
+assert.match(
+  serviceSource,
+  /if \(!entry \|\| entry\.workspaceId !== input\.workspaceId \|\| entry\.agentId !== input\.agentId\) \{/,
+  "poll must refuse an unknown capability or a mismatched workspace/agent binding",
+);
 assert.match(
   serviceSource,
   /result = await entry\.handle\.waitForFinish\(READONLY_REVIEW_POLL_WAIT_MS\);/,
@@ -114,13 +152,50 @@ assert.match(
   "settled with null/empty lastMessage must use timeline text, then error, then the locale fallback",
 );
 
-// 3. Start RPC methods exist and return { requestId }.
+// 3. Start RPC methods exist and return { requestId }; both inputs carry the
+//    workspace binding and the signatures type it.
 assert.match(serviceSource, /async startExplainHunkAi\(/, "startExplainHunkAi must exist");
 assert.match(serviceSource, /async startRunReview\(/, "startRunReview must exist");
+assert.match(
+  serviceSource,
+  /input: ReviewRequest & \{ hunkId: string; agentId: string; workspaceId: string \}/,
+  "startExplainHunkAi must type the workspace binding",
+);
+assert.match(
+  serviceSource,
+  /input: ReviewRequest & \{ agentId: string; workspaceId: string \}/,
+  "startRunReview must type the workspace binding",
+);
 assert.match(serviceSource, /Promise<\{ requestId: string \}>/, "start methods must return the requestId");
 assert.match(serviceSource, /this\.startTransientReviewAgent\(/, "start methods must use the create-only start");
 assert.ok(!serviceSource.includes("async runAgentReview("), "old blocking runAgentReview must be removed");
 assert.ok(!serviceSource.includes("async explainHunkWithAgent("), "old blocking explainHunkWithAgent must be removed");
+
+// 3b. The workspace-bound agent gate lives in resolveParentAgentConfig and
+//     runs BEFORE any child is created: the refreshed parent must belong to
+//     the claimed workspace, the claimed workspace itself must resolve to the
+//     reviewed worktree, and the parent agent must run in that worktree. A
+//     foreign workspace Agent can never be bound to another workspace's diff.
+assert.match(
+  serviceSource,
+  /if \(agent\.workspaceId !== input\.workspaceId\) \{/,
+  "the refreshed parent agent must belong to the claimed workspace",
+);
+assert.match(
+  serviceSource,
+  /const workspaceHandle = context\.paseo\.workspaces\.ref\(input\.workspaceId\);/,
+  "the claimed workspace must be refreshed (its id alone never authorizes a cwd)",
+);
+assert.match(
+  serviceSource,
+  /if \(!\(await this\.directoriesMatch\(workspaceDirectory, input\.worktreePath\)\)\) \{/,
+  "the claimed workspace directory must BE the reviewed worktree",
+);
+assert.match(
+  serviceSource,
+  /if \(!agent\.cwd \|\| !\(await this\.directoriesMatch\(agent\.cwd, input\.worktreePath\)\)\) \{/,
+  "the parent agent must run in the reviewed worktree",
+);
 
 // 4. The parent-snapshot resolver exists and refreshes the SELECTED agent
 //    (fresh.agent ?? current(), falling back to current()).
@@ -207,6 +282,59 @@ assert.match(
   "reviseFileFromComment must clear the handed-over file comment and refresh the project list",
 );
 
+// 7b. v0.8 submission timeline row: after the daemon ACCEPTS the send, the
+//     service appends one content-minimal "review-deck-handoff" row to the
+//     SAME agent's timeline, then clears the queue. Ordering is asserted by
+//     source position (never by whitespace or generated ids), and the append
+//     must be best-effort: a failure is swallowed so the queue clear still
+//     runs and no error surfaces that could make a client retry re-send the
+//     prompt and duplicate the Agent task.
+const sendIndex = serviceSource.indexOf("await handle.send(prompt);");
+const appendIndex = serviceSource.indexOf("await handle.timeline.append({");
+const clearIndex = serviceSource.indexOf("await this.clearProjectReviewComments(input.projectId);");
+assert.ok(
+  sendIndex >= 0 && appendIndex > sendIndex && clearIndex > appendIndex,
+  "ordering must be: accepted send, then the timeline append, then the queue clear",
+);
+const tryIndex = serviceSource.indexOf("try {", sendIndex);
+const catchIndex = serviceSource.indexOf("catch (error)", sendIndex);
+assert.ok(
+  tryIndex > sendIndex && tryIndex < appendIndex && appendIndex < catchIndex && catchIndex < clearIndex,
+  "the timeline append must sit inside a try introduced only after the send, with its catch before the queue clear",
+);
+// The catch swallows the append failure: nothing between it and the queue
+// clear may return or throw, so a failed append can never skip the clear.
+const catchToClear = serviceSource.slice(catchIndex, clearIndex);
+assert.ok(
+  !/\breturn\b|\bthrow\b/.test(catchToClear),
+  "append failure must be swallowed (no return/throw between the catch and the queue clear)",
+);
+// The row is built through the SHARED strict schema with exactly the two
+// allowed fields; no review content, patch text, path, or identifier may
+// appear in the append payload.
+const appendSegment = serviceSource.slice(appendIndex, catchIndex);
+assert.match(appendSegment, /type: "plugin",/, "append must be a plugin-kind timeline item");
+assert.match(appendSegment, /kind: reviewHandoffTimelineKind,/, "append must use the shared handoff kind constant");
+assert.match(appendSegment, /version: reviewHandoffTimelineVersion,/, "append must use the shared handoff version constant");
+const handoffPayload = serviceSource.match(/data: reviewHandoffTimelineSchema\.parse\(\{([\s\S]*?)\}\),/);
+assert.ok(handoffPayload, "the timeline row must be validated through the shared reviewHandoffTimelineSchema.parse");
+assert.match(
+  handoffPayload[1],
+  /commentCount: processedCommentIds\.length,/,
+  "row data must carry the submitted batch's comment count",
+);
+assert.match(
+  handoffPayload[1],
+  /submittedAt: new Date\(\)\.toISOString\(\),/,
+  "row data must carry the ISO submission timestamp",
+);
+for (const forbidden of ["filePath", "hunkPatch", "hunkHeader", "projectId", "workspaceId", "agentId", "cwd", "prompt", "content"]) {
+  assert.ok(
+    !handoffPayload[1].includes(forbidden),
+    `timeline row data must not carry a ${forbidden} field`,
+  );
+}
+
 // 8. Client-side async polling: the AI flows call the start RPCs and poll
 //    pollAiReview every few seconds with a total cap, guarding each landing.
 assert.match(clientHookSource, /const startExplainHunkAiRpc = useRpc\(startExplainHunkAi\);/, "client must bind startExplainHunkAi");
@@ -215,7 +343,17 @@ assert.match(clientHookSource, /const pollAiReviewRpc = useRpc\(pollAiReview\);/
 assert.match(clientHookSource, /const \{ requestId \} = await startExplainHunkAiRpc\(/, "explainWithAgent must start, not block");
 assert.match(clientHookSource, /const \{ requestId \} = await startRunReviewRpc\(/, "runAgentReview must start, not block");
 assert.match(clientHookSource, /await pollUntilDone\(requestId, run, requestedLocale, /, "both flows must poll until done");
-assert.match(clientHookSource, /const result = await pollAiReviewRpc\(\{ requestId \}\);/i, "pollUntilDone must call pollAiReview");
+assert.match(
+  clientHookSource,
+  /const result = await pollAiReviewRpc\(\{ requestId, workspaceId: boundWorkspaceId, agentId: boundAgentId \}\);/i,
+  "pollUntilDone must call pollAiReview with the request capability plus the bound workspace/agent",
+);
+assert.match(
+  clientHookSource,
+  /cwd: reviewCwd,\n\s+workspaceId,\n\s+scope,/,
+  "both start calls must carry the bound workspaceId next to the reviewed cwd",
+);
+assert.match(clientHookSource, /pollUntilDone\(requestId, run, requestedLocale, workspaceId, agentId, /, "both flows must poll with the start-time workspace/agent binding");
 assert.match(
   clientHookSource,
   /run !== analysisRunRef\.current \|\| localeRef\.current !== requestedLocale/,
@@ -275,12 +413,21 @@ assert.equal(bareFrame.config.model, undefined, "bare parent: no model key and s
 assert.equal(bareFrame.config.thinkingOptionId, undefined, "bare parent: thinkingOptionId omitted and still schema-valid");
 
 console.log("readonly-review-routing: all assertions passed");
-console.log("verdict: read-only reviews (startExplainHunkAi, startRunReview) create a transient child agent");
-console.log("         and return its id WITHOUT waiting; pollAiReview waits in short windows and resolves the");
-console.log("         result (timeout = still running, idle/error/permission = settled, unknown = error).");
+console.log("verdict: read-only reviews (startExplainHunkAi, startRunReview) pass a workspace-bound agent");
+console.log("         gate (parent agent belongs to the claimed workspace, the claimed workspace's");
+console.log("         directory is the reviewed worktree, the parent runs in that worktree), then create a");
+console.log("         transient child agent and return a per-request capability (randomUUID — NEVER the");
+console.log("         child's discoverable agent id) WITHOUT waiting; pollAiReview repeats the start-time");
+console.log("         workspace/agent binding, waits in short windows and resolves the result (timeout =");
+console.log("         still running, idle/error/permission = settled, unknown or mismatched = error).");
 console.log("         config.provider is the combined 'provider/model' derived from the selected workspace");
 console.log("         Agent snapshot (no separate model key, optional thinkingOptionId); the client polls");
 console.log("         every few seconds with a 5-minute cap. Editing flows (processProjectReview handle.send,");
 console.log("         client reviseCurrent/reviseFileFromComment send) hand the prompt to the visible stream");
 console.log("         fire-and-forget and clear the submitted comments from Review Deck.");
+console.log("         processProjectReview appends one best-effort, content-minimal version-1");
+console.log("         review-deck-handoff timeline row (accepted send, then append, then queue clear): the");
+console.log("         strict shared schema admits only commentCount + submittedAt, so the row records the");
+console.log("         submission and never completion, review content, paths, or identifiers, and a failed");
+console.log("         append is swallowed so the queue clear always runs.");
 console.log("         The combined config parses against the daemon's CreateAgentRequestMessageSchema.");

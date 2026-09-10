@@ -21,9 +21,9 @@ function run(command, args) {
   });
 }
 
-await run(process.execPath, ["tests/agent-message-stream.test.ts"]);
-await run(process.execPath, ["tests/readonly-review-routing.test.ts"]);
-await run(process.execPath, ["tests/review-settings-timeline.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/agent-message-stream.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/readonly-review-routing.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/review-settings-timeline.test.ts"]);
 
 const outputDirectory = await mkdtemp(join(tmpdir(), "review-deck-tooltip-"));
 try {

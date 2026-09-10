@@ -2,7 +2,7 @@
 
 A **human-in-the-loop review plugin for Paseo**. When an Agent finishes a change in a Paseo workspace (worktree), reviewing the result across many files is awkward — you have to keep viewing diffs, annotate them, feed your feedback back to an Agent, and clean up afterwards. Review Deck turns a Git changeset into a **navigable review workspace**: browse files and hunks, leave comments right next to the exact diff, collect them in a project queue, and let one Agent process all of them at once.
 
-![Review Deck — human-in-the-loop review workspace for Paseo](pic/screenshot.png)
+![Review Deck — human-in-the-loop review workspace for Paseo](images/review-deck.png)
 
 ## The problem
 
@@ -111,35 +111,50 @@ Requires **Paseo 0.8.x** (`>=0.8.0 <0.9.0`).
 7. **Read the results in the Agent's conversation.** The Agent works through the comments and reports per-comment outcomes (completed / stale / failed / unresolved) in its own reply; its timeline also shows one *"{count} review comments submitted"* row as the handoff record. Re-add any comment the Agent could not complete if you want it revisited.
 8. **Tune the defaults.** Under **Settings → Plugins → Review defaults**, choose the panel language (Auto / 中文 / English) and the default diff layout (Auto / Unified / Split); these host-scoped settings apply everywhere Review Deck opens.
 
-## Safety & limitations
+## Limitations
 
 - **Comments leave the deck at handoff, not at completion.** Processing a project hands every saved comment to the selected Agent's workflow fire-and-forget; once the Agent accepts the batch, those comments are removed from the queue (reviewed records are kept). Review Deck never tracks whether the Agent's work completed — the Agent reports per-comment outcomes in its own conversation, and you re-add anything it could not finish.
 - **The timeline row records only the submission.** The *"{count} review comments submitted"* row on the Agent's timeline is an audit record of the handoff, not a completion tracker: it never claims the work finished and carries no comment or patch content, file paths, or identifiers.
-- **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
 - **Batch processing is delegated.** Project batch processing is executed by the selected workspace Agent, so outcomes depend on that Agent; AI explanations and reviews are labeled with the provider/model that produced them.
 - **Commit scopes are read-only.** Branch and commit scopes support commenting and feedback, but hunk rejection is available only for working-tree and staged changes.
 - **An Agent is required.** AI review and feedback need an available Agent in the current workspace; without one, deterministic analysis and manual review still work.
 
-## Quick start
+## Safety controls
 
-From the repository root:
+- **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
+
+## Installation
+
+Review Deck requires Paseo 0.8.x (currently beta) and is incompatible with Paseo 0.7.x.
+
+Install it from GitHub:
 
 ```sh
-npm install        # install dependencies
-npm run typecheck  # type check
-```
-
-Install and manage the plugin with the Paseo CLI:
-
-```sh
-paseo plugin install /path/to/review-deck  # install from this repo
-paseo plugin reload review-deck            # reload after source edits
-paseo plugin ls                            # verify the plugin is running
+paseo plugin add mentalfl0w/review-deck
+paseo plugin ls
 ```
 
 Open the panel from the Command Center (**⌘K** on macOS, **Ctrl+K** on Windows/Linux) with **Open Review Deck** — or, from inside an Agent, use **Open Review Deck for this Agent** or the **`/review-deck`** slash command for the Agent-bound deck.
 
 The plugin depends on an existing Paseo workspace and Agent. No additional model configuration is required — models are configured in the Paseo Agent settings, and Review Deck uses the model of the Agent you select.
+
+## Development
+
+From the repository root:
+
+```sh
+npm install
+npm run typecheck
+npm test
+```
+
+Install and manage a local checkout with the Paseo CLI:
+
+```sh
+paseo plugin install /absolute/path/to/review-deck
+paseo plugin reload review-deck
+paseo plugin ls
+```
 
 ## Acknowledge
 

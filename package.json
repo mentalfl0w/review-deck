@@ -1,9 +1,22 @@
 {
   "name": "review-deck",
-  "private": true,
   "version": "1.1.0",
+  "private": true,
+  "description": "Human-in-the-loop code review workspace for Paseo with inline file comments and project-level AI processing.",
+  "license": "MIT",
+  "author": "mentalfl0w",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mentalfl0w/review-deck.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mentalfl0w/review-deck/issues"
+  },
+  "homepage": "https://github.com/mentalfl0w/review-deck#readme",
+  "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test.mjs"
   },
   "devDependencies": {
     "@getpaseo/client": "0.8.0-beta.1",

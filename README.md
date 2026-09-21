@@ -49,7 +49,7 @@ flowchart TB
 
 ## Architecture
 
-Review Deck is a Paseo **0.8.x** plugin built on the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.8+** plugin built on the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -98,7 +98,7 @@ flowchart LR
 - **shared/review-handoff.ts** defines the version-1 `review-deck-handoff` timeline row: exactly a positive comment count and the ISO submission timestamp, parsed strictly so a row can never carry review content, patch text, file paths, or workspace/project/agent identifiers.
 - **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` owns atomic JSON persistence, `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
 
-Requires **Paseo 0.8.x** (`>=0.8.0 <0.9.0`).
+Requires **Paseo 0.8.0 or newer** (`>=0.8.0`).
 
 ## Usage
 

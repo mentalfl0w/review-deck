@@ -134,7 +134,7 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
     diffCellEmpty: { backgroundColor: withAlpha(c.foreground, 0.01) },
     diffCellInner: { flexDirection: "row", alignItems: "flex-start" },
     diffLineNo: { fontFamily: "monospace", fontSize: compact ? 9 : 10, color: c.foregroundMuted, width: 38, flexShrink: 0, textAlign: "right", paddingRight: 6, lineHeight: compact ? 15 : 17, paddingTop: 1 },
-    diffCode: { fontFamily: "monospace", fontSize: compact ? 10.5 : 11.5, lineHeight: compact ? 15 : 17, color: c.foreground, paddingRight: 6, flexShrink: 1 },
+    diffCode: { fontFamily: "monospace", fontSize: compact ? 10.5 : 11.5, lineHeight: compact ? 15 : 17, color: c.foreground, paddingRight: 6, flexShrink: 1, minWidth: 0 },
     diffSign: { width: 16, fontFamily: "monospace", fontWeight: "700", fontSize: compact ? 10.5 : 11.5, lineHeight: compact ? 15 : 17, textAlign: "center" },
     diffSignAdd: { color: c.accent },
     diffSignDel: { color: c.statusDanger },

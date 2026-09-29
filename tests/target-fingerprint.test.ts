@@ -277,19 +277,26 @@ async function main(): Promise<void> {
       hunkFingerprint: "old-fingerprint",
       contentId: savedAnchorEntry.contentId,
     });
-    const reboundEntries = await service.reviewState("tfp-anchor-new", [{
-      hunkId: "new-hunk",
-      filePath: "src/anchor.txt",
-      hunkHeader: "@@ -1 +1 @@",
-      hunkPatch: anchorPatch,
-    }]);
+    const reboundState = await service.reviewState({
+      targetFingerprint: "tfp-anchor-new",
+      currentHunks: [{
+        hunkId: "new-hunk",
+        filePath: "src/anchor.txt",
+        hunkHeader: "@@ -1 +1 @@",
+        hunkPatch: anchorPatch,
+      }],
+    });
+    assert.equal((await store.load())["tfp-anchor-old"], undefined, "the migrated entry leaves its source bucket");
     const reboundAnchorEntry = (await store.load())["tfp-anchor-new"][0];
-    assert.equal(reboundEntries[0]?.anchor?.kind, "hunk");
+    assert.equal(reboundState.decisions[0]?.anchor?.kind, "hunk");
+    assert.equal(reboundState.decisions[0]?.anchorState, "relocated");
+    assert.equal(reboundState.decisions[0]?.id, savedAnchorEntry.id);
+    assert.deepEqual(reboundState.anchorIssues, []);
     assert.deepEqual(reboundAnchorEntry.anchor, {
       kind: "hunk",
       filePath: "src/anchor.txt",
       hunkId: "new-hunk",
-      hunkFingerprint: reboundEntries[0]?.hunkFingerprint,
+      hunkFingerprint: reboundAnchorEntry.hunkFingerprint,
       contentId: savedAnchorEntry.contentId,
     });
     // -----------------------------------------------------------------------
@@ -351,7 +358,7 @@ async function main(): Promise<void> {
     registerRpcStub(FINGERPRINT_RPC, async () => ({ targetFingerprint: currentFingerprint }));
     registerRpcStub(STATE_RPC, async () => {
       stateReads += 1;
-      return { decisions: [] };
+      return { decisions: [], anchorIssues: [] };
     });
 
     const baseProps: ReviewSnapshotWatcherParams = {
@@ -361,6 +368,8 @@ async function main(): Promise<void> {
       headRef: "",
       filePath: "  src/app.txt  ",
       locale: "en",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
       workspaceDiffStat: { additions: 1, deletions: 1 },
       workspaceStatus: "idle",
       agentRevision: 1,

@@ -1,0 +1,24 @@
+{
+  "//": "Compile config for tests/anchor-engine.test.ts: CommonJS output through the same path mapping the target-fingerprint suite uses (@getpaseo/plugin resolves through its exports map, which the legacy node10 resolution used for CJS emit cannot read on its own). Type checking stays the project's own --noEmit run.",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "target": "ES2020",
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": false,
+    "outDir": "../node_modules/.cache/review-deck-anchor-tests",
+    "baseUrl": "..",
+    "paths": {
+      "@getpaseo/plugin": ["node_modules/@getpaseo/plugin/dist/index.d.ts"],
+      "@getpaseo/plugin/server": ["node_modules/@getpaseo/plugin/dist/server/index.d.ts"],
+      "@getpaseo/plugin/client": ["node_modules/@getpaseo/plugin/dist/client/index.d.ts"]
+    }
+  },
+  "files": [
+    "../server/ReviewService.ts",
+    "anchor-engine.test.ts"
+  ]
+}

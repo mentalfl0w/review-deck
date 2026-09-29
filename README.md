@@ -24,6 +24,7 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Project comments queue | The top queue aggregates every saved comment for the current project, grouped by workspace, scope, and file |
 | AI processing | Select the Agent of the current workspace and process all saved comments for the project in one batch |
 | Agent-context Review Deck | Open Review Deck bound to the Agent of the current workspace — its own panel entry, the Command Center item **Open Review Deck for this Agent**, or the **`/review-deck`** slash command in an Agent chat; the Agent is preselected as the review target |
+| Paseo-native entries | Workspace header button and Agent composer pill open the matching Review Deck and show the project's pending comment count. |
 | Submission timeline row | Handing a comment batch to an Agent adds one row to that Agent's timeline — *"{count} review comments submitted"*. The row records only the submission: it never claims completion and never carries comment, patch, path, or identifier content |
 | Review defaults | Panel language (Auto / 中文 / English) and default diff layout (Auto / Unified / Split), configured under **Settings → Plugins → Review defaults** and stored per host |
 | AI review & explain | Explain a hunk with local rules or ask an Agent for an AI explanation; run a full review of the changeset with an Agent; results separate verified facts from AI inference |
@@ -49,7 +50,7 @@ flowchart TB
 
 ## Architecture
 
-Review Deck is a Paseo **0.8+** plugin built on the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. All review state lives on disk in `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.10.1+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -62,7 +63,7 @@ flowchart LR
     end
 
     subgraph shared["shared/ — contracts"]
-        RPC["zod schemas + defineRpc contracts<br/>review defaults · handoff row data"]
+        RPC["zod schemas + defineRpc contracts<br/>fingerprint · comment count · defaults · handoff"]
     end
 
     subgraph server["server/ — service layer"]
@@ -75,11 +76,11 @@ flowchart LR
         Svc --> Store
     end
 
-    ClientEntry["index.client.tsx (repo root)<br/>registers panels (workspace + Agent)<br/>Command Center items · /review-deck<br/>timeline row · Review defaults screen"]
+    ClientEntry["index.client.tsx (repo root)<br/>panels · Command Center · /review-deck<br/>timeline · settings · header / composer entries"]
     ServerEntry["index.server.ts (repo root)<br/>creates ReviewService · registers<br/>RPCs · starts maintenance"]
     Agents["Paseo Agents"]
     Repo[("workspace repo")]
-    State[("reviews.json")]
+    State[("reviews.json · v2")]
 
     ClientEntry --> Panel
     Panel -- "useRpc" --> RPC
@@ -90,19 +91,22 @@ flowchart LR
     Svc -- "comment batch · explanation · review" --> Agents
 ```
 
-- **index.client.tsx** is the v0.8 client runtime entry — it registers both Review Deck panels (the workspace panel and the Agent-context panel that preselects the current Agent), the **Open Review Deck** and **Open Review Deck for this Agent** Command Center items, the **`/review-deck`** slash command, the timeline renderer for the submission row, and the **Review defaults** settings screen with the Paseo client runtime.
-- **index.server.ts** is the v0.8 server runtime entry — it constructs the `ReviewService`, registers the RPC handlers from the shared contract, and starts the maintenance sweep; its returned cleanup stops maintenance on unload.
+- **index.client.tsx** is the Paseo 0.10 client runtime entry — it registers both Review Deck panels, Command Center items, the `/review-deck` slash command, timeline renderer, Review defaults screen, and subscription-backed workspace header / Agent composer entries.
+- **index.server.ts** is the Paseo 0.10 server runtime entry — it retains the settings handle, constructs `ReviewService`, registers RPC handlers, and starts the maintenance sweep; its cleanup stops maintenance on unload.
 - **client/** owns presentation and intent only — every mutation goes through an RPC.
 - **shared/review.ts** is the single source of truth for request/response shapes (zod), imported by both sides.
 - **shared/review-settings.ts** defines the host-scoped v1 Review Deck defaults — panel locale (`auto`/`zh`/`en`) and default diff layout (`auto`/`unified`/`split`). Only harmless display preferences are settings; agent identity, scopes, paths, comments, and review state are never persisted there.
 - **shared/review-handoff.ts** defines the version-1 `review-deck-handoff` timeline row: exactly a positive comment count and the ISO submission timestamp, parsed strictly so a row can never carry review content, patch text, file paths, or workspace/project/agent identifiers.
-- **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` owns atomic JSON persistence, `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
+- **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` validates and atomically migrates the v2 JSON envelope, and `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
 
-Requires **Paseo 0.8.0 or newer** (`>=0.8.0`).
+- **Agent updates are event-driven.** One owned agent subscription feeds the panel registry and composer pills; workspace activity and agent updates trigger fingerprint-only snapshot checks, with a 60-second fallback.
+- **Damaged review state fails closed.** Legacy files migrate automatically; invalid JSON or schema data surfaces an error and is never replaced with an empty store.
+
+Requires **Paseo 0.10.1 or newer** (`>=0.10.1`).
 
 ## Usage
 
-1. **Open the panel.** From the Command Center (⌘K / Ctrl+K), run **Open Review Deck**. The panel opens on the workspace you started from and defaults to it. From inside an Agent, use **Open Review Deck for this Agent** or type **`/review-deck`** to open the deck bound to that Agent — it is preselected as the review target.
+1. **Open the panel.** Use the workspace header's **Review** button, or from an Agent use the composer **Review** pill. The Command Center (**⌘K / Ctrl+K**) and `/review-deck` command remain available. Agent-context entries preselect that Agent as the review target.
 2. **Pick a project and workspace.** Use the pickers at the top of the panel. Selecting a project or workspace brings that workspace to the Paseo foreground.
 3. **Browse the changes.** Work through the changed files; each file shows its hunks with the exact diff next to the change details.
 4. **Leave a comment.** Write a file-level main comment beside the change details and save it.
@@ -125,7 +129,7 @@ Requires **Paseo 0.8.0 or newer** (`>=0.8.0`).
 
 ## Installation
 
-Review Deck requires Paseo 0.8.x (currently beta) and is incompatible with Paseo 0.7.x.
+Review Deck requires Paseo 0.10.1 or newer (`>=0.10.1`).
 
 Install it from GitHub:
 

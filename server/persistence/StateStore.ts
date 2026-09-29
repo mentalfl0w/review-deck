@@ -4,7 +4,14 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { reviewAnchorSchema, reviewScopeSchema, type ReviewAnchor, type ReviewScope } from "../../shared/review";
+import {
+  anchorStateSchema,
+  reviewAnchorSchema,
+  reviewScopeSchema,
+  type AnchorState,
+  type ReviewAnchor,
+  type ReviewScope,
+} from "../../shared/review";
 import { createMutex, type Mutex } from "../util/mutex";
 
 export type StateEntry = {
@@ -28,6 +35,8 @@ export type StateEntry = {
   baseRef?: string;
   headRef?: string;
   anchor?: ReviewAnchor;
+  /** Anchor status of the last resolution against a live target (v1.3). */
+  anchorState?: AnchorState;
 };
 
 export type StateFile = Record<string, StateEntry[]>;
@@ -83,6 +92,7 @@ const stateEntrySchema = z
     baseRef: z.string().min(1).optional(),
     headRef: z.string().min(1).optional(),
     anchor: reviewAnchorSchema.optional(),
+    anchorState: anchorStateSchema.optional(),
   })
   .loose();
 

@@ -41,6 +41,36 @@ export const reviewAnchorSchema = z.discriminatedUnion("kind", [
   lineRangeReviewAnchorSchema,
 ]);
 export type ReviewAnchor = z.infer<typeof reviewAnchorSchema>;
+export const anchorStateSchema = z.enum(["exact", "relocated", "ambiguous", "stale"]);
+export type AnchorState = z.infer<typeof anchorStateSchema>;
+
+export const lineRangeSelectionSchema = z.object({
+  side: z.enum(["old", "new"]),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().positive(),
+}).strict().refine((range) => range.startLine <= range.endLine, {
+  message: "endLine must be greater than or equal to startLine",
+});
+export type LineRangeSelection = z.infer<typeof lineRangeSelectionSchema>;
+
+export const reviewAnchorCandidateSchema = z.union([
+  hunkReviewAnchorSchema,
+  lineRangeReviewAnchorSchema,
+]);
+
+export const reviewAnchorIssueSchema = z.object({
+  id: z.string().min(1),
+  sourceTargetFingerprint: z.string().min(1),
+  sourceHunkId: z.string().min(1),
+  filePath: z.string().min(1),
+  anchor: reviewAnchorSchema,
+  anchorState: z.enum(["ambiguous", "stale"]),
+  candidates: z.array(reviewAnchorCandidateSchema),
+  matchCount: z.number().int().nonnegative(),
+  comment: z.string().min(1),
+  savedAt: z.string().min(1),
+}).strict();
+export type ReviewAnchorIssue = z.infer<typeof reviewAnchorIssueSchema>;
 
 export const reviewLocaleSchema = z.enum(["zh", "en"]);
 export type ReviewLocale = z.infer<typeof reviewLocaleSchema>;
@@ -224,6 +254,11 @@ export const hunkDecision = defineRpc({
     baseRef: z.string().trim().min(1).optional(),
     headRef: z.string().trim().min(1).optional(),
     comment: z.string().trim().max(8000).optional(),
+    lineRange: lineRangeSelectionSchema.optional(),
+    supersedes: z.object({
+      targetFingerprint: z.string().min(1),
+      entryId: z.string().min(1),
+    }).strict().optional(),
   }),
   output: z.object({ savedAt: z.string() }),
 });
@@ -287,27 +322,39 @@ export const revertFile = defineRpc({
 export const reviewStateCurrentHunkSchema = z.object({
   hunkId: z.string().min(1),
   filePath: z.string().min(1),
+  oldPath: z.string().min(1).optional(),
   hunkHeader: z.string().min(1),
   hunkPatch: z.string().min(1),
 });
 export type ReviewStateCurrentHunk = z.infer<typeof reviewStateCurrentHunkSchema>;
 
+export const reviewStateDecisionSchema = z.object({
+  id: z.string().min(1).optional(),
+  hunkId: z.string(),
+  decision: z.enum(["reviewed", "commented"]),
+  comment: z.string().optional(),
+  savedAt: z.string(),
+  anchor: reviewAnchorSchema.optional(),
+  anchorState: anchorStateSchema.optional(),
+});
+export type ReviewStateDecision = z.infer<typeof reviewStateDecisionSchema>;
+
+export const reviewStateResultSchema = z.object({
+  decisions: z.array(reviewStateDecisionSchema),
+  anchorIssues: z.array(reviewAnchorIssueSchema),
+});
+export type ReviewStateResult = z.infer<typeof reviewStateResultSchema>;
+
 export const getReviewState = defineRpc({
   name: "review-deck.state",
   input: z.object({
     targetFingerprint: z.string().min(1),
-    currentHunks: z.array(reviewStateCurrentHunkSchema).optional(),
+    request: reviewRequestSchema,
+    projectId: z.string().min(1).optional(),
+    workspaceId: z.string().trim().min(1).optional(),
+    currentHunks: z.array(reviewStateCurrentHunkSchema),
   }),
-  output: z.object({
-    decisions: z.array(
-      z.object({
-        hunkId: z.string(),
-        decision: z.enum(["reviewed", "commented"]),
-        comment: z.string().optional(),
-        savedAt: z.string(),
-      }),
-    ),
-  }),
+  output: reviewStateResultSchema,
 });
 export const fileViewRowSchema = z.object({
   kind: z.enum(["context", "add", "del"]),
@@ -345,6 +392,8 @@ export const projectReviewCommentSchema = z.object({
   headRef: z.string().optional(),
   comment: z.string(),
   savedAt: z.string(),
+  anchor: reviewAnchorSchema.optional(),
+  anchorState: anchorStateSchema.optional(),
 });
 export type ProjectReviewComment = z.infer<typeof projectReviewCommentSchema>;
 

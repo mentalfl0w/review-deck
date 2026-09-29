@@ -44,9 +44,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(hunkDecision, async (input) => ({
     savedAt: await reviewService.recordDecision(input),
   }));
-  server.handle(getReviewState, async ({ targetFingerprint, currentHunks }) => ({
-    decisions: await reviewService.reviewState(targetFingerprint, currentHunks),
-  }));
+  server.handle(getReviewState, async ({ targetFingerprint, request, projectId, workspaceId, currentHunks }) =>
+    reviewService.reviewState({ targetFingerprint, request, projectId, workspaceId, currentHunks }));
   server.handle(clearHunkState, async ({ targetFingerprint, hunkId }) => ({
     cleared: await reviewService.clearHunkState(targetFingerprint, hunkId),
   }));

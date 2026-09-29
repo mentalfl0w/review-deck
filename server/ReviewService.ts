@@ -3,17 +3,23 @@ import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import type {
+  AnchorState,
   ExplainHunkResult,
+  LineRangeSelection,
   PollAiReviewResult,
   ProcessProjectReviewResult,
   ProjectReviewComment,
   ProjectReviewSummary,
+  ReviewAnchor,
+  ReviewAnchorIssue,
   ReviewLocale,
   ReviewRequest,
   ReviewSections,
   ReviewScope,
   ReviewSnapshot,
   ReviewStateCurrentHunk,
+  ReviewStateDecision,
+  ReviewStateResult,
   FileViewRow,
 } from "../shared/review";
 import type { ReviewDeckSettingsHandle } from "../shared/review-settings";
@@ -23,12 +29,21 @@ import {
   reviewHandoffTimelineVersion,
 } from "../shared/review-handoff";
 import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
+import {
+  buildLineRangeAnchor,
+  currentHunkDescriptors,
+  ownershipMismatch,
+  resolveAnchor,
+  type AnchorResolution,
+  type OwnershipConstraints,
+} from "./AnchorEngine";
 import { RepoMutexRegistry } from "./util/mutex";
 import { displayLanguage } from "./lang/languages";
 import { severityRank } from "./diff/FindingDetector";
-import { DiffParser, hunkFingerprint, parseRange, type Hunk } from "./diff/DiffParser";
+import { DiffParser, parseRange, type Hunk } from "./diff/DiffParser";
 import { GitRunner } from "./git/GitRunner";
 import { StateStore, type StateEntry, type StateFile } from "./persistence/StateStore";
+import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
 export interface ReviewServiceDependencies {
@@ -63,6 +78,7 @@ type TransientTimelinePayload = {
 const FILE_VIEW_MAX_ROWS = 20_000;
 const STATE_BUCKET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+const ANCHOR_FILE_VIEW_CACHE_SIZE = 8;
 interface ReviewTarget {
   repositoryPath: string;
   worktreePath: string;
@@ -89,6 +105,26 @@ type CompleteProjectCommentEntry = StateEntry & Required<Pick<
   "id" | "filePath" | "hunkFingerprint" | "hunkHeader" | "hunkPatch" | "cwd" | "scope"
 >>;
 
+type FileViewInput = ReviewRequest & {
+  filePath: string;
+  targetFingerprint: string;
+  hunks: ReviewStateCurrentHunk[];
+};
+type FileViewData = {
+  binary: boolean;
+  truncated: boolean;
+  complete: boolean;
+  rows: FileViewRow[];
+};
+type ReviewStateInput = {
+  targetFingerprint: string;
+  currentHunks: readonly ReviewStateCurrentHunk[];
+  request?: ReviewRequest;
+  projectId?: string;
+  workspaceId?: string;
+  /** Internal injection for deterministic service tests; the RPC never accepts it. */
+  currentFileViews?: readonly ReviewAnchorFileView[];
+};
 const DETERMINISTIC_COPY: Record<ReviewLocale, DeterministicCopy> = {
   en: {
     file: "File",
@@ -173,6 +209,7 @@ export class ReviewService {
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
   private readonly gitFactory: (cwd: string) => GitRunner;
+  private readonly anchorFileViewCache = new Map<string, ReviewAnchorFileView>();
   // Read-only reviews started by startRunReview/startExplainHunkAi, keyed by
   // a per-request capability (randomUUID) that is NEVER the child agent id —
   // the child id is globally discoverable through the agent registry, the
@@ -294,16 +331,29 @@ export class ReviewService {
    * worktree (working scope), the index (staged), or the head revision
    * (branch/commits); binary content yields an empty view.
    */
-  async fileView(
-    input: ReviewRequest & { filePath: string; targetFingerprint: string; hunks: ReviewStateCurrentHunk[] },
-  ): Promise<{ binary: boolean; truncated: boolean; rows: FileViewRow[] }> {
+  async fileView(input: FileViewInput): Promise<{ binary: boolean; truncated: boolean; rows: FileViewRow[] }> {
+    const { binary, truncated, rows } = await this.fileViewData(input);
+    return { binary, truncated, rows };
+  }
+
+  private async fileViewData(input: FileViewInput): Promise<FileViewData> {
     const target = await this.resolveReviewTarget(input);
+    const gitRunner = this.gitFactory(target.repositoryPath);
+    gitRunner.validatePathSpec(input.filePath);
     let content: string | null = null;
+    let sourceAvailable = false;
     if (input.scope === "working") {
       try {
-        const buffer = await readFile(join(target.repositoryPath, input.filePath));
-        if (buffer.includes(0)) return { binary: true, truncated: false, rows: [] };
+        const repositoryPath = await realpath(target.repositoryPath);
+        const sourcePath = await realpath(join(repositoryPath, input.filePath));
+        const repositoryPrefix = repositoryPath === sep ? repositoryPath : `${repositoryPath}${sep}`;
+        if (sourcePath !== repositoryPath && !sourcePath.startsWith(repositoryPrefix)) {
+          throw new Error("Review Deck refuses to read a file outside the repository.");
+        }
+        const buffer = await readFile(sourcePath);
+        if (buffer.includes(0)) return { binary: true, truncated: false, complete: false, rows: [] };
         content = buffer.toString("utf8");
+        sourceAvailable = true;
       } catch {
         // Unreadable or missing worktree file: fall through to patch-only
         // assembly when hunks are available.
@@ -314,9 +364,10 @@ export class ReviewService {
         const spec = input.scope === "staged"
           ? `:${input.filePath}`
           : `${target.headSha ?? target.headRef}:${input.filePath}`;
-        const shown = await this.gitFactory(target.repositoryPath).run(["show", spec]);
-        if (shown.includes("\u0000")) return { binary: true, truncated: false, rows: [] };
+        const shown = await gitRunner.run(["show", spec]);
+        if (shown.includes("\u0000")) return { binary: true, truncated: false, complete: false, rows: [] };
         content = shown;
+        sourceAvailable = true;
       } catch {
         // Revision or index lookup failed (e.g. the file does not exist in
         // that state): fall through to patch-only assembly.
@@ -329,7 +380,95 @@ export class ReviewService {
         : []
       : this.assembleFileView(content.endsWith("\n") ? content.slice(0, -1).split("\n") : content.split("\n"), input.hunks);
     const truncated = rows.length > FILE_VIEW_MAX_ROWS;
-    return { binary: false, truncated, rows: truncated ? rows.slice(0, FILE_VIEW_MAX_ROWS) : rows };
+    return {
+      binary: false,
+      truncated,
+      complete: sourceAvailable && !truncated,
+      rows: truncated ? rows.slice(0, FILE_VIEW_MAX_ROWS) : rows,
+    };
+  }
+
+  private async loadAnchorFileViews(input: ReviewStateInput): Promise<ReviewAnchorFileView[]> {
+    const request = input.request;
+    if (!request) return [];
+    const stored = await this.store.load();
+    const constraints: OwnershipConstraints = {
+      projectId: input.projectId,
+      workspaceId: input.workspaceId,
+      cwd: request.cwd,
+      scope: request.scope,
+    };
+    const sourcePaths = new Set<string>();
+    for (const entries of Object.values(stored)) {
+      for (const entry of entries) {
+        if (
+          entry.decision === "commented" &&
+          entry.comment?.trim() &&
+          entry.anchor?.kind === "range" &&
+          entry.filePath &&
+          ownershipMismatch(entry, constraints) === null
+        ) {
+          sourcePaths.add(entry.filePath);
+        }
+      }
+    }
+    if (sourcePaths.size === 0) return [];
+
+    const groups = new Map<string, ReviewStateCurrentHunk[]>();
+    for (const hunk of input.currentHunks) {
+      // The hunks already come from the pathspec-scoped snapshot, so no second
+      // file filter is applied here: a directory or wildcard filter has no
+      // single matching file path to compare against.
+      if (!sourcePaths.has(hunk.filePath) && (!hunk.oldPath || !sourcePaths.has(hunk.oldPath))) continue;
+      const group = groups.get(hunk.filePath) ?? [];
+      group.push(hunk);
+      groups.set(hunk.filePath, group);
+    }
+    if (
+      request.filePath &&
+      sourcePaths.has(request.filePath) &&
+      !groups.has(request.filePath)
+    ) {
+      groups.set(request.filePath, []);
+    }
+
+    const views = await Promise.all([...groups].map(async ([filePath, hunks]) => {
+      const cacheKey = canonicalJson([request.cwd, request.scope, input.targetFingerprint, filePath]);
+      const cached = this.anchorFileViewCache.get(cacheKey);
+      if (cached) {
+        this.anchorFileViewCache.delete(cacheKey);
+        this.anchorFileViewCache.set(cacheKey, cached);
+        return cached;
+      }
+      try {
+        const data = await this.fileViewData({
+          ...request,
+          filePath,
+          targetFingerprint: input.targetFingerprint,
+          hunks,
+        });
+        const view: ReviewAnchorFileView = {
+          filePath,
+          oldPath: hunks.find((hunk) => hunk.oldPath !== undefined)?.oldPath,
+          complete: data.complete,
+          binary: data.binary,
+          truncated: data.truncated,
+          rows: data.rows,
+        };
+        this.anchorFileViewCache.set(cacheKey, view);
+        while (this.anchorFileViewCache.size > ANCHOR_FILE_VIEW_CACHE_SIZE) {
+          const oldest = this.anchorFileViewCache.keys().next().value;
+          if (oldest === undefined) break;
+          this.anchorFileViewCache.delete(oldest);
+        }
+        return view;
+      } catch {
+        // An unreadable source is not evidence of a unique match. The engine
+        // falls back to manual-only patch candidates for this target.
+        return null;
+      }
+    }));
+    return views.filter((view): view is ReviewAnchorFileView => view !== null);
   }
   /**
    * Run one maintenance pass: prune every decision bucket whose newest savedAt
@@ -359,6 +498,19 @@ export class ReviewService {
     return () => clearInterval(timer);
   }
 
+  /**
+   * Save one hunk decision. The persisted entry always carries a validated
+   * anchor (roadmap §5.2): a hunk anchor, or — when the client selected lines —
+   * a line range anchor whose hashes and preview are derived from the very
+   * patch the decision was taken from, so an unusable range is rejected before
+   * anything is written.
+   *
+   * `supersedes` is the re-anchor write path: after the whole entry (including
+   * the new anchor) validated, exactly the comment it names — matched by entry
+   * id, and only inside the intended project/workspace/cwd/scope — is removed
+   * in the same critical section that stores the replacement, so a re-anchor
+   * can never duplicate a comment or strand its original.
+   */
   async recordDecision(input: {
     projectId: string;
     cwd: string;
@@ -376,11 +528,45 @@ export class ReviewService {
     baseRef?: string;
     headRef?: string;
     comment?: string;
+    lineRange?: LineRangeSelection;
+    supersedes?: { targetFingerprint: string; entryId: string };
   }): Promise<string> {
     const contentId = hunkContentId(input.filePath, input.hunkPatch);
+    const anchor: ReviewAnchor = input.lineRange
+      ? buildLineRangeAnchor({
+        filePath: input.filePath,
+        hunkId: input.hunkId,
+        hunkFingerprint: input.hunkFingerprint,
+        contentId,
+        hunkHeader: input.hunkHeader,
+        hunkPatch: input.hunkPatch,
+        selection: input.lineRange,
+      })
+      : {
+        kind: "hunk",
+        filePath: input.filePath,
+        hunkId: input.hunkId,
+        hunkFingerprint: input.hunkFingerprint,
+        contentId,
+      };
     return this.store.runExclusive(async () => {
       const savedAt = new Date().toISOString();
       const file = await this.store.load();
+      if (input.supersedes) {
+        if (input.decision !== "commented") {
+          throw new Error("A re-anchored comment must remain a saved comment.");
+        }
+        const sourceEntryId = input.supersedes.entryId;
+        const conflictingComment = (file[input.targetFingerprint] ?? []).find((entry) =>
+          entry.hunkId === input.hunkId &&
+          entry.id !== sourceEntryId &&
+          entry.decision === "commented" &&
+          Boolean(entry.comment?.trim()));
+        if (conflictingComment) {
+          throw new Error("Another saved comment already owns this change block; preserve or clear it before re-anchoring.");
+        }
+        this.removeSupersededComment(file, input, input.supersedes);
+      }
       const entries = file[input.targetFingerprint] ?? [];
       const next = entries.filter((entry) => entry.hunkId !== input.hunkId);
       next.push({
@@ -397,13 +583,8 @@ export class ReviewService {
         hunkHeader: input.hunkHeader,
         hunkPatch: input.hunkPatch,
         contentId,
-        anchor: {
-          kind: "hunk",
-          filePath: input.filePath,
-          hunkId: input.hunkId,
-          hunkFingerprint: input.hunkFingerprint,
-          contentId,
-        },
+        anchor,
+        anchorState: "exact",
         ...(input.projectName ? { projectName: input.projectName } : {}),
         ...(input.projectRootPath ? { projectRootPath: input.projectRootPath } : {}),
         ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
@@ -417,103 +598,300 @@ export class ReviewService {
     });
   }
 
-  async reviewState(targetFingerprint: string, currentHunks?: readonly ReviewStateCurrentHunk[]): Promise<StateEntry[]> {
-    if (!currentHunks) return (await this.store.load())[targetFingerprint] ?? [];
+  /**
+   * Remove exactly the comment a re-anchor supersedes. The source is the entry
+   * carrying the given id inside the named target bucket; when an earlier
+   * resolution already migrated it, the single bucket that still holds the id
+   * is used instead. The removal is refused — leaving the store untouched —
+   * unless the entry really is a saved comment and its project, workspace, cwd,
+   * and scope are compatible with the incoming decision.
+   */
+  private removeSupersededComment(
+    file: StateFile,
+    input: { projectId: string; cwd: string; scope: ReviewScope; workspaceId?: string },
+    supersedes: { targetFingerprint: string; entryId: string },
+  ): void {
+    const holders = Object.entries(file)
+      .map(([key, entries]) => ({ key, entry: entries.find((candidate) => candidate.id === supersedes.entryId) }))
+      .filter((holder): holder is { key: string; entry: StateEntry } => holder.entry !== undefined);
+    const named = holders.find((holder) => holder.key === supersedes.targetFingerprint);
+    const source = named ?? holders[0];
+    if (!source) {
+      throw new Error(
+        `Superseded comment ${supersedes.entryId} no longer exists in the review state; refresh before re-anchoring it.`,
+      );
+    }
+    if (!named && holders.length > 1) {
+      throw new Error(
+        `Superseded comment ${supersedes.entryId} exists in ${holders.length} review targets; refresh before re-anchoring it.`,
+      );
+    }
+    const mismatch = ownershipMismatch(source.entry, {
+      projectId: input.projectId,
+      workspaceId: input.workspaceId,
+      cwd: input.cwd,
+      scope: input.scope,
+    });
+    if (mismatch) {
+      throw new Error(
+        `Superseded comment ${supersedes.entryId} belongs to a different ${mismatch} than this decision; refusing to remove it.`,
+      );
+    }
+    if (source.entry.decision !== "commented" || !(source.entry.comment?.trim())) {
+      throw new Error(
+        `Superseded entry ${supersedes.entryId} is not a saved comment; refusing to remove it.`,
+      );
+    }
+    const next = file[source.key].filter((entry) => entry !== source.entry);
+    if (next.length === 0) delete file[source.key];
+    else file[source.key] = next;
+  }
+
+  /**
+   * Resolve the saved decisions against the hunks the client currently shows
+   * (roadmap v1.3 §6).
+   *
+   * Entries that resolve exactly or by relocation are migrated to the current
+   * target — identity, anchor position, and the patch fields the handoff
+   * prompt reads are rewritten — and returned as decisions. Stale and
+   * ambiguous anchors are never auto-selected: they stay where they are, keep
+   * their last known anchor state, and are surfaced as anchor issues with their
+   * candidate positions so the user can re-anchor them. Migration (and
+   * surfacing) is restricted to entries whose cwd/scope match the request and
+   * whose project/workspace are compatible, so one worktree's review never
+   * leaks into another; a field either side does not define never blocks. A
+   * foreign entry that shares the requested bucket is still surfaced as a
+   * decision, but it is neither marked nor turned into an anchor issue: the
+   * supersede write path refuses to replace another project's comment, so such
+   * an issue could never be healed from this review.
+   */
+  async reviewState(input: ReviewStateInput): Promise<ReviewStateResult> {
+    const fileViews = input.currentFileViews ?? await this.loadAnchorFileViews(input);
     return this.store.runExclusive(async () => {
       const file = await this.store.load();
       let changed = false;
       // Fallback GC: whole buckets whose newest decision predates the 30-day
       // window are dead; drop everything but the requested target.
-      if (this.pruneStaleBuckets(file, targetFingerprint) > 0) changed = true;
-      // Content ids of the hunks the client currently shows; inheritance and
-      // result filtering both key on them.
-      const currentContentIds = new Set(currentHunks.map((hunk) => hunkContentId(hunk.filePath, hunk.hunkPatch)));
-      const bucket = file[targetFingerprint] ?? [];
-      const presentContentIds = new Set(bucket.flatMap((entry) => (entry.contentId ? [entry.contentId] : [])));
-      // Inherit: move the earliest-saved entry per needed content id out of
-      // other buckets, fields as-is; a bucket emptied by the move disappears.
-      const inherited = new Map<string, StateEntry>();
-      for (const [key, entries] of Object.entries(file)) {
-        if (key === targetFingerprint) continue;
+      if (this.pruneStaleBuckets(file, input.targetFingerprint) > 0) changed = true;
+      const descriptors = currentHunkDescriptors(input.targetFingerprint, input.currentHunks);
+      const requestedPath = input.request?.filePath;
+      // request.filePath is a Git pathspec — the snapshot hands it to git — so
+      // it may name a directory or a wildcard pattern: every file the snapshot
+      // actually contains is relevant, not only an exact string match. A stored
+      // path under the filter's directory stays relevant too, so an entry whose
+      // file left the diff is still surfaced as a stale anchor issue.
+      const relevantFiles = new Set<string>();
+      if (requestedPath) {
+        relevantFiles.add(requestedPath);
+        for (const descriptor of descriptors) {
+          relevantFiles.add(descriptor.hunk.filePath);
+          if (descriptor.hunk.oldPath) relevantFiles.add(descriptor.hunk.oldPath);
+        }
+      }
+      const requestedDirectory = requestedPath === undefined
+        ? null
+        : requestedPath.endsWith("/")
+          ? requestedPath
+          : `${requestedPath}/`;
+      const withinRequestedPath = (filePath: string): boolean =>
+        relevantFiles.has(filePath) ||
+        (requestedDirectory !== null && filePath.startsWith(requestedDirectory));
+      const constraints: OwnershipConstraints = {
+        projectId: input.projectId,
+        workspaceId: input.workspaceId,
+        cwd: input.request?.cwd,
+        scope: input.request?.scope,
+      };
+      const decisions: ReviewStateDecision[] = [];
+      const issues: ReviewAnchorIssue[] = [];
+      const moved: StateEntry[] = [];
+      // The requested target's own entries are resolved first, so a migrated
+      // entry can neither shadow nor duplicate one the target already holds.
+      const presentHunkIds = new Set((file[input.targetFingerprint] ?? []).map((entry) => entry.hunkId));
+      const keys = [input.targetFingerprint, ...Object.keys(file).filter((key) => key !== input.targetFingerprint)];
+      for (const key of keys) {
+        const entries = file[key];
+        if (entries === undefined) continue;
+        const sameTarget = key === input.targetFingerprint;
         for (const entry of entries) {
-          if (!entry.contentId || presentContentIds.has(entry.contentId) || !currentContentIds.has(entry.contentId)) continue;
-          const existing = inherited.get(entry.contentId);
-          if (!existing || entry.savedAt < existing.savedAt) inherited.set(entry.contentId, entry);
-        }
-      }
-      if (inherited.size > 0) {
-        const migrated = [...inherited.values()].sort((left, right) => left.savedAt.localeCompare(right.savedAt));
-        file[targetFingerprint] = [...bucket, ...migrated];
-        // The inherited entry moves out of its source bucket; a bucket emptied
-        // by the move disappears.
-        for (const entry of migrated) {
-          for (const key of Object.keys(file)) {
-            if (key === targetFingerprint) continue;
-            const source = file[key];
-            const index = source.indexOf(entry);
-            if (index === -1) continue;
-            source.splice(index, 1);
-            if (source.length === 0) delete file[key];
-            break;
+          if (requestedPath && (!entry.filePath || !withinRequestedPath(entry.filePath))) continue;
+          // An entry whose cwd/scope/project/workspace does not match this
+          // review is never migrated. In the requested bucket it still surfaces
+          // (the v1.2 bucket semantics), but this review never marks it or
+          // raises an issue for it: the supersede write path refuses to replace
+          // another project's/workspace's comment, so such an issue could never
+          // be healed from here.
+          const foreign = ownershipMismatch(entry, constraints) !== null;
+          if (!sameTarget && foreign) continue;
+          const resolution = resolveAnchor({
+            entry,
+            descriptors,
+            sameTarget,
+            // Comments take every drift level; reviewed records keep the v1.2
+            // scope (exact fingerprint or content identity only).
+            fileViews,
+            fullDrift: entry.decision === "commented",
+          });
+          if (!sameTarget && resolution.descriptor !== undefined && presentHunkIds.has(resolution.descriptor.hunk.hunkId)) {
+            if (entry.decision === "commented") {
+              // A current decision already owns this hunk. Never silently drop
+              // an older comment: preserve it as an explicit ambiguity, and let
+              // the supersede write path refuse to overwrite another comment.
+              const descriptor = resolution.descriptor;
+              const candidate: ReviewAnchor = resolution.anchor?.kind === "range" || resolution.anchor?.kind === "hunk"
+                ? resolution.anchor
+                : {
+                  kind: "hunk",
+                  filePath: descriptor.hunk.filePath,
+                  hunkId: descriptor.hunk.hunkId,
+                  hunkFingerprint: descriptor.fingerprint,
+                  contentId: descriptor.contentId,
+                };
+              const collision: AnchorResolution = { ...resolution, state: "ambiguous", candidates: [candidate] };
+              if (!foreign && entry.anchor !== undefined && entry.anchorState !== "ambiguous") {
+                entry.anchorState = "ambiguous";
+                changed = true;
+              }
+              const issue = foreign ? null : this.anchorIssue(entry, key, collision);
+              if (issue) issues.push(issue);
+            }
+            continue;
           }
+          if (resolution.state === "exact" || resolution.state === "relocated") {
+            if (this.applyAnchorResolution(entry, resolution, input.targetFingerprint) > 0) changed = true;
+            if (!sameTarget) {
+              if (resolution.descriptor !== undefined) presentHunkIds.add(resolution.descriptor.hunk.hunkId);
+              moved.push(entry);
+            }
+            decisions.push(this.decisionRow(entry, resolution.state));
+            continue;
+          }
+          // Stale and ambiguous anchors stay where they are (the old target may
+          // return, making them exact again); comments are surfaced with their
+          // candidate positions, and every anchor keeps its last known state.
+          if (!foreign && entry.anchor !== undefined && entry.anchorState !== resolution.state) {
+            entry.anchorState = resolution.state;
+            changed = true;
+          }
+          const issue = foreign ? null : this.anchorIssue(entry, key, resolution);
+          if (issue) issues.push(issue);
         }
-        changed = true;
       }
-      for (const key of Object.keys(file)) {
-        if (key !== targetFingerprint && file[key].length === 0) {
-          delete file[key];
+      if (moved.length > 0) {
+        const moving = new Set(moved);
+        for (const key of Object.keys(file)) {
+          if (key === input.targetFingerprint) continue;
+          const entries = file[key];
+          const next = entries.filter((entry) => !moving.has(entry));
+          if (next.length === entries.length) continue;
+          if (next.length === 0) delete file[key];
+          else file[key] = next;
           changed = true;
         }
+        file[input.targetFingerprint] = [...(file[input.targetFingerprint] ?? []), ...moved];
       }
       if (changed) await this.store.save(file);
-      // Match: content-id hits, or legacy id/fingerprint hits against the
-      // current hunks; anything else stays out of the result. Content-matched
-      // entries may still carry a hunkId from an earlier fingerprint era
-      // (inherited or drifted in place), so their identity is rebound to the
-      // current hunk — persisted too, keeping clients free of id lookup
-      // mismatches and recordDecision's same-id replace coherent.
-      const metaByContentId = new Map<string, { id: string; fingerprint: string }>();
-      const currentById = new Set(currentHunks.map((hunk) => hunk.hunkId));
-      const currentByFingerprint = new Set<string>();
-      const ordinalByPath = new Map<string, number>();
-      for (const hunk of currentHunks) {
-        const ordinal = ordinalByPath.get(hunk.filePath) ?? 0;
-        ordinalByPath.set(hunk.filePath, ordinal + 1);
-        const fingerprint = hunkFingerprint(targetFingerprint, hunk.filePath, hunk.hunkHeader, hunk.hunkPatch, ordinal);
-        currentByFingerprint.add(fingerprint);
-        metaByContentId.set(hunkContentId(hunk.filePath, hunk.hunkPatch), {
-          id: hunk.hunkId,
-          fingerprint,
-        });
-      }
-      const entries = file[targetFingerprint] ?? [];
-      // Rebind drifted identities in place (all rows kept — unmatched rows
-      // only leave the RESULT, the bucket still owns them), then filter.
-      let identityChanged = false;
-      const rebound = entries.map((entry) => {
-        if (entry.contentId === undefined) return entry;
-        const meta = metaByContentId.get(entry.contentId);
-        if (!meta || (entry.hunkId === meta.id && entry.hunkFingerprint === meta.fingerprint)) return entry;
-        identityChanged = true;
-        return {
-          ...entry,
-          hunkId: meta.id,
-          hunkFingerprint: meta.fingerprint,
-          ...(entry.anchor?.kind === "hunk"
-            ? { anchor: { ...entry.anchor, hunkId: meta.id, hunkFingerprint: meta.fingerprint } }
-            : {}),
-        };
-      });
-      if (identityChanged) {
-        file[targetFingerprint] = rebound;
-        await this.store.save(file);
-      }
-      return rebound.filter((entry) =>
-        entry.contentId !== undefined
-          ? currentContentIds.has(entry.contentId)
-          : currentById.has(entry.hunkId) || (entry.hunkFingerprint !== undefined && currentByFingerprint.has(entry.hunkFingerprint)),
-      );
+      issues.sort((left, right) => left.savedAt.localeCompare(right.savedAt) || left.id.localeCompare(right.id));
+      return { decisions, anchorIssues: issues };
     });
+  }
+
+  /**
+   * Write a resolution back onto an entry: its current target, the resolved
+   * hunk identity, the anchor rewritten for the current target, and — for a
+   * relocation — the patch fields the handoff prompt reads, so the stored
+   * fingerprint and the stored patch always describe the same hunk. Returns
+   * the number of fields that changed, so an unchanged resolution never
+   * rewrites the store.
+   */
+  private applyAnchorResolution(entry: StateEntry, resolution: AnchorResolution, targetFingerprint: string): number {
+    let changes = 0;
+    if (entry.targetFingerprint !== targetFingerprint) {
+      entry.targetFingerprint = targetFingerprint;
+      changes += 1;
+    }
+    const descriptor = resolution.descriptor;
+    if (descriptor) {
+      if (entry.hunkId !== descriptor.hunk.hunkId) {
+        entry.hunkId = descriptor.hunk.hunkId;
+        changes += 1;
+      }
+      if (entry.hunkFingerprint !== descriptor.fingerprint) {
+        entry.hunkFingerprint = descriptor.fingerprint;
+        changes += 1;
+      }
+      if (entry.contentId !== descriptor.contentId) {
+        entry.contentId = descriptor.contentId;
+        changes += 1;
+      }
+      if (entry.filePath !== descriptor.hunk.filePath) {
+        entry.filePath = descriptor.hunk.filePath;
+        changes += 1;
+      }
+      if (resolution.state === "relocated") {
+        if (entry.hunkHeader !== descriptor.hunk.hunkHeader) {
+          entry.hunkHeader = descriptor.hunk.hunkHeader;
+          changes += 1;
+        }
+        if (entry.hunkPatch !== descriptor.hunk.hunkPatch) {
+          entry.hunkPatch = descriptor.hunk.hunkPatch;
+          changes += 1;
+        }
+      }
+    }
+    if (resolution.anchor !== undefined && canonicalJson(entry.anchor) !== canonicalJson(resolution.anchor)) {
+      entry.anchor = resolution.anchor;
+      changes += 1;
+    }
+    if (entry.anchor !== undefined && entry.anchorState !== resolution.state) {
+      entry.anchorState = resolution.state;
+      changes += 1;
+    }
+    return changes;
+  }
+
+  /** One resolved entry as the review-state RPC exposes it. */
+  private decisionRow(entry: StateEntry, anchorState: AnchorState): ReviewStateDecision {
+    return {
+      ...(entry.id !== undefined ? { id: entry.id } : {}),
+      hunkId: entry.hunkId,
+      decision: entry.decision,
+      ...(entry.comment !== undefined ? { comment: entry.comment } : {}),
+      savedAt: entry.savedAt,
+      ...(entry.anchor !== undefined ? { anchor: entry.anchor } : {}),
+      anchorState,
+    };
+  }
+
+  /**
+   * The re-anchor issue of one stale or ambiguous comment: its original anchor,
+   * the candidate positions detected in the current target, and the body the
+   * user wrote. Only a saved comment can be re-anchored, so the predicate
+   * matches the supersede path exactly: a reviewed record, an entry without an
+   * id, and an entry without comment text are never surfaced.
+   */
+  private anchorIssue(
+    entry: StateEntry,
+    sourceTargetFingerprint: string,
+    resolution: AnchorResolution,
+  ): ReviewAnchorIssue | null {
+    const comment = entry.comment?.trim();
+    const anchor = entry.anchor;
+    if (resolution.state !== "ambiguous" && resolution.state !== "stale") return null;
+    if (entry.decision !== "commented" || entry.id === undefined || anchor === undefined) return null;
+    if (entry.filePath === undefined || !comment) return null;
+    return {
+      id: entry.id,
+      sourceTargetFingerprint,
+      sourceHunkId: entry.hunkId,
+      filePath: entry.filePath,
+      anchor,
+      anchorState: resolution.state,
+      candidates: resolution.candidates,
+      matchCount: resolution.matchCount ?? resolution.candidates.length,
+      comment,
+      savedAt: entry.savedAt,
+    };
   }
 
   /**
@@ -1584,6 +1962,8 @@ export class ReviewService {
       ...(source.headRef ? { headRef: source.headRef } : {}),
       comment: eligible.body,
       savedAt: source.savedAt,
+      ...(source.anchor ? { anchor: source.anchor } : {}),
+      ...(source.anchorState ? { anchorState: source.anchorState } : {}),
     };
   }
 

@@ -7,8 +7,10 @@ import {
   explainFile,
   explainHunk,
   getFileView,
+  getProjectReviewCommentCount,
   getReviewState,
   getSnapshot,
+  getTargetFingerprint,
   hunkDecision,
   listProjectReviewComments,
   listReviewStates,
@@ -24,10 +26,11 @@ import { reviewDeckSettings } from "./shared/review-settings";
 const MAINTENANCE_INTERVAL_MS = 60_000;
 
 export default function contribute(server: PluginServerContext) {
-  const reviewService = new ReviewService();
-  server.registerSettings(reviewDeckSettings);
+  const settings = server.registerSettings(reviewDeckSettings);
+  const reviewService = new ReviewService({ settings });
 
   server.handle(getSnapshot, async (input) => reviewService.createSnapshot(input));
+  server.handle(getTargetFingerprint, async (input) => reviewService.getTargetFingerprint(input));
   server.handle(getFileView, async (input) => reviewService.fileView(input));
   server.handle(explainHunk, async (input) => {
     const snapshot = await reviewService.createSnapshot(input);
@@ -59,6 +62,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(listProjectReviewComments, async ({ projectId }) => ({
     project: await reviewService.listProjectReviewComments(projectId),
   }));
+  server.handle(getProjectReviewCommentCount, async ({ projectId }) => reviewService.getProjectReviewCommentCount(projectId));
   server.handle(processProjectReview, async (input, context) => reviewService.processProjectReview(input, context));
   server.handle(rejectHunk, async (input) =>
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),

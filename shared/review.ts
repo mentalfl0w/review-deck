@@ -4,6 +4,44 @@ import { z } from "zod";
 export const reviewScopeSchema = z.enum(["working", "staged", "branch", "commits"]);
 export type ReviewScope = z.infer<typeof reviewScopeSchema>;
 
+export const fileReviewAnchorSchema = z.object({
+  kind: z.literal("file"),
+  filePath: z.string().min(1),
+}).strict();
+export type FileReviewAnchor = z.infer<typeof fileReviewAnchorSchema>;
+
+export const hunkReviewAnchorSchema = z.object({
+  kind: z.literal("hunk"),
+  filePath: z.string().min(1),
+  hunkId: z.string().min(1),
+  hunkFingerprint: z.string().min(1),
+  contentId: z.string().min(1),
+}).strict();
+export type HunkReviewAnchor = z.infer<typeof hunkReviewAnchorSchema>;
+
+export const lineRangeReviewAnchorSchema = z.object({
+  kind: z.literal("range"),
+  filePath: z.string().min(1),
+  side: z.enum(["old", "new"]),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().positive(),
+  hunkId: z.string().min(1),
+  hunkFingerprint: z.string().min(1),
+  contentId: z.string().min(1),
+  selectedTextHash: z.string().min(1),
+  selectedTextPreview: z.string().optional(),
+  contextBeforeHash: z.string().min(1),
+  contextAfterHash: z.string().min(1),
+}).strict();
+export type LineRangeReviewAnchor = z.infer<typeof lineRangeReviewAnchorSchema>;
+
+export const reviewAnchorSchema = z.discriminatedUnion("kind", [
+  fileReviewAnchorSchema,
+  hunkReviewAnchorSchema,
+  lineRangeReviewAnchorSchema,
+]);
+export type ReviewAnchor = z.infer<typeof reviewAnchorSchema>;
+
 export const reviewLocaleSchema = z.enum(["zh", "en"]);
 export type ReviewLocale = z.infer<typeof reviewLocaleSchema>;
 
@@ -79,6 +117,15 @@ export const getSnapshot = defineRpc({
   name: "review-deck.snapshot",
   input: reviewRequestSchema,
   output: reviewSnapshotSchema,
+});
+// The cheap sibling of review-deck.snapshot: the same request, but only the
+// Git target fingerprint (never a parsed hunk). The client's watcher probes
+// this while the user works and requests a full snapshot only when the
+// returned fingerprint differs from the one on screen.
+export const getTargetFingerprint = defineRpc({
+  name: "review-deck.target-fingerprint",
+  input: reviewRequestSchema,
+  output: z.object({ targetFingerprint: z.string() }),
 });
 export const reviewSectionsSchema = z.object({
   verifiedFacts: z.array(z.string()),
@@ -316,6 +363,15 @@ export const listProjectReviewComments = defineRpc({
   name: "review-deck.list-project-review-comments",
   input: z.object({ projectId: z.string().min(1) }),
   output: z.object({ project: projectReviewSummarySchema.nullable() }),
+});
+
+// Count-only sibling of review-deck.list-project-review-comments for the
+// client's project badge: the same comment predicate, but no comment body
+// ever leaves the state store.
+export const getProjectReviewCommentCount = defineRpc({
+  name: "review-deck.project-review-comment-count",
+  input: z.object({ projectId: z.string().min(1) }),
+  output: z.object({ commentCount: z.number().int().nonnegative() }),
 });
 
 // processProjectReview hands every comment to the selected agent's workflow

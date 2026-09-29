@@ -16,6 +16,7 @@ import type {
   ReviewStateCurrentHunk,
   FileViewRow,
 } from "../shared/review";
+import type { ReviewDeckSettingsHandle } from "../shared/review-settings";
 import {
   reviewHandoffTimelineKind,
   reviewHandoffTimelineSchema,
@@ -29,7 +30,9 @@ import { DiffParser, hunkFingerprint, parseRange, type Hunk } from "./diff/DiffP
 import { GitRunner } from "./git/GitRunner";
 import { StateStore, type StateEntry, type StateFile } from "./persistence/StateStore";
 
+
 export interface ReviewServiceDependencies {
+  settings?: ReviewDeckSettingsHandle;
   store?: StateStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
@@ -80,6 +83,11 @@ type DeterministicCopy = {
   fallbackCategoryCheck: (category: string) => string;
   fileHunk: (header: string) => string;
 };
+
+type CompleteProjectCommentEntry = StateEntry & Required<Pick<
+  StateEntry,
+  "id" | "filePath" | "hunkFingerprint" | "hunkHeader" | "hunkPatch" | "cwd" | "scope"
+>>;
 
 const DETERMINISTIC_COPY: Record<ReviewLocale, DeterministicCopy> = {
   en: {
@@ -159,6 +167,8 @@ function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "e
  * the decision state file are injected dependencies rather than module globals.
  */
 export class ReviewService {
+  /** Retain the server settings capability for server-side settings consumers. */
+  private readonly settings: ReviewDeckSettingsHandle | undefined;
   private readonly store: StateStore;
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
@@ -191,6 +201,7 @@ export class ReviewService {
   }
 
   constructor(dependencies: ReviewServiceDependencies = {}) {
+    this.settings = dependencies.settings;
     this.store = dependencies.store ?? new StateStore();
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
@@ -198,6 +209,54 @@ export class ReviewService {
   }
 
   async createSnapshot(request: ReviewRequest): Promise<ReviewSnapshot> {
+    const { target, targetFingerprint, untracked } = await this.fingerprintTarget(request);
+    const files = this.diffParser.parse(await this.diffFor(request, target, untracked), targetFingerprint, request.locale ?? "en");
+    const totalHunks = files.reduce((total, file) => total + file.hunks.length, 0);
+    const priorityHunks = files.reduce(
+      (total, file) => total + file.hunks.filter((hunk) => hunk.findings.some((finding) => severityRank(finding.severity) >= 4)).length,
+      0,
+    );
+    return {
+      repositoryPath: target.repositoryPath,
+      worktreePath: target.worktreePath,
+      scope: request.scope,
+      baseRef: target.baseRef,
+      headRef: target.headRef,
+      baseSha: target.baseSha,
+      headSha: target.headSha,
+      targetFingerprint,
+      files,
+      totalHunks,
+      priorityHunks,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Cheap sibling of createSnapshot for the client's refresh watcher: the same
+   * target fingerprint createSnapshot stamps on its snapshot, computed from the
+   * raw Git state alone — and without parsing a single hunk. The watcher probes
+   * this while the user works and requests a full snapshot only when the
+   * returned fingerprint differs from the one it currently shows.
+   */
+  async getTargetFingerprint(request: ReviewRequest): Promise<{ targetFingerprint: string }> {
+    const { targetFingerprint } = await this.fingerprintTarget(request);
+    return { targetFingerprint };
+  }
+
+  /**
+   * The one fingerprint implementation shared by createSnapshot and
+   * getTargetFingerprint, so the light probe can never disagree with the full
+   * snapshot it guards: identity of the reviewed target derived from the raw
+   * Git state (repository/worktree/gitDir, scope, refs and their resolved SHAs,
+   * the staged and worktree diffs, porcelain status, untracked patches, and
+   * the file filter) — never from parsed hunks. Untracked patches are returned
+   * so createSnapshot reuses this pass for its diff assembly instead of
+   * listing and diffing them twice.
+   */
+  private async fingerprintTarget(
+    request: ReviewRequest,
+  ): Promise<{ target: ReviewTarget; targetFingerprint: string; untracked: string[] }> {
     const target = await this.resolveReviewTarget(request);
     const [indexDiff, worktreeDiff, status] = await Promise.all([
       this.gitFactory(target.repositoryPath).run(["diff", "--cached", "--binary", "--no-ext-diff"]),
@@ -219,26 +278,7 @@ export class ReviewService {
       worktreeStateHash: sha256(`${status}\u0000${worktreeDiff}\u0000${untrackedStateHash}`),
       filePath: request.filePath ?? null,
     }));
-    const files = this.diffParser.parse(await this.diffFor(request, target, untracked), targetFingerprint, request.locale ?? "en");
-    const totalHunks = files.reduce((total, file) => total + file.hunks.length, 0);
-    const priorityHunks = files.reduce(
-      (total, file) => total + file.hunks.filter((hunk) => hunk.findings.some((finding) => severityRank(finding.severity) >= 4)).length,
-      0,
-    );
-    return {
-      repositoryPath: target.repositoryPath,
-      worktreePath: target.worktreePath,
-      scope: request.scope,
-      baseRef: target.baseRef,
-      headRef: target.headRef,
-      baseSha: target.baseSha,
-      headSha: target.headSha,
-      targetFingerprint,
-      files,
-      totalHunks,
-      priorityHunks,
-      generatedAt: new Date().toISOString(),
-    };
+    return { target, targetFingerprint, untracked };
   }
 
   findHunk(snapshot: ReviewSnapshot, hunkId: string): Hunk {
@@ -357,6 +397,13 @@ export class ReviewService {
         hunkHeader: input.hunkHeader,
         hunkPatch: input.hunkPatch,
         contentId,
+        anchor: {
+          kind: "hunk",
+          filePath: input.filePath,
+          hunkId: input.hunkId,
+          hunkFingerprint: input.hunkFingerprint,
+          contentId,
+        },
         ...(input.projectName ? { projectName: input.projectName } : {}),
         ...(input.projectRootPath ? { projectRootPath: input.projectRootPath } : {}),
         ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
@@ -448,7 +495,14 @@ export class ReviewService {
         const meta = metaByContentId.get(entry.contentId);
         if (!meta || (entry.hunkId === meta.id && entry.hunkFingerprint === meta.fingerprint)) return entry;
         identityChanged = true;
-        return { ...entry, hunkId: meta.id, hunkFingerprint: meta.fingerprint };
+        return {
+          ...entry,
+          hunkId: meta.id,
+          hunkFingerprint: meta.fingerprint,
+          ...(entry.anchor?.kind === "hunk"
+            ? { anchor: { ...entry.anchor, hunkId: meta.id, hunkFingerprint: meta.fingerprint } }
+            : {}),
+        };
       });
       if (identityChanged) {
         file[targetFingerprint] = rebound;
@@ -560,6 +614,27 @@ export class ReviewService {
       targetCount: new Set(comments.map((comment) => comment.targetFingerprint)).size,
       comments,
     };
+  }
+
+  /**
+   * Count one project's saved review comments. The count-only sibling of
+   * listProjectReviewComments for the client's project badge: it applies the
+   * same comment predicate (projectId + commented + non-blank body) but never
+   * materializes a comment row, so no comment body leaves the state store.
+   */
+  async getProjectReviewCommentCount(projectId: string): Promise<{ commentCount: number }> {
+    const file = await this.store.load();
+    return { commentCount: this.countProjectComments(file, projectId) };
+  }
+
+  private countProjectComments(file: StateFile, projectId: string): number {
+    let commentCount = 0;
+    for (const entries of Object.values(file)) {
+      for (const entry of entries) {
+        if (this.projectCommentBody(entry, projectId) !== null) commentCount += 1;
+      }
+    }
+    return commentCount;
   }
 
   /**
@@ -1463,29 +1538,52 @@ export class ReviewService {
     return rows;
   }
 
+  /**
+   * One eligibility predicate for both the project list and its count-only
+   * badge. It returns a body only inside the server; the count RPC never
+   * includes it in its response.
+   */
+  private projectCommentBody(
+    entry: StateEntry,
+    projectId: string,
+  ): { entry: CompleteProjectCommentEntry; body: string } | null {
+    if (
+      entry.projectId !== projectId ||
+      entry.decision !== "commented" ||
+      !entry.id ||
+      !entry.filePath ||
+      !entry.hunkFingerprint ||
+      !entry.hunkHeader ||
+      !entry.hunkPatch ||
+      !entry.cwd ||
+      entry.scope === undefined
+    ) return null;
+    const body = entry.comment?.trim();
+    return body ? { entry: entry as CompleteProjectCommentEntry, body } : null;
+  }
+
   private projectCommentFromEntry(entry: StateEntry, targetFingerprint: string, projectId: string): ProjectReviewComment | null {
-    if (entry.projectId !== projectId || entry.decision !== "commented") return null;
-    const comment = entry.comment?.trim();
-    if (!comment) return null;
-    if (!entry.id || !entry.filePath || !entry.hunkFingerprint || !entry.hunkHeader || !entry.hunkPatch || !entry.cwd || entry.scope === undefined) return null;
+    const eligible = this.projectCommentBody(entry, projectId);
+    if (!eligible) return null;
+    const source = eligible.entry;
     return {
-      id: entry.id,
+      id: source.id,
       projectId,
-      ...(entry.projectName ? { projectName: entry.projectName } : {}),
-      ...(entry.projectRootPath ? { projectRootPath: entry.projectRootPath } : {}),
-      ...(entry.workspaceId ? { workspaceId: entry.workspaceId } : {}),
-      targetFingerprint: entry.targetFingerprint ?? targetFingerprint,
-      hunkId: entry.hunkId,
-      hunkFingerprint: entry.hunkFingerprint,
-      filePath: entry.filePath,
-      hunkHeader: entry.hunkHeader,
-      hunkPatch: entry.hunkPatch,
-      cwd: entry.cwd,
-      scope: entry.scope,
-      ...(entry.baseRef ? { baseRef: entry.baseRef } : {}),
-      ...(entry.headRef ? { headRef: entry.headRef } : {}),
-      comment,
-      savedAt: entry.savedAt,
+      ...(source.projectName ? { projectName: source.projectName } : {}),
+      ...(source.projectRootPath ? { projectRootPath: source.projectRootPath } : {}),
+      ...(source.workspaceId ? { workspaceId: source.workspaceId } : {}),
+      targetFingerprint: source.targetFingerprint ?? targetFingerprint,
+      hunkId: source.hunkId,
+      hunkFingerprint: source.hunkFingerprint,
+      filePath: source.filePath,
+      hunkHeader: source.hunkHeader,
+      hunkPatch: source.hunkPatch,
+      cwd: source.cwd,
+      scope: source.scope,
+      ...(source.baseRef ? { baseRef: source.baseRef } : {}),
+      ...(source.headRef ? { headRef: source.headRef } : {}),
+      comment: eligible.body,
+      savedAt: source.savedAt,
     };
   }
 

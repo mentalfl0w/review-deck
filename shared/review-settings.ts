@@ -20,6 +20,15 @@ export const reviewDeckSettingsSchema = z.object({
 });
 export type ReviewDeckSettingsValues = z.infer<typeof reviewDeckSettingsSchema>;
 
+export type ReviewDeckSettingsState =
+  | { status: "ready"; revision: string; values: ReviewDeckSettingsValues }
+  | { status: "invalid"; revision: string; error: string };
+
+export interface ReviewDeckSettingsHandle {
+  read(): Promise<ReviewDeckSettingsState>;
+  subscribe(listener: (state: ReviewDeckSettingsState) => void | Promise<void>): () => void | Promise<void>;
+}
+
 export const reviewDeckSettings = defineSettings({
   id: "review-deck",
   scope: "host",

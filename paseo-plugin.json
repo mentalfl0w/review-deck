@@ -1,6 +1,7 @@
 {
   "id": "review-deck",
+  "description": "Human-in-the-loop code review workspace for Paseo",
   "requirements": {
-    "paseo": ">=0.8.0"
+    "paseo": ">=0.10.1"
   }
 }

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSettings, type PluginAgentPanelProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
-import { ScrollView, Text, View } from "react-native";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n";
 import { scopeKeys, type DiffMode, type ViewMode } from "./tools";
 import { buildPanelStyles } from "./styles";
 import { useReviewScope } from "./hooks/useReviewScope";
 import { useReviewSnapshot } from "./hooks/useReviewSnapshot";
+import { useLineSelection } from "./hooks/useLineSelection";
+import type { LineSide } from "./lineRange";
 import { useAgents } from "./hooks/useAgents";
 import { useProjectComments } from "./hooks/useProjectComments";
 import { useReviewActions } from "./hooks/useReviewActions";
@@ -74,11 +76,34 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
     locale,
+    projectId: scopeApi.effectiveProjectId,
+    workspaceId: scopeApi.selectedWorkspaceId,
     workspaceDiffStat: scopeApi.workspace?.diffStat ?? null,
     workspaceStatus: scopeApi.workspace?.status ?? null,
     agentRevision: agentsApi.agentRevision,
     setActionError,
   });
+  // The v1.3 line-range selection: scoped to the shown target and change block,
+  // so it can never describe lines of a hunk that is no longer on screen.
+  const lineSelectionApi = useLineSelection({
+    targetFingerprint: snapshotApi.snapshot?.targetFingerprint ?? null,
+    hunkId: snapshotApi.selectedHunkId,
+  });
+  const selectLine = useCallback((side: LineSide, line: number, extend: boolean) => {
+    lineSelectionApi.dispatch({ type: extend ? "extend" : "click", side, line });
+  }, [lineSelectionApi.dispatch]);
+  const tapLine = useCallback((side: LineSide, line: number) => {
+    lineSelectionApi.dispatch({ type: "tap", side, line });
+  }, [lineSelectionApi.dispatch]);
+  const clearLineSelection = useCallback(() => {
+    lineSelectionApi.dispatch({ type: "clear" });
+  }, [lineSelectionApi.dispatch]);
+  // Bumped by the diff strip's comment action; the dock focuses its input on
+  // every new value.
+  const [commentRequestNonce, setCommentRequestNonce] = useState(0);
+  const requestCommentOnSelection = useCallback(() => {
+    setCommentRequestNonce((current) => current + 1);
+  }, []);
   const commentsApi = useProjectComments({
     effectiveProjectId: scopeApi.effectiveProjectId,
     selectedWorkspaceId: scopeApi.selectedWorkspaceId,
@@ -103,7 +128,11 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     selectedFile: snapshotApi.selectedFile,
     decisions: snapshotApi.decisions,
     setDecisions: snapshotApi.setDecisions,
-    stateRpc: snapshotApi.stateRpc,
+    setAnchorIssues: snapshotApi.setAnchorIssues,
+    lineRange: lineSelectionApi.range,
+    lineSelectionPending: lineSelectionApi.state?.awaitingEnd ?? false,
+    clearLineSelection,
+    readReviewState: snapshotApi.readReviewState,
     refresh: snapshotApi.refresh,
     refreshProjectComments: commentsApi.refreshProjectComments,
   });
@@ -197,6 +226,25 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const activeWorkspaceName = scopeApi.workspace?.name ?? "";
   const activeWorkspaceStatus = scopeApi.workspace?.status ?? "";
   const projectCommentCount = commentsApi.projectComments?.commentCount ?? 0;
+  // Files whose saved comments could not be re-anchored on their own. This is
+  // the cross-file entry point: the re-anchor card lives in the file detail,
+  // so an issue of a file the user is not looking at would otherwise be
+  // invisible. Each entry jumps to the file's first change block.
+  const anchorIssueFiles = useMemo(() => {
+    const files = snapshotApi.snapshot?.files ?? [];
+    const paths: string[] = [];
+    for (const issue of snapshotApi.anchorIssues) {
+      const candidatePath = issue.candidates.find((candidate) =>
+        files.some((file) => file.path === candidate.filePath))?.filePath;
+      const renamedPath = files.find((file) => file.oldPath === issue.filePath)?.path;
+      const path = candidatePath ??
+        (files.some((file) => file.path === issue.filePath) ? issue.filePath : undefined) ??
+        renamedPath ??
+        issue.filePath;
+      if (!paths.includes(path)) paths.push(path);
+    }
+    return paths;
+  }, [snapshotApi.anchorIssues, snapshotApi.snapshot]);
   const analysisStale = snapshotApi.stale && (agentApi.explanation !== null || agentApi.aiExplanation !== null || agentApi.agentReview !== null);
 
   if (!scopeApi.workspace) {
@@ -299,6 +347,16 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
       onToggleOtherComments={() => actionsApi.setOtherCommentsOpen((open) => !open)}
       onEditSavedComment={editSavedFileComment}
       onSaveComment={() => void actionsApi.saveComment()}
+      lineSelection={lineSelectionApi.state}
+      onLinePress={selectLine}
+      onLineTap={tapLine}
+      onClearLineSelection={clearLineSelection}
+      onCommentLineSelection={requestCommentOnSelection}
+      commentRequestNonce={commentRequestNonce}
+      anchorIssues={snapshotApi.anchorIssues}
+      reanchorBusyIssueId={actionsApi.reanchorBusyIssueId}
+      reanchorNotice={actionsApi.reanchorNotice}
+      onReanchorIssue={(issue, target, range) => void actionsApi.reanchorIssue(issue, target, range)}
     />
   );
 
@@ -329,6 +387,32 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     snapshotApi.stale ? (
       <View key="stale" style={styles.staleStrip}>
         <Text style={styles.staleStripText}>{t("staleBanner")}</Text>
+      </View>
+    ) : null,
+    anchorIssueFiles.length > 0 ? (
+      <View key="anchor-issues" style={styles.anchorIssuesCard}>
+        <Text style={styles.anchorIssueWarning}>{t("anchorIssueWarning")}</Text>
+        <Text style={styles.sectionSummary}>{t("anchorIssuesSummary", { count: snapshotApi.anchorIssues.length })}</Text>
+        <View style={styles.actionRow}>
+          {anchorIssueFiles.map((path) => {
+            // A file the current snapshot no longer contains has no change
+            // block to jump to; the path stays listed so the issue is not lost.
+            const firstHunk = snapshotApi.snapshot?.files.find((file) => file.path === path)?.hunks[0];
+            return firstHunk ? (
+              <Pressable
+                key={path}
+                accessibilityRole="button"
+                onPress={() => {
+                  selectHunk(firstHunk.id);
+                  setCompactFilesOpen(false);
+                }}
+                style={styles.topButton}
+              >
+                <Text numberOfLines={1} ellipsizeMode="middle" style={styles.topButtonText}>{path}</Text>
+              </Pressable>
+            ) : <Text key={path} numberOfLines={1} ellipsizeMode="middle" style={styles.muted}>{path}</Text>;
+          })}
+        </View>
       </View>
     ) : null,
     actionError ? (

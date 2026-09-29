@@ -26,10 +26,11 @@ import type { PanelStyles } from "../styles";
 import { ActionButton, FindingGroup, HoverTooltip, Segmented, StringGroup } from "./ui";
 import { DiffView } from "./DiffView";
 import { FileView } from "./FileView";
+import { lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
 
 /** A single change block: navigation, diff mode, review/reject/explain
  * actions, the diff or file-context body and the findings disclosure. */
-export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections }: {
+export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -61,6 +62,11 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   aiExplanation: ExplainHunkAiResult | null;
   agentReview: string | null;
   agentSections: ReviewSections | null;
+  selection: LineSelectionState;
+  onLinePress: (side: LineSide, line: number, extend: boolean) => void;
+  onLineTap: (side: LineSide, line: number) => void;
+  onClearSelection: () => void;
+  onCommentSelection: () => void;
 }) {
   const selectedHeader = hunkHeaderParts(hunk.header);
   const selectedHunkIndex = file.hunks.findIndex((candidate) => candidate.id === hunk.id);
@@ -84,6 +90,10 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
       agentSections.aiInference.length > 0 ||
       agentSections.humanVerificationRecommended.length > 0),
   );
+  // The submit-ready range of the live selection: null while the user has
+  // selected nothing (or the machine dropped the selection), a single-line
+  // range while the compact pairing still awaits its end tap.
+  const selectionRange = lineSelectionRange(selection);
   const diffContent = viewMode === "blockFile" ? (
     <FileView
       t={t}
@@ -94,7 +104,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
       selectedHunkId={hunk.id}
     />
   ) : (
-    <DiffView t={t} styles={styles} mode={effectiveDiffMode} pairs={selectedPairs} rows={unifiedRows} />
+    <DiffView t={t} styles={styles} mode={effectiveDiffMode} pairs={selectedPairs} rows={unifiedRows} selection={lineSelectionRange(selection)} compact={layout.compact} onLinePress={onLinePress} onLineTap={onLineTap} />
   );
   return (
     <View>
@@ -201,6 +211,40 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
       >
         {diffContent}
       </ScrollView>
+
+      {selection ? (
+        <View style={[styles.lineSelectionStrip, selection.awaitingEnd ? styles.lineSelectionStripAwaiting : null]}>
+          <Text style={styles.lineSelectionStripText}>
+            {selectionRange && !selection.awaitingEnd
+              ? `${t("lineSelectionLabel")} ${lineSelectionLocationText(t, selectionRange)}`
+              : t("lineSelectionLabel")}
+          </Text>
+          {/* The awaiting first tap has no end line yet: the pending start is
+              named in the hint instead of a range, and the range hint (which
+              promises an exact saved range) only appears once completed. */}
+          {selection.awaitingEnd ? (
+            <Text style={styles.lineSelectionStripHint}>{t("lineSelectionAwaitingEnd", { line: selection.anchorLine })}</Text>
+          ) : null}
+          <Text style={styles.lineSelectionStripHint}>{selection.awaitingEnd ? t("lineSelectionHint") : t("lineSelectionRangeHint")}</Text>
+          <ActionButton
+            variant="ghost"
+            label={t("clearLineSelection")}
+            tooltip={t("clearLineSelectionHint")}
+            onPress={onClearSelection}
+            theme={theme}
+            layout={layout}
+          />
+          <ActionButton
+            variant="primary"
+            label={t("commentLineSelection")}
+            tooltip={t("commentLineSelectionHint")}
+            disabled={selection.awaitingEnd}
+            onPress={onCommentSelection}
+            theme={theme}
+            layout={layout}
+          />
+        </View>
+      ) : null}
 
       <HoverTooltip text={t("findingsToggleHint")} theme={theme} layout={layout}>
         <Pressable accessibilityRole="button" onPress={onToggleFindingsOpen} style={styles.findingsDisclosure}>

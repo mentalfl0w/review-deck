@@ -3,9 +3,14 @@ import { Pressable, ScrollView, Text, View } from "react-native";
 import type {
   ExplainHunkAiResult,
   ExplainHunkResult,
+  LineRangeSelection,
+  ReviewAnchor,
+  ReviewAnchorIssue,
   ReviewScope,
   ReviewSections,
 } from "../../shared/review";
+import { hunkHeaderParts } from "../diffView";
+import { anchorLineRange, lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
 import {
   maxSeverity,
   severityLabelKeys,
@@ -29,10 +34,11 @@ import { ActionButton, Segmented, SeverityBadge } from "./ui";
 import { HunkCard } from "./HunkCard";
 import { FileView } from "./FileView";
 import { CommentSheet } from "./CommentSheet";
+import { AnchorIssues } from "./AnchorIssues";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -94,6 +100,23 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   fileReviseFeedback: AgentFeedbackMap;
   onReviseCurrentFromComment: (agentId: string) => void;
   onReviseFileFromComment: (agentId: string) => void;
+  /** The live line-range selection of the current change block, its press
+   * handlers and the strip actions. */
+  lineSelection: LineSelectionState;
+  onLinePress: (side: LineSide, line: number, extend: boolean) => void;
+  onLineTap: (side: LineSide, line: number) => void;
+  onClearLineSelection: () => void;
+  onCommentLineSelection: () => void;
+  /** Bumped by the strip's comment action; the dock focuses its input on each
+   * new value. */
+  commentRequestNonce: number;
+  /** Unresolved anchors (ambiguous/stale) of the current target. */
+  anchorIssues: ReviewAnchorIssue[];
+  reanchorBusyIssueId: string | null;
+  reanchorNotice: string | null;
+  /** Heal one anchor issue against an explicitly chosen target of the current
+   * snapshot (a resolved candidate, or the current selection). */
+  onReanchorIssue: (issue: ReviewAnchorIssue, target: SelectedHunk, lineRange: LineRangeSelection | null) => void;
 }) {
   const [confirmRevert, setConfirmRevert] = useState(false);
   useEffect(() => {
@@ -106,6 +129,31 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   const selectedMeta = {
     language: selected.language ?? selectedFile.language,
     functionHint: selected.functionHint,
+  };
+  // Anchor issues are shown for the file being reviewed, and their candidates
+  // are resolved against THIS file's hunks: a candidate the current snapshot no
+  // longer contains is presented as unavailable instead of being re-anchored
+  // onto stale geometry.
+  const issuesForFile = anchorIssues.filter((issue) =>
+    issue.filePath === selectedFile.path ||
+    issue.filePath === selectedFile.oldPath ||
+    issue.candidates.some((candidate) => candidate.filePath === selectedFile.path));
+  const hunkLabels: Record<string, string> = Object.fromEntries(
+    selectedFile.hunks.map((hunk): [string, string] => [hunk.id, hunkHeaderParts(hunk.header).range]),
+  );
+  const selectedLineRange = lineSelectionRange(lineSelection);
+  const selectionLabel = selectedLineRange ? lineSelectionLocationText(t, selectedLineRange) : null;
+  const reanchorTo = (issue: ReviewAnchorIssue, candidate: ReviewAnchor | null) => {
+    // No candidate: the manual path, anchored to what the user selected in the
+    // diff right now (the card only offers it for the same file).
+    if (!candidate) {
+      onReanchorIssue(issue, selected, selectedLineRange);
+      return;
+    }
+    const target = candidate.kind === "file"
+      ? undefined
+      : selectedFile.hunks.find((hunk) => hunk.id === candidate.hunkId);
+    if (target) onReanchorIssue(issue, target, anchorLineRange(candidate));
   };
   return (
     <View style={styles.detailCanvas}>
@@ -252,10 +300,35 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             aiExplanation={aiExplanation}
             agentReview={agentReview}
             agentSections={agentSections}
+            selection={lineSelection}
+            onLinePress={onLinePress}
+            onLineTap={onLineTap}
+            onClearSelection={onClearLineSelection}
+            onCommentSelection={onCommentLineSelection}
           />
         )}
 
         <View style={styles.commentArea}>
+        <AnchorIssues
+          theme={theme}
+          layout={layout}
+          t={t}
+          styles={styles}
+          issues={issuesForFile}
+          hunkLabels={hunkLabels}
+          selectedFilePath={selectedFile.path}
+          selectionHunkId={selected.id}
+          selectionLabel={selectionLabel}
+          selectionPending={lineSelection?.awaitingEnd ?? false}
+          busyIssueId={reanchorBusyIssueId}
+          notice={reanchorNotice}
+          onSelectCandidate={(issue, candidate) => {
+            // Candidates are hunk or range anchors by construction; a file
+            // anchor carries no change block to jump to.
+            if (candidate.kind !== "file") onSelectHunk(candidate.hunkId);
+          }}
+          onReanchor={reanchorTo}
+        />
         <CommentSheet
           theme={theme}
           layout={layout}
@@ -283,6 +356,10 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
           selectedAgentId={selectedAgentId}
           agentFeedback={agentFeedback}
           onReviseCurrentFromComment={onReviseCurrentFromComment}
+          selection={selectedLineRange}
+          selectionPending={lineSelection?.awaitingEnd ?? false}
+          selectionText={selectionLabel}
+          commentRequestNonce={commentRequestNonce}
           />
         </View>
       </View>

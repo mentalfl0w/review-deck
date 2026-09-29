@@ -9,8 +9,11 @@ import {
   listReviewStates,
   rejectHunk,
   revertFile,
+  type LineRangeSelection,
+  type ReviewAnchorIssue,
   type ReviewScope,
   type ReviewSnapshot,
+  type ReviewStateResult,
 } from "../../shared/review";
 import type {
   FileCommentDraft,
@@ -22,15 +25,14 @@ import type {
 } from "../tools";
 import type { TFunc } from "../i18n";
 
-/** RPC contract of getReviewState as consumed by the comment reconciliation. */
-type StateRpc = (input: { targetFingerprint: string }) => Promise<{ decisions: ReviewDecision[] }>;
-
 /**
  * Human review actions: mark-reviewed / save-comment / reject and every clear
- * flow (current hunk, current review, saved targets, all saved), plus the
- * file-comment draft model (body + anchor bookkeeping) and the saved-review
- * management modal state. Snapshot refresh linkage arrives as `refresh`;
- * decisions live in the snapshot hook and are written here through its setter.
+ * flow (current hunk, current review, saved targets, all saved) plus the
+ * file-comment draft model (body + anchor bookkeeping and the v1.3 line-range
+ * anchor), the manual re-anchor of an ambiguous/stale saved comment, and the
+ * saved-review management modal state. Snapshot refresh linkage arrives as
+ * `refresh`; decisions and anchor issues live in the snapshot hook and are
+ * written here through its setters.
  */
 export function useReviewActions(params: {
   reviewCwd: string | null;
@@ -48,7 +50,13 @@ export function useReviewActions(params: {
   selectedFile: ReviewFile | null;
   decisions: ReviewDecision[];
   setDecisions: Dispatch<SetStateAction<ReviewDecision[]>>;
-  stateRpc: StateRpc;
+  setAnchorIssues: Dispatch<SetStateAction<ReviewAnchorIssue[]>>;
+  /** The live line-range selection of the current change block: when set, a
+   * saved comment is persisted with a precise line-range anchor. */
+  lineRange: LineRangeSelection | null;
+  lineSelectionPending: boolean;
+  clearLineSelection: () => void;
+  readReviewState: (targetFingerprint: string) => Promise<ReviewStateResult>;
   refresh: () => Promise<void>;
   refreshProjectComments: (projectId?: string) => Promise<void>;
 }) {
@@ -57,7 +65,7 @@ export function useReviewActions(params: {
     scope,
     baseRef,
     headRef,
-  filePath,
+    filePath,
     effectiveProjectId,
     projectIdentity,
     selectedWorkspaceId,
@@ -68,7 +76,11 @@ export function useReviewActions(params: {
     selectedFile,
     decisions,
     setDecisions,
-    stateRpc,
+    setAnchorIssues,
+    lineRange,
+    lineSelectionPending,
+    clearLineSelection,
+    readReviewState,
     refresh,
     refreshProjectComments,
   } = params;
@@ -80,6 +92,8 @@ export function useReviewActions(params: {
   const clearAllRpc = useRpc(clearAllReviewStates);
   const revertFileRpc = useRpc(revertFile);
   const [revertNotice, setRevertNotice] = useState<string | null>(null);
+  const [reanchorBusyIssueId, setReanchorBusyIssueId] = useState<string | null>(null);
+  const [reanchorNotice, setReanchorNotice] = useState<string | null>(null);
   const [fileCommentDrafts, setFileCommentDrafts] = useState<Record<string, FileCommentDraft>>({});
   const [commentSaving, setCommentSaving] = useState(false);
   const [commentNotice, setCommentNotice] = useState<string | null>(null);
@@ -225,10 +239,15 @@ export function useReviewActions(params: {
 
   const saveComment = useCallback(async () => {
     const comment = commentBody.trim();
-    if (!reviewCwd || !snapshot || !selected || !activeCommentKey || comment.length === 0 || !effectiveProjectId) return;
+    if (!reviewCwd || !snapshot || !selected || !activeCommentKey || comment.length === 0 || !effectiveProjectId || lineSelectionPending) return;
     // Browsing another change block never silently rebinds a file comment.
     // The user must either return to its anchor or explicitly arm a move.
     if (commentAnchorHunkId !== selected.id) return;
+    const savedAnchor = activeSavedComment?.decision.anchor;
+    const savedRange = activeSavedComment?.hunk.id === commentAnchorHunkId && savedAnchor?.kind === "range"
+      ? { side: savedAnchor.side, startLine: savedAnchor.startLine, endLine: savedAnchor.endLine }
+      : null;
+    const rangeToSave = lineRange ?? savedRange;
     setCommentSaving(true);
     setActionError(null);
     setCommentNotice(null);
@@ -249,6 +268,9 @@ export function useReviewActions(params: {
         ...(projectIdentity?.rootPath ? { projectRootPath: projectIdentity.rootPath } : {}),
         ...(selectedWorkspaceId ? { workspaceId: selectedWorkspaceId } : {}),
         ...(scope === "commits" ? { baseRef, headRef } : {}),
+        // A live or saved line selection persists a precise line-range anchor;
+        // without one the comment keeps today's hunk anchor.
+        ...(rangeToSave ? { lineRange: rangeToSave } : {}),
       });
       // Moving an anchor is an explicit two-step cutover: persist the new exact
       // anchor first, then clear only the old anchored decision. A failed clear
@@ -273,11 +295,26 @@ export function useReviewActions(params: {
         },
       }));
       setCommentNotice(t("fileCommentSaved"));
-      void refreshProjectComments();
+      // The range is now the persisted anchor: the in-diff selection has served
+      // its purpose and must not read as an unsaved target anymore.
+      if (lineRange) clearLineSelection();
+      // The RPC returns only its timestamp; read the stored decision back so
+      // the precise anchor and its exact/relocated status appear immediately.
+      try {
+        const persisted = await readReviewState(snapshot.targetFingerprint);
+        setDecisions(persisted.decisions);
+        setAnchorIssues(persisted.anchorIssues);
+      } catch {
+        // The optimistic row cannot carry the anchor the write just built, so
+        // re-read through the full pipeline: an anchor-less row would make the
+        // next body-only edit re-save a stored range comment as a hunk anchor.
+        void refresh();
+      }
     } catch (error) {
       try {
-        const persisted = await stateRpc({ targetFingerprint: snapshot.targetFingerprint });
+        const persisted = await readReviewState(snapshot.targetFingerprint);
         setDecisions(persisted.decisions);
+        setAnchorIssues(persisted.anchorIssues);
       } catch {
         // Keep the recoverable draft when persisted-state reconciliation fails.
       }
@@ -286,7 +323,63 @@ export function useReviewActions(params: {
     } finally {
       setCommentSaving(false);
     }
-  }, [activeCommentKey, baseRef, clearHunkRpc, commentAnchorHunkId, commentBody, decisionRpc, effectiveProjectId, headRef, originalCommentHunkId, projectIdentity, refreshProjectComments, reviewCwd, scope, selected, selectedWorkspaceId, snapshot, stateRpc, t]);
+  }, [activeCommentKey, activeSavedComment, baseRef, clearHunkRpc, clearLineSelection, commentAnchorHunkId, commentBody, decisionRpc, effectiveProjectId, headRef, lineRange, lineSelectionPending, originalCommentHunkId, projectIdentity, readReviewState, refresh, refreshProjectComments, reviewCwd, scope, selected, selectedWorkspaceId, setAnchorIssues, setDecisions, snapshot, t]);
+
+  /**
+   * Manual re-anchor of an unresolved saved comment (the §6.2 level 3/4 human
+   * decision): heals ONE anchor issue by persisting its comment against an
+   * explicitly chosen target of the CURRENT snapshot — a candidate position the
+   * engine detected, or the change block / line range the user selected — and
+   * supersedes the issue's old record in the same write. The old entry is named
+   * by its SOURCE target and entry id, so the store removes exactly that record
+   * and nothing else; the shown issue disappears only once the write succeeded.
+   */
+  const reanchorIssue = useCallback(async (issue: ReviewAnchorIssue, target: SelectedHunk, targetLineRange: LineRangeSelection | null) => {
+    if (!reviewCwd || !snapshot || !effectiveProjectId) return;
+    setReanchorBusyIssueId(issue.id);
+    setActionError(null);
+    setReanchorNotice(null);
+    try {
+      await decisionRpc({
+        projectId: effectiveProjectId,
+        cwd: reviewCwd,
+        targetFingerprint: snapshot.targetFingerprint,
+        hunkId: target.id,
+        hunkFingerprint: target.fingerprint,
+        filePath: target.filePath,
+        hunkHeader: target.header,
+        hunkPatch: target.patch,
+        decision: "commented",
+        comment: issue.comment,
+        scope,
+        ...(projectIdentity?.displayName ? { projectName: projectIdentity.displayName } : {}),
+        ...(projectIdentity?.rootPath ? { projectRootPath: projectIdentity.rootPath } : {}),
+        ...(selectedWorkspaceId ? { workspaceId: selectedWorkspaceId } : {}),
+        ...(scope === "commits" ? { baseRef, headRef } : {}),
+        ...(targetLineRange ? { lineRange: targetLineRange } : {}),
+        supersedes: { targetFingerprint: issue.sourceTargetFingerprint, entryId: issue.id },
+      });
+      // The superseded record is gone in the store and the re-anchored comment
+      // now lives under THIS target: read both back instead of guessing the new
+      // entry locally. The local drop runs first so the healed issue is gone
+      // even if the confirming read fails.
+      setAnchorIssues((current) => current.filter((candidate) => candidate.id !== issue.id));
+      try {
+        const persisted = await readReviewState(snapshot.targetFingerprint);
+        setDecisions(persisted.decisions);
+        setAnchorIssues(persisted.anchorIssues);
+      } catch {
+        // Keep the local drop; the next snapshot refresh reconciles the rest.
+      }
+      setReanchorNotice(t("reanchorDone"));
+      void refreshProjectComments();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+      setReanchorNotice(t("reanchorFailed"));
+    } finally {
+      setReanchorBusyIssueId(null);
+    }
+  }, [baseRef, decisionRpc, effectiveProjectId, headRef, projectIdentity, readReviewState, refreshProjectComments, reviewCwd, scope, selectedWorkspaceId, setAnchorIssues, snapshot, t]);
 
   /**
    * Clears the saved comment/decision of one hunk (saved record, local
@@ -439,6 +532,7 @@ export function useReviewActions(params: {
   const resetCommentUi = useCallback(() => {
     setOtherCommentsOpen(false);
     setCommentNotice(null);
+    setReanchorNotice(null);
   }, []);
 
   return {
@@ -472,6 +566,9 @@ export function useReviewActions(params: {
     revertFileReview,
     revertNotice,
     saveComment,
+    reanchorIssue,
+    reanchorBusyIssueId,
+    reanchorNotice,
     clearCurrentHunk,
     clearHunkComment,
     clearCurrentReview,

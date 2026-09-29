@@ -1,5 +1,5 @@
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
-import type { ProjectReviewComment, ReviewScope, ReviewSnapshot } from "../shared/review";
+import type { AnchorState, ProjectReviewComment, ReviewAnchor, ReviewScope, ReviewSnapshot } from "../shared/review";
 import type { StringKey } from "./i18n";
 
 export type SelectedHunk = ReviewSnapshot["files"][number]["hunks"][number];
@@ -38,10 +38,17 @@ export function projectKeyOf(entry: WorkspaceEntry): string {
   return entry.projectId ?? entry.projectDisplayName;
 }
 export type ReviewDecision = {
+  /** Persisted entry id; present on decisions read back from the state store,
+   * absent on client-side optimistic mirrors. */
+  id?: string;
   hunkId: string;
   decision: "reviewed" | "commented";
   comment?: string;
   savedAt: string;
+  /** The persisted ReviewAnchor (v1.3): file / hunk / line range. */
+  anchor?: ReviewAnchor;
+  /** Where the anchor stands after re-anchoring (v1.3). */
+  anchorState?: AnchorState;
 };
 export type SavedReviewSummary = {
   targetFingerprint: string;
@@ -98,6 +105,29 @@ export const statusLabelKeys: Record<string, StringKey> = {
   running: "statusRunning",
   failed: "statusFailed",
   archiving: "statusArchiving",
+};
+
+/** Anchor-state vocabulary shared by the comment dock and the re-anchor card:
+ * the label, the badge surface and the badge text tone always stay in step. */
+export const anchorStateLabelKeys: Record<AnchorState, StringKey> = {
+  exact: "anchorStateExact",
+  relocated: "anchorStateRelocated",
+  ambiguous: "anchorStateAmbiguous",
+  stale: "anchorStateStale",
+};
+export const anchorStateBadgeKeys: Record<AnchorState,
+  "anchorStateBadgeExact" | "anchorStateBadgeRelocated" | "anchorStateBadgeAmbiguous" | "anchorStateBadgeStale"> = {
+  exact: "anchorStateBadgeExact",
+  relocated: "anchorStateBadgeRelocated",
+  ambiguous: "anchorStateBadgeAmbiguous",
+  stale: "anchorStateBadgeStale",
+};
+export const anchorStateBadgeTextKeys: Record<AnchorState,
+  "anchorStateBadgeTextExact" | "anchorStateBadgeTextRelocated" | "anchorStateBadgeTextAmbiguous" | "anchorStateBadgeTextStale"> = {
+  exact: "anchorStateBadgeTextExact",
+  relocated: "anchorStateBadgeTextRelocated",
+  ambiguous: "anchorStateBadgeTextAmbiguous",
+  stale: "anchorStateBadgeTextStale",
 };
 
 export const severityOrder: Severity[] = [

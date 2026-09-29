@@ -4,10 +4,13 @@ import {
   getReviewState,
   getSnapshot,
   getTargetFingerprint,
+  type ReviewAnchorIssue,
   type ReviewLocale,
   type ReviewRequest,
   type ReviewScope,
   type ReviewSnapshot,
+  type ReviewStateCurrentHunk,
+  type ReviewStateResult,
 } from "../../shared/review";
 import type { ReviewDecision } from "../tools";
 
@@ -20,6 +23,20 @@ import type { ReviewDecision } from "../tools";
 const FINGERPRINT_FALLBACK_MS = 60_000;
 
 /**
+ * The state read's current-hunk view: every parsed hunk of the snapshot, with
+ * the file's pre-change path so a re-anchored comment can follow a rename.
+ */
+function currentHunksOf(snapshot: ReviewSnapshot): ReviewStateCurrentHunk[] {
+  return snapshot.files.flatMap((file) => file.hunks.map((hunk) => ({
+    hunkId: hunk.id,
+    filePath: file.path,
+    ...(file.oldPath ? { oldPath: file.oldPath } : {}),
+    hunkHeader: hunk.header,
+    hunkPatch: hunk.patch,
+  })));
+}
+
+/**
  * The panel's snapshot binding: the review request inputs plus the workspace
  * activity signals the watcher compares for change.
  */
@@ -30,6 +47,10 @@ export interface ReviewSnapshotWatcherParams {
   headRef: string;
   filePath: string;
   locale: ReviewLocale;
+  /** Identity of the reviewed project/workspace: the state read resolves
+   * cross-target anchor issues through it. */
+  projectId: string;
+  workspaceId: string;
   /** Opaque workspace-activity signals compared for change only, never
    * interpreted: the workspace's diff stat, its status, and the agent-registry
    * revision. Undefined simply means "no such signal to watch". */
@@ -42,8 +63,8 @@ export interface ReviewSnapshotWatcherParams {
 /**
  * Snapshot pipeline: owns the review snapshot, the current selection, the
  * saved decisions loaded with it, the stale/loading flags, and the watcher that
- * keeps them in sync with Git. Also owns the shared stateRpc instance consumed
- * by the comment actions for reconciliation.
+ * keeps them in sync with Git. Also owns the shared stateRpc instance and
+ * exposes readReviewState, the reconciliation read the comment actions use.
  *
  * Refresh model: the initial load, every manual refresh, and every
  * cwd/scope/ref/file change run a FULL snapshot (diff + parse + state read).
@@ -56,13 +77,14 @@ export interface ReviewSnapshotWatcherParams {
  * at workspace-activity pace instead of a fixed full-parse poll.
  */
 export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
-  const { reviewCwd, scope, baseRef, headRef, filePath, locale, workspaceDiffStat, workspaceStatus, agentRevision, setActionError } = params;
+  const { reviewCwd, scope, baseRef, headRef, filePath, locale, projectId, workspaceId, workspaceDiffStat, workspaceStatus, agentRevision, setActionError } = params;
   const snapshotRpc = useRpc(getSnapshot);
   const fingerprintRpc = useRpc(getTargetFingerprint);
   const stateRpc = useRpc(getReviewState);
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null);
   const [selectedHunkId, setSelectedHunkId] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<ReviewDecision[]>([]);
+  const [anchorIssues, setAnchorIssues] = useState<ReviewAnchorIssue[]>([]);
   const [stale, setStale] = useState(false);
   const [loading, setLoading] = useState(false);
   const targetFingerprintRef = useRef<string | null>(null);
@@ -110,12 +132,10 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
       if (background && next.targetFingerprint === targetFingerprintRef.current) return;
       const nextState = await stateRpc({
         targetFingerprint: next.targetFingerprint,
-        currentHunks: next.files.flatMap((file) => file.hunks.map((hunk) => ({
-          hunkId: hunk.id,
-          filePath: file.path,
-          hunkHeader: hunk.header,
-          hunkPatch: hunk.patch,
-        }))),
+        request,
+        ...(projectId ? { projectId } : {}),
+        ...(workspaceId ? { workspaceId } : {}),
+        currentHunks: currentHunksOf(next),
       });
       if (!mountedRef.current || run !== snapshotRunRef.current) return;
       const previousFingerprint = targetFingerprintRef.current;
@@ -125,6 +145,7 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
       setStale(previousFingerprint !== null && previousFingerprint !== next.targetFingerprint);
       setSnapshot(next);
       setDecisions(nextState.decisions);
+      setAnchorIssues(nextState.anchorIssues);
       setSelectedHunkId((current) => next.files.flatMap((file) => file.hunks).some((hunk) => hunk.id === current)
         ? current
         : next.files[0]?.hunks[0]?.id ?? null);
@@ -135,12 +156,31 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
       if (background) return;
       setSnapshot(null);
       setDecisions([]);
+      setAnchorIssues([]);
       setSelectedHunkId(null);
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       if (!background) setLoading(false);
     }
-  }, [request, snapshotRpc, stateRpc, setActionError]);
+  }, [projectId, request, snapshotRpc, stateRpc, setActionError, workspaceId]);
+
+  /**
+   * Read-back of the persisted decisions and anchor issues of one target,
+   * under the same request/project/workspace binding the snapshot pipeline
+   * used. The comment actions reconcile through this after a failed save or a
+   * successful re-anchor, so what is shown always comes from what is stored.
+   */
+  const readReviewState = useCallback(async (targetFingerprint: string): Promise<ReviewStateResult> => {
+    if (!request) return { decisions: [], anchorIssues: [] };
+    const currentHunks = snapshot && snapshot.targetFingerprint === targetFingerprint ? currentHunksOf(snapshot) : [];
+    return stateRpc({
+      targetFingerprint,
+      request,
+      ...(projectId ? { projectId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      currentHunks,
+    });
+  }, [projectId, request, snapshot, stateRpc, workspaceId]);
 
   /** Fingerprint-only probe: when it reports a target different from the one
    * on screen, a background full snapshot follows; a failed probe (transient
@@ -216,6 +256,8 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
     selectedHunkId,
     decisions,
     setDecisions,
+    anchorIssues,
+    setAnchorIssues,
     stale,
     setStale,
     loading,
@@ -223,6 +265,6 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
     selected,
     selectedFile,
     selectHunk,
-    stateRpc,
+    readReviewState,
   };
 }

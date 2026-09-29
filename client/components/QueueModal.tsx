@@ -1,6 +1,10 @@
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
 import type { ProcessProjectReviewResult, ProjectReviewSummary } from "../../shared/review";
+import { anchorLocationText } from "../lineRange";
 import {
+  anchorStateBadgeKeys,
+  anchorStateBadgeTextKeys,
+  anchorStateLabelKeys,
   scopeLabelKeys,
   type PanelLayout,
   type PanelTheme,
@@ -111,7 +115,21 @@ export function QueueModal({ theme, layout, t, styles, open, onClose, projectCom
                           {file.comments.map((comment) => (
                             <View key={comment.id} style={styles.queueComment}>
                               <Text selectable numberOfLines={4} style={styles.body}>{comment.comment}</Text>
-                              <Text style={styles.routeMeta}>{t("projectCommentSavedAt", { savedAt: comment.savedAt })}</Text>
+                              <View style={styles.savedMetaRow}>
+                                {comment.anchor ? (
+                                  <Text selectable numberOfLines={1} ellipsizeMode="middle" style={styles.anchorMeta}>
+                                    {anchorLocationText(t, comment.anchor, comment.hunkHeader)}
+                                  </Text>
+                                ) : null}
+                                {comment.anchorState ? (
+                                  <View style={[styles.anchorStateBadge, styles[anchorStateBadgeKeys[comment.anchorState]]]}>
+                                    <Text style={[styles.anchorStateBadgeText, styles[anchorStateBadgeTextKeys[comment.anchorState]]]}>
+                                      {t(anchorStateLabelKeys[comment.anchorState])}
+                                    </Text>
+                                  </View>
+                                ) : null}
+                                <Text style={styles.routeMeta}>{t("projectCommentSavedAt", { savedAt: comment.savedAt })}</Text>
+                              </View>
                             </View>
                           ))}
                         </View>

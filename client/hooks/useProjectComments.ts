@@ -9,6 +9,7 @@ import {
   type ReviewScope,
 } from "../../shared/review";
 import type { AgentInfo } from "../tools";
+import { getReviewCountStore } from "../review-count-store";
 import type { TFunc } from "../i18n";
 
 /**
@@ -89,6 +90,12 @@ export function useProjectComments(params: {
     setProjectCommentsError(null);
     try {
       const result = await listProjectCommentsRpc({ projectId });
+      // The entry badges read the same project-scoped count the queue shows;
+      // publishing it here keeps review/header pills in sync with every local
+      // comment change without another round trip. A superseded response is
+      // still this project's own count, so it lands before the staleness guard
+      // drops it from the panel.
+      getReviewCountStore().setCount(projectId, result.project?.commentCount ?? 0);
       if (requestId !== projectCommentsRequestRef.current) return;
       setProjectComments(result.project);
     } catch (error) {

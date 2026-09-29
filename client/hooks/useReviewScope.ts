@@ -12,10 +12,11 @@ import type { ProjectIdentity } from "../tools";
  * sibling workspace.
  */
 export function useReviewScope(workspaceId: string) {
-  const workspace = useWorkspace(workspaceId, ({ directory, name, status, projectId, projectDisplayName, projectRootPath }) => ({
+  const workspace = useWorkspace(workspaceId, ({ directory, name, status, diffStat, projectId, projectDisplayName, projectRootPath }) => ({
     directory,
     name,
     status,
+    diffStat,
     projectId,
     projectDisplayName,
     projectRootPath,

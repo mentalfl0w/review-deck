@@ -63,6 +63,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
   }, []);
   const scopeApi = useReviewScope(workspaceId);
+  const agentsApi = useAgents({
+    selectedWorkspaceId: scopeApi.selectedWorkspaceId,
+    reviewCwd: scopeApi.reviewCwd,
+  });
   const snapshotApi = useReviewSnapshot({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
@@ -70,11 +74,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     headRef: scopeApi.headRef,
     filePath: scopeApi.filePath,
     locale,
+    workspaceDiffStat: scopeApi.workspace?.diffStat ?? null,
+    workspaceStatus: scopeApi.workspace?.status ?? null,
+    agentRevision: agentsApi.agentRevision,
     setActionError,
-  });
-  const agentsApi = useAgents({
-    selectedWorkspaceId: scopeApi.selectedWorkspaceId,
-    reviewCwd: scopeApi.reviewCwd,
   });
   const commentsApi = useProjectComments({
     effectiveProjectId: scopeApi.effectiveProjectId,

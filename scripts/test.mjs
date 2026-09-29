@@ -24,6 +24,10 @@ function run(command, args) {
 await run(process.execPath, ["--experimental-strip-types", "tests/agent-message-stream.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/readonly-review-routing.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-settings-timeline.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/agent-registry.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/state-store.test.ts"]);
+await run(process.execPath, [tsc, "-p", "tests/tsconfig.target-fingerprint.json"]);
+await run(process.execPath, ["node_modules/.cache/review-deck-tests/tests/target-fingerprint.test.js"]);
 
 const outputDirectory = await mkdtemp(join(tmpdir(), "review-deck-tooltip-"));
 try {

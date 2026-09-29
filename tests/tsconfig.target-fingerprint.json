@@ -1,0 +1,25 @@
+{
+  "//": "Compile config for tests/target-fingerprint.test.ts: CommonJS output (the hook harness installs module doubles through the CJS require cache) while @getpaseo/plugin resolves through its exports map, which the legacy node10 resolution used for CJS emit cannot read on its own. Type checking stays the project's own --noEmit run.",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "target": "ES2020",
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": false,
+    "outDir": "../node_modules/.cache/review-deck-tests",
+    "baseUrl": "..",
+    "paths": {
+      "@getpaseo/plugin": ["node_modules/@getpaseo/plugin/dist/index.d.ts"],
+      "@getpaseo/plugin/client": ["node_modules/@getpaseo/plugin/dist/client/index.d.ts"],
+      "@getpaseo/plugin/server": ["node_modules/@getpaseo/plugin/dist/server/index.d.ts"]
+    }
+  },
+  "files": [
+    "../server/ReviewService.ts",
+    "../client/hooks/useReviewSnapshot.ts",
+    "target-fingerprint.test.ts"
+  ]
+}

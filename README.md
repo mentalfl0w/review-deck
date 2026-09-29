@@ -20,7 +20,7 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Capability | What it does |
 |---|---|
 | File-first review UI | Navigate changed files and hunks with the exact diff shown next to the change details; wide layout shows file list and file details side by side, compact layout drills down |
-| Inline comments | Write a file-level main comment beside the change details and save it; the comment stays anchored to the change you reviewed |
+| Inline comments | Select exact diff lines (click / Shift-click on desktop, two taps in compact layouts) or keep a hunk-level anchor; comments follow safe re-anchors across snapshots |
 | Project comments queue | The top queue aggregates every saved comment for the current project, grouped by workspace, scope, and file |
 | AI processing | Select the Agent of the current workspace and process all saved comments for the project in one batch |
 | Agent-context Review Deck | Open Review Deck bound to the Agent of the current workspace — its own panel entry, the Command Center item **Open Review Deck for this Agent**, or the **`/review-deck`** slash command in an Agent chat; the Agent is preselected as the review target |
@@ -56,8 +56,8 @@ Review Deck is a Paseo **0.10.1+** plugin using the v0.8 runtime-entry format: t
 flowchart LR
     subgraph panel["client/ — React Native panel"]
         Panel["ReviewDeckPanel"]
-        Hooks["hooks/ — scope · snapshot · actions<br/>agent review · comments · file view"]
-        UI["components/ — file navigator · file detail<br/>hunk card · diff view · file view"]
+        Hooks["hooks/ — scope · snapshot · actions<br/>agent review · comments · file view · line selection"]
+        UI["components/ — file navigator · file detail · hunk card<br/>diff view · file view · anchor issues"]
         Panel --> Hooks
         Panel --> UI
     end
@@ -68,9 +68,11 @@ flowchart LR
 
     subgraph server["server/ — service layer"]
         Svc["ReviewService"]
+        Anchor["AnchorEngine"]
         Git["GitRunner"]
         Parse["DiffParser · FindingDetector"]
         Store["StateStore"]
+        Svc --> Anchor
         Svc --> Git
         Svc --> Parse
         Svc --> Store
@@ -97,7 +99,7 @@ flowchart LR
 - **shared/review.ts** is the single source of truth for request/response shapes (zod), imported by both sides.
 - **shared/review-settings.ts** defines the host-scoped v1 Review Deck defaults — panel locale (`auto`/`zh`/`en`) and default diff layout (`auto`/`unified`/`split`). Only harmless display preferences are settings; agent identity, scopes, paths, comments, and review state are never persisted there.
 - **shared/review-handoff.ts** defines the version-1 `review-deck-handoff` timeline row: exactly a positive comment count and the ISO submission timestamp, parsed strictly so a row can never carry review content, patch text, file paths, or workspace/project/agent identifiers.
-- **server/** composes small, injectable classes: `GitRunner` wraps all git invocations with output limits, `StateStore` validates and atomically migrates the v2 JSON envelope, and `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
+- **server/** composes small, injectable classes: `GitRunner` wraps Git invocations with output limits, `StateStore` validates and atomically migrates the v2 JSON envelope, `AnchorEngine` resolves exact, changed-line, and context matches without auto-selecting ambiguity, and `ReviewService` orchestrates snapshots, decisions, file-level actions, and Agent delegation.
 
 - **Agent updates are event-driven.** One owned agent subscription feeds the panel registry and composer pills; workspace activity and agent updates trigger fingerprint-only snapshot checks, with a 60-second fallback.
 - **Damaged review state fails closed.** Legacy files migrate automatically; invalid JSON or schema data surfaces an error and is never replaced with an empty store.
@@ -108,8 +110,8 @@ Requires **Paseo 0.10.1 or newer** (`>=0.10.1`).
 
 1. **Open the panel.** Use the workspace header's **Review** button, or from an Agent use the composer **Review** pill. The Command Center (**⌘K / Ctrl+K**) and `/review-deck` command remain available. Agent-context entries preselect that Agent as the review target.
 2. **Pick a project and workspace.** Use the pickers at the top of the panel. Selecting a project or workspace brings that workspace to the Paseo foreground.
-3. **Browse the changes.** Work through the changed files; each file shows its hunks with the exact diff next to the change details.
-4. **Leave a comment.** Write a file-level main comment beside the change details and save it.
+3. **Browse and select the change.** Work through the changed files; each file shows its hunks with the exact diff next to the change details. Click a line number to select it; Shift-click extends a range on desktop, while compact layouts use two taps.
+4. **Leave a comment.** Save a comment against the selected line range, or leave the selection empty to keep the hunk-level anchor.
 5. **Watch the queue.** The project comments queue at the top summarizes all saved comments for the current project.
 6. **Process with an Agent.** Select an Agent from the current workspace and process all saved comments for the project in one batch. The batch is handed to that Agent's workflow and the queue clears at handoff — Review Deck never waits for the Agent and never tracks completion.
 7. **Read the results in the Agent's conversation.** The Agent works through the comments and reports per-comment outcomes (completed / stale / failed / unresolved) in its own reply; its timeline also shows one *"{count} review comments submitted"* row as the handoff record. Re-add any comment the Agent could not complete if you want it revisited.
@@ -126,6 +128,7 @@ Requires **Paseo 0.10.1 or newer** (`>=0.10.1`).
 ## Safety controls
 
 - **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
+- **Re-anchoring is advisory and fail-closed.** Unique exact/content/context matches can follow comments; stale or ambiguous anchors are never guessed and require an explicit user re-anchor. Reject/revert still verify the current target and hunk fingerprints independently.
 
 ## Installation
 

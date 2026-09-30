@@ -20,6 +20,7 @@
   "files": [
     "../server/ReviewService.ts",
     "anchor-engine.test.ts",
-    "ai-review-service.test.ts"
+    "ai-review-service.test.ts",
+    "review-batch-service.test.ts",
   ]
 }

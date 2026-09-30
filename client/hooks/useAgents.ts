@@ -19,8 +19,8 @@ import type { AgentEntry, AgentInfo } from "../tools";
  * agent set actually moved, so the snapshot watcher can treat it as a
  * workspace-activity signal without polling.
  */
-export function useAgents(params: { selectedWorkspaceId: string; reviewCwd: string | null }) {
-  const { selectedWorkspaceId, reviewCwd } = params;
+export function useAgents(params: { selectedWorkspaceId: string; reviewCwd: string | null; projectId: string }) {
+  const { selectedWorkspaceId, reviewCwd, projectId } = params;
   const paseo = usePaseo();
   const registry = getAgentRegistry();
   useEffect(() => {
@@ -50,8 +50,24 @@ export function useAgents(params: { selectedWorkspaceId: string; reviewCwd: stri
   const agents = useMemo(() => workspaceScoped
     .map(({ id, provider, model, title }): AgentInfo => ({ id, provider, model, title })),
   [workspaceScoped]);
-  // Project-scoped processing agents for the batch queue (same safe scope).
-  const projectAgents = agents;
+  // The project queue needs eligible Agents from every workspace in the project.
+  const projectAgents = useMemo(() => snapshot.agents
+    .filter((agent) =>
+      USABLE_AGENT_STATUSES[agent.status] === true &&
+      !agent.archived &&
+      agent.projectKey === projectId &&
+      agent.workspaceId !== null,
+    )
+    .map((agent): AgentEntry => ({
+      id: agent.id,
+      workspaceId: agent.workspaceId,
+      cwd: agent.cwd,
+      status: agent.status,
+      provider: agent.provider,
+      model: agent.model,
+      title: agent.title,
+    })),
+  [projectId, snapshot.agents]);
 
   return { agents, projectAgents, agentsLoading: snapshot.loading, agentRevision: snapshot.revision };
 }

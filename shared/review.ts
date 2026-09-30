@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { activeReviewBatchSchema, reviewBatchSchema } from "./review-batch";
 
 export const reviewScopeSchema = z.enum(["working", "staged", "branch", "commits"]);
 export type ReviewScope = z.infer<typeof reviewScopeSchema>;
@@ -450,6 +451,7 @@ export const projectReviewSummarySchema = z.object({
   fileCount: z.number().int().nonnegative(),
   targetCount: z.number().int().nonnegative(),
   comments: z.array(projectReviewCommentSchema),
+  batches: z.array(activeReviewBatchSchema),
 });
 export type ProjectReviewSummary = z.infer<typeof projectReviewSummarySchema>;
 
@@ -468,17 +470,9 @@ export const getProjectReviewCommentCount = defineRpc({
   output: z.object({ commentCount: z.number().int().nonnegative() }),
 });
 
-// processProjectReview hands every comment to the selected agent's workflow
-// (fire-and-forget; results appear in the agent's conversation) and removes the
-// comments from Review Deck — the result is a submission confirmation only.
-export const processProjectReviewResultSchema = z.object({
-  projectId: z.string(),
-  workspaceId: z.string(),
-  workspaceCwd: z.string(),
-  processedCommentIds: z.array(z.string()),
-  commentCount: z.number().int().nonnegative(),
-  submittedAt: z.string(),
-});
+// Submit one workspace's selected comments as a persisted ReviewBatch. Comments
+// remain queued until the Agent's turn reports explicit COMPLETED outcomes.
+export const processProjectReviewResultSchema = reviewBatchSchema;
 export type ProcessProjectReviewResult = z.infer<typeof processProjectReviewResultSchema>;
 
 export const processProjectReview = defineRpc({
@@ -488,6 +482,7 @@ export const processProjectReview = defineRpc({
     agentId: z.string().min(1),
     workspaceId: z.string().min(1),
     workspaceCwd: z.string().min(1),
+    commentIds: z.array(z.string().min(1)).min(1),
   }),
   output: processProjectReviewResultSchema,
 });

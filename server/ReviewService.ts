@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext, PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type {
   AiReviewDepth,
   AiReviewBudgetPreset,
@@ -35,10 +35,13 @@ import {
   type ReviewDeckSettingsValues,
 } from "../shared/review-settings";
 import {
-  reviewHandoffTimelineKind,
-  reviewHandoffTimelineSchema,
-  reviewHandoffTimelineVersion,
-} from "../shared/review-handoff";
+  reviewBatchTimelineKind,
+  reviewBatchTimelineSchema,
+  reviewBatchTimelineVersion,
+  type ActiveReviewBatch,
+  type ReviewBatch,
+  type ReviewCommentOutcome,
+} from "../shared/review-batch";
 import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
 import {
   buildLineRangeAnchor,
@@ -48,7 +51,7 @@ import {
   type AnchorResolution,
   type OwnershipConstraints,
 } from "./AnchorEngine";
-import { RepoMutexRegistry } from "./util/mutex";
+import { createMutex, RepoMutexRegistry } from "./util/mutex";
 import { displayLanguage } from "./lang/languages";
 import { severityRank } from "./diff/FindingDetector";
 import { DiffParser, hunkBodyLines, parseRange, type Hunk } from "./diff/DiffParser";
@@ -58,6 +61,7 @@ import {
   AiReviewCacheStore,
   type AiReviewCacheEntry,
 } from "./persistence/AiReviewCacheStore";
+import { ReviewBatchStore } from "./persistence/ReviewBatchStore";
 import {
   AI_REVIEW_PROMPT_VERSION,
   AI_REVIEW_SCHEMA_VERSION,
@@ -65,6 +69,12 @@ import {
   promptHunk,
   type AiReviewPromptFile,
 } from "./ai-review-prompt";
+import {
+  buildReviewBatchPrompt,
+  extractReviewBatchAssistantResponse,
+  parseReviewCommentOutcomes,
+  reviewBatchTimelineData,
+} from "./review-batch";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
@@ -72,6 +82,7 @@ export interface ReviewServiceDependencies {
   settings?: ReviewDeckSettingsHandle;
   store?: StateStore;
   aiReviewCacheStore?: AiReviewCacheStore;
+  reviewBatchStore?: ReviewBatchStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -82,6 +93,17 @@ export interface ReviewServiceDependencies {
 const READONLY_REVIEW_POLL_WAIT_MS = 2_000;
 /** Abandoned review entries (client gave up polling) are evicted after this. */
 const READONLY_REVIEW_ENTRY_TTL_MS = 10 * 60_000;
+/** Give the Agent a bounded startup window before releasing a lost submission. */
+const REVIEW_BATCH_START_TIMEOUT_MS = 2 * 60_000;
+
+function isActiveReviewBatch(status: ReviewBatch["status"]): boolean {
+  return status === "draft" || status === "submitted" || status === "running";
+}
+
+function isOrphanedReviewBatch(batch: ReviewBatch): boolean {
+  return batch.status === "failed" &&
+    batch.commentIds.every((commentId) => batch.outcomes[commentId] === "unresolved");
+}
 
 function emptyReviewSections(): ReviewSections {
   return { verifiedFacts: [], aiInference: [], humanVerificationRecommended: [] };
@@ -258,6 +280,8 @@ export class ReviewService {
   private readonly settings: ReviewDeckSettingsHandle | undefined;
   private readonly store: StateStore;
   private readonly aiReviewCacheStore: AiReviewCacheStore;
+  private readonly reviewBatchStore: ReviewBatchStore;
+  private readonly reviewBatchTimelineMutex = createMutex();
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
   private readonly gitFactory: (cwd: string) => GitRunner;
@@ -277,6 +301,7 @@ export class ReviewService {
     this.settings = dependencies.settings;
     this.store = dependencies.store ?? new StateStore();
     this.aiReviewCacheStore = dependencies.aiReviewCacheStore ?? new AiReviewCacheStore();
+    this.reviewBatchStore = dependencies.reviewBatchStore ?? new ReviewBatchStore();
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
     this.gitFactory = dependencies.gitFactory ?? ((cwd) => new GitRunner(cwd));
@@ -1011,24 +1036,83 @@ export class ReviewService {
   }
 
   /**
-   * List the saved review comments of one project, ordered by filePath then savedAt.
-   * Returns null when the project has no comment records, so listings never expose
-   * an empty project. fileCount/targetCount are computed from the comment records.
+   * List a project's queued comments and in-flight batches. Completed outcomes
+   * are reconciled against the queue before the summary is returned.
    */
-  async listProjectReviewComments(projectId: string): Promise<ProjectReviewSummary | null> {
-    const file = await this.store.load();
+  async listProjectReviewComments(
+    projectId: string,
+    context?: PluginHandlerContext,
+  ): Promise<ProjectReviewSummary | null> {
+    if (context) await this.reconcileStalledReviewBatches(projectId, context);
+    const storedBatches = await this.reviewBatchStore.listByProject(projectId);
+    const completedCommentIds = [...new Set(storedBatches
+      .filter((batch) => !isActiveReviewBatch(batch.status))
+      .flatMap((batch) => batch.commentIds.filter((commentId) => batch.outcomes[commentId] === "completed")))];
+    if (completedCommentIds.length > 0) {
+      await this.clearProjectReviewComments(projectId, completedCommentIds);
+    }
+    const [file, activeBatches] = await Promise.all([
+      this.store.load(),
+      this.reviewBatchStore.listActiveByProject(projectId),
+    ]);
     const comments = sortProjectComments(this.projectComments(file, projectId));
-    if (comments.length === 0) return null;
-    const { projectName, projectRootPath } = this.projectCommentIdentity(comments);
+    if (comments.length === 0 && activeBatches.length === 0) return null;
+    const identity = comments.length > 0 ? this.projectCommentIdentity(comments) : null;
     return {
       projectId,
-      ...(projectName !== undefined ? { projectName } : {}),
-      ...(projectRootPath !== undefined ? { projectRootPath } : {}),
+      ...(identity?.projectName !== undefined ? { projectName: identity.projectName } : {}),
+      ...(identity?.projectRootPath !== undefined ? { projectRootPath: identity.projectRootPath } : {}),
       commentCount: comments.length,
       fileCount: new Set(comments.map((comment) => comment.filePath)).size,
       targetCount: new Set(comments.map((comment) => comment.targetFingerprint)).size,
       comments,
+      batches: activeBatches.map((batch): ActiveReviewBatch => ({
+        id: batch.id,
+        workspaceId: batch.workspaceId,
+        agentId: batch.agentId,
+        commentIds: batch.commentIds,
+        status: batch.status as ActiveReviewBatch["status"],
+      })),
     };
+  }
+
+  private async reconcileStalledReviewBatches(projectId: string, context: PluginHandlerContext): Promise<void> {
+    const batches = await this.reviewBatchStore.listActiveByProject(projectId);
+    for (const batch of batches) {
+      const turnWasObserved = batch.status === "running" ||
+        (batch.status === "submitted" && batch.turnId !== undefined);
+      const startExpired = (batch.status === "draft" || batch.status === "submitted") &&
+        Date.now() - Date.parse(batch.createdAt) >= REVIEW_BATCH_START_TIMEOUT_MS;
+      const handle = context.paseo.agents.ref(batch.agentId);
+      let refreshed;
+      try {
+        refreshed = await handle.refresh();
+      } catch {
+        // An RPC/transport failure is not evidence that the Agent is gone.
+        continue;
+      }
+      const agent = refreshed?.agent ?? handle.current();
+      if (agent && !agent.archivedAt && (agent.status === "running" || agent.status === "initializing")) continue;
+      if (!turnWasObserved && !startExpired) continue;
+      await this.failActiveBatchAsUnresolved(batch.id, context);
+    }
+  }
+
+  private async failActiveBatchAsUnresolved(
+    batchId: string,
+    context: PluginHandlerContext | PluginHookContext,
+  ): Promise<void> {
+    const completedAt = new Date().toISOString();
+    let finalized = false;
+    const updated = await this.reviewBatchStore.update(batchId, (current) => {
+      if (!isActiveReviewBatch(current.status)) return current;
+      finalized = true;
+      const outcomes = Object.fromEntries(
+        current.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "unresolved"]),
+      );
+      return { ...current, status: "failed", outcomes, completedAt };
+    });
+    if (finalized && updated) await this.appendReviewBatchTimeline(updated, context);
   }
 
   /**
@@ -1053,33 +1137,28 @@ export class ReviewService {
   }
 
   /**
-   * Process every saved review comment of one project in a single agent run,
-   * strictly bound to the workspace selected in the client UI.
-   * The executing agent is refreshed and validated BEFORE anything runs: it must
-   * exist, must belong to input.workspaceId, and its cwd must be the selected
-   * workspace directory (real-path/normalization differences allowed, a foreign
-   * workspace never accepted). Any mismatch throws a clear error — the server
-   * never silently substitutes another agent.
-   * The prompt embeds the executing agent's workspace id/cwd plus each comment's
-   * file path, target/hunk fingerprints, hunk header, exact patch, human comment,
-   * and its own worktree context (cwd, scope, refs, workspace id). Project
-   * comments may span multiple worktrees; the agent must only touch the listed
-   * files/hunks inside the comment's own cwd/worktree, verify fingerprints item by
-   * item, and stop (reporting stale) any item whose target drifted.
-   * Submit-and-cleanup semantics: the whole prompt is handed to the agent's
-   * workflow fire-and-forget (never waited on — processing time is unbounded),
-   * then every submitted comment is removed from Review Deck. The returned
-   * processedCommentIds/commentCount/submittedAt are the submission
-   * confirmation; results appear in the agent's conversation, not here.
+   * Submit exactly one workspace's selected comments. Their records remain in
+   * the queue until the matching Agent turn explicitly reports COMPLETED.
    */
   async processProjectReview(
-    input: { projectId: string; agentId: string; workspaceId: string; workspaceCwd: string },
+    input: {
+      projectId: string;
+      agentId: string;
+      workspaceId: string;
+      workspaceCwd: string;
+      commentIds: string[];
+    },
     context: PluginHandlerContext,
   ): Promise<ProcessProjectReviewResult> {
-    // Workspace-bound agent gate: refresh first so a deleted, replaced, or
-    // re-bound agent can never be processed silently under a stale id.
+    const requestedIds = new Set(input.commentIds);
+    if (requestedIds.size !== input.commentIds.length) {
+      throw new Error("A ReviewBatch cannot contain duplicate comment ids.");
+    }
+
+    // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
+    // can never process comments under a stale workspace selection.
     const handle = context.paseo.agents.ref(input.agentId);
-    let agent: { workspaceId?: string; cwd?: string } | null | undefined;
+    let agent: { workspaceId?: string | null; cwd?: string | null } | null | undefined;
     try {
       const fresh = await handle.refresh();
       agent = fresh?.agent ?? handle.current();
@@ -1087,128 +1166,219 @@ export class ReviewService {
       agent = handle.current();
     }
     if (!agent) {
-      throw new Error(
-        `Processing agent ${input.agentId} does not exist. Select an agent of workspace ${input.workspaceId} and retry.`,
-      );
+      throw new Error(`Processing agent ${input.agentId} does not exist. Select an Agent in workspace ${input.workspaceId} and retry.`);
     }
     if (agent.workspaceId !== input.workspaceId) {
       throw new Error(
-        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not the selected workspace ${input.workspaceId}. Project comments can only be processed by an agent of the selected workspace; no other agent was substituted.`,
+        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not ${input.workspaceId}. No other Agent was substituted.`,
       );
     }
     if (!(await this.directoriesMatch(agent.cwd ?? "", input.workspaceCwd))) {
       throw new Error(
-        `Processing agent ${input.agentId} runs in ${agent.cwd ?? "(unknown)"}, which is not the selected workspace directory ${input.workspaceCwd}. Refusing to process with an agent outside the selected workspace.`,
+        `Processing agent ${input.agentId} does not run in the selected workspace directory ${input.workspaceCwd}. Refusing to process outside that workspace.`,
       );
     }
+
     const file = await this.store.load();
-    const comments = sortProjectComments(this.projectComments(file, input.projectId));
-    if (comments.length === 0) {
-      throw new Error(`Project ${input.projectId} has no saved review comments. Save at least one commented hunk before processing.`);
+    const comments = sortProjectComments(this.projectComments(file, input.projectId))
+      .filter((comment) => requestedIds.has(comment.id));
+    if (comments.length !== requestedIds.size) {
+      throw new Error("One or more selected project comments are no longer in the queue. Refresh the queue and retry.");
     }
-    const processedCommentIds = comments.map((comment) => comment.id);
-    const { projectName, projectRootPath } = this.projectCommentIdentity(comments);
-    const commentBlocks = comments.map(
-      (comment, index) => [
-        `[${index + 1}] Comment id: ${comment.id}`,
-        `File: ${comment.filePath}`,
-        `Comment cwd (worktree): ${comment.cwd}`,
-        `Scope: ${comment.scope}`,
-        `Base ref: ${comment.baseRef ?? "(repository default)"}`,
-        `Head ref: ${comment.headRef ?? "(repository default)"}`,
-        ...(comment.workspaceId !== undefined ? [`Workspace id: ${comment.workspaceId}`] : []),
-        `Target fingerprint: ${comment.targetFingerprint}`,
-        `Hunk fingerprint: ${comment.hunkFingerprint}`,
-        `Hunk header: ${comment.hunkHeader}`,
-        `Human comment: ${comment.comment}`,
-        `Exact hunk patch:\n${comment.hunkPatch}`,
-      ].join("\n"),
-    );
-    const prompt = [
-      "Process every saved review comment below as one task.",
-      "Each comment block carries its own cwd (the exact working directory of the worktree the comment came from), scope, refs, and workspace id. The project may span multiple worktrees: you MUST validate and modify every comment inside that comment's own cwd/workspace only, and never treat the project root path, the executing agent's own workspace, or any other worktree as the target of a comment. Every comment is validated against its own cwd, even when that cwd differs from the executing agent's workspace.",
-      "You may edit the listed files and hunks to address the human comments, but never modify unrelated files or hunks, and never touch anything outside the comment's own cwd/worktree.",
-      "Verify each comment against the current state before editing. If the target fingerprint or the exact hunk fingerprint no longer matches the current change (the target drifted), stop work on that comment, do not edit it, and report it as stale.",
-      "For each matching comment, apply the requested change to exactly the listed hunk. Focused verification (running the relevant test or build for the code you changed) is allowed, but never claim that tests or builds passed unless you actually ran them.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "At the very end of your response, add a strict machine-parseable COMMENT OUTCOMES section with exactly one line per comment id, in this exact format:",
-      "- <comment-id> | COMPLETED | optional short detail",
-      "- <comment-id> | STALE | optional short detail",
-      "- <comment-id> | FAILED | optional short detail",
-      "- <comment-id> | UNRESOLVED | optional short detail",
-      "Mark COMPLETED only for comments you actually finished editing. Mark STALE when the target drifted, FAILED when you tried but could not complete it, UNRESOLVED when you did not address it. A comment that is not explicitly marked COMPLETED must never be treated as completed.",
-      `Project id: ${input.projectId}`,
-      ...(projectName !== undefined ? [`Project name: ${projectName}`] : []),
-      `Workspace: ${projectRootPath ?? comments[0].cwd}`,
-      `Executing agent workspace id: ${input.workspaceId}`,
-      `Executing agent workspace cwd: ${input.workspaceCwd}`,
-      `Comments (${comments.length}):`,
-      commentBlocks.join("\n\n"),
-    ].join("\n\n");
-    // Fire-and-forget submit: the prompt is handed to the agent's workflow via
-    // handle.send (send_agent_message_request — the same RPC the workspace UI
-    // uses, so the prompt lands in the selected workspace Agent's message
-    // stream). Processing time is unbounded, so we never wait for the agent:
-    // results appear in the agent's conversation and the user copies them from
-    // there. Only after the daemon accepts the prompt are the submitted
-    // comments removed from Review Deck (every commented record of the project;
-    // reviewed records are preserved); on send failure the comments are left
-    // untouched and the error propagates.
-    await handle.send(prompt);
-    // Observability-only audit row on the SAME agent's timeline: one
-    // version-1 "review-deck-handoff" plugin item recording that this batch
-    // of review comments was submitted to the agent's workflow. The row
-    // states only the submission (never completion) and carries no review
-    // content, file path, cwd, workspace, project, or agent identifiers.
-    // The append is best-effort: a failure is logged and swallowed so the
-    // established queue-clear path below still runs — an append failure can
-    // never surface as an RPC error, so a client retry can never re-send the
-    // prompt and duplicate the Agent task.
-    try {
-      await handle.timeline.append({
-        type: "plugin",
-        id: randomUUID(),
-        kind: reviewHandoffTimelineKind,
-        version: reviewHandoffTimelineVersion,
-        data: reviewHandoffTimelineSchema.parse({
-          commentCount: processedCommentIds.length,
-          submittedAt: new Date().toISOString(),
-        }),
-      });
-    } catch (error) {
-      console.error(
-        `review-deck: could not append a review-deck-handoff timeline row for agent ${input.agentId}; the batch was already sent, continuing with the queue clear`,
-        error,
-      );
+    for (const comment of comments) {
+      if (comment.workspaceId !== undefined && comment.workspaceId !== input.workspaceId) {
+        throw new Error(`Comment ${comment.id} belongs to another workspace; refusing to include it in this batch.`);
+      }
+      if (!(await this.directoriesMatch(comment.cwd, input.workspaceCwd))) {
+        throw new Error(`Comment ${comment.id} does not belong to the selected workspace directory; refusing to include it.`);
+      }
     }
-    await this.clearProjectReviewComments(input.projectId);
-    return {
+
+    const batch: ReviewBatch = {
+      id: randomUUID(),
+      createdAt: new Date().toISOString(),
       projectId: input.projectId,
       workspaceId: input.workspaceId,
-      workspaceCwd: input.workspaceCwd,
-      processedCommentIds,
-      commentCount: processedCommentIds.length,
-      submittedAt: new Date().toISOString(),
+      agentId: input.agentId,
+      commentIds: comments.map((comment) => comment.id),
+      status: "draft",
+      outcomes: {},
     };
+    await this.reviewBatchStore.create(batch);
+    const { projectName } = this.projectCommentIdentity(comments);
+    const prompt = buildReviewBatchPrompt({
+      batchId: batch.id,
+      projectId: input.projectId,
+      ...(projectName !== undefined ? { projectName } : {}),
+      workspaceId: input.workspaceId,
+      workspaceCwd: input.workspaceCwd,
+      comments,
+    });
+
+    try {
+      await handle.send(prompt);
+    } catch (error) {
+      const completedAt = new Date().toISOString();
+      const failedOutcomes = Object.fromEntries(
+        batch.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "failed"]),
+      );
+      const failed = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status)) return current;
+        return { ...current, status: "failed", outcomes: failedOutcomes, completedAt };
+      });
+      if (failed?.submittedAt) await this.appendReviewBatchTimeline(failed, context);
+      throw error;
+    }
+
+    const submittedAt = new Date().toISOString();
+    const submitted = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (current.status !== "draft") return current;
+      return { ...current, status: "submitted", submittedAt };
+    });
+    if (!submitted) throw new Error(`ReviewBatch ${batch.id} disappeared after Agent submission.`);
+    await this.appendReviewBatchTimeline(submitted, context);
+    return submitted;
+  }
+
+  async handleAgentTurnStarted(
+    event: PluginLifecycleEvents["agent.turn_started"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
+    if (!batch) return;
+    if (batch.status === "running") {
+      if (event.turnId === null || batch.turnId === event.turnId) return;
+      await this.failActiveBatchAsUnresolved(batch.id, context);
+      return;
+    }
+    const startedAt = new Date().toISOString();
+    const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (current.status !== "draft" && current.status !== "submitted") return current;
+      return {
+        ...current,
+        status: "running",
+        submittedAt: current.submittedAt ?? startedAt,
+        ...(event.turnId !== null ? { turnId: event.turnId } : {}),
+      };
+    });
+    if (updated?.status === "running") await this.appendReviewBatchTimeline(updated, context);
+  }
+
+  async handleAgentArchived(
+    event: PluginLifecycleEvents["agent.archived"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
+    if (batch) await this.failActiveBatchAsUnresolved(batch.id, context);
+  }
+
+  async handleAgentTurnEnded(
+    event: PluginLifecycleEvents["agent.turn_ended"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const storedBatches = await this.reviewBatchStore.list();
+    const candidates = storedBatches.filter((batch) =>
+      batch.agentId === event.agent.id &&
+      (isActiveReviewBatch(batch.status) || isOrphanedReviewBatch(batch)),
+    );
+
+    for (const batch of candidates) {
+      const response = extractReviewBatchAssistantResponse(event.timeline, batch.id);
+      const eventMatchesBatchTurn = batch.turnId !== undefined &&
+        event.turnId !== null &&
+        batch.turnId === event.turnId;
+      if (!eventMatchesBatchTurn) {
+        if (isActiveReviewBatch(batch.status) && response.found) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+      if (!response.found || !response.hasAssistantMessage || !response.hasOutcomesSection) {
+        if (isActiveReviewBatch(batch.status)) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+      if (event.outcome.kind !== "completed") {
+        if (isActiveReviewBatch(batch.status)) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+
+      const outcomes = parseReviewCommentOutcomes(response.text, batch.commentIds);
+      const values = batch.commentIds.map((commentId) => outcomes[commentId]);
+      const status: ReviewBatch["status"] = values.every((outcome) => outcome === "completed")
+        ? "completed"
+        : values.every((outcome) => outcome === "failed" || outcome === "unresolved")
+          ? "failed"
+          : "partial";
+      const completedAt = new Date().toISOString();
+      let finalized = false;
+      const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status) && !isOrphanedReviewBatch(current)) return current;
+        if (current.turnId !== event.turnId) return current;
+        finalized = true;
+        return {
+          ...current,
+          status,
+          outcomes,
+          submittedAt: current.submittedAt ?? completedAt,
+          completedAt,
+        };
+      });
+      if (!finalized || !updated) continue;
+
+      const completedCommentIds = batch.commentIds.filter((commentId) => updated.outcomes[commentId] === "completed");
+      await this.appendReviewBatchTimeline(updated, context);
+      if (completedCommentIds.length > 0) {
+        await this.clearProjectReviewComments(updated.projectId, completedCommentIds);
+      }
+    }
+  }
+  private async appendReviewBatchTimeline(
+    batch: ReviewBatch,
+    context: PluginHandlerContext | PluginHookContext,
+  ): Promise<void> {
+    await this.reviewBatchTimelineMutex.run(async () => {
+      const current = (await this.reviewBatchStore.list()).find((entry) => entry.id === batch.id);
+      if (!current || current.agentId !== batch.agentId || !current.submittedAt) return;
+      try {
+        await context.paseo.agents.ref(current.agentId).timeline.append({
+          type: "plugin",
+          id: `review-deck-batch:${current.id}`,
+          kind: reviewBatchTimelineKind,
+          version: reviewBatchTimelineVersion,
+          data: reviewBatchTimelineData(current),
+        });
+      } catch (error) {
+        console.error(`review-deck: could not update the timeline row for ReviewBatch ${current.id}`, error);
+      }
+    });
   }
 
   /**
-   * Remove every commented/has-comment record of the project (used by
-   * processProjectReview after the comments were handed to the agent's
-   * workflow); reviewed records are preserved. Returns the number of records
-   * actually cleared.
+   * Remove only the named completed comments. A comment edited while its batch
+   * ran receives a new id and therefore remains queued for the next batch.
    */
-  async clearProjectReviewComments(projectId: string): Promise<number> {
+  async clearProjectReviewComments(projectId: string, commentIds: readonly string[]): Promise<number> {
+    const completedIds = new Set(commentIds);
+    if (completedIds.size === 0) return 0;
     return this.store.runExclusive(async () => {
       const file = await this.store.load();
       let cleared = 0;
       for (const [targetFingerprint, entries] of Object.entries(file)) {
         const next = entries.filter((entry) => {
-          if (entry.projectId !== projectId) return true;
-          return !(entry.decision === "commented" || (entry.comment?.trim() ?? "") !== "");
+          if (
+            entry.projectId !== projectId ||
+            !entry.id ||
+            !completedIds.has(entry.id) ||
+            this.projectCommentBody(entry, projectId) === null
+          ) return true;
+          cleared++;
+          return false;
         });
         if (next.length === entries.length) continue;
-        cleared += entries.length - next.length;
         if (next.length === 0) delete file[targetFingerprint];
         else file[targetFingerprint] = next;
       }

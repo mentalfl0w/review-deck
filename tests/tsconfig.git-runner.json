@@ -1,0 +1,24 @@
+{
+  "//": "Compile config for tests/git-runner.test.ts: the runner and the parser are plain server modules, so CommonJS emit is enough and no @getpaseo exports-map paths are needed. Type checking stays the project's own --noEmit run.",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "target": "ES2020",
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": false,
+    "outDir": "../node_modules/.cache/review-deck-git-runner-tests",
+    "baseUrl": "..",
+    "paths": {
+      "@getpaseo/plugin": ["node_modules/@getpaseo/plugin/dist/index.d.ts"]
+    }
+  },
+  "files": [
+    "../server/git/GitRunner.ts",
+    "../server/diff/DiffParser.ts",
+    "../server/diff/FindingDetector.ts",
+    "git-runner.test.ts"
+  ]
+}

@@ -12,13 +12,32 @@ export interface GitRunOptions {
  * Runs `git -C <cwd> <args>` with Review Deck's output cap and prompt/lock
  * hardening. One instance is bound to a single working directory; callers
  * construct a runner per repository path they need.
+ *
+ * The diff prefixes are pinned to the `a/`/`b/` defaults. The DiffParser
+ * recovers file paths from the `diff --git` header, and a user-level
+ * `diff.mnemonicPrefix`, `diff.noprefix` or `diff.srcPrefix`/`diff.dstPrefix`
+ * changes that header into a shape the parser cannot split, which silently
+ * yields snapshots with no files. Command-line `-c` outranks every config
+ * file, so the plugin's own reads stay canonical without touching the user's
+ * Git configuration or their terminal output.
  */
+const CANONICAL_DIFF_CONFIG = [
+  "-c",
+  "diff.noprefix=false",
+  "-c",
+  "diff.mnemonicPrefix=false",
+  "-c",
+  "diff.srcPrefix=a/",
+  "-c",
+  "diff.dstPrefix=b/",
+];
+
 export class GitRunner {
   constructor(private readonly cwd: string) {}
 
   run(args: string[], options: GitRunOptions = {}): Promise<string> {
     const { promise, resolve, reject } = Promise.withResolvers<string>();
-    const child = spawn("git", ["-C", this.cwd, ...args], {
+    const child = spawn("git", ["-C", this.cwd, ...CANONICAL_DIFF_CONFIG, ...args], {
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
       stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });

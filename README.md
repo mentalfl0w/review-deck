@@ -26,8 +26,8 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Agent-context Review Deck | Open Review Deck bound to the Agent of the current workspace — its own panel entry, the Command Center item **Open Review Deck for this Agent**, or the **`/review-deck`** slash command in an Agent chat; the Agent is preselected as the review target |
 | Paseo-native entries | Workspace header button and Agent composer pill open the matching Review Deck and show the project's pending comment count. |
 | Submission timeline row | Handing a comment batch to an Agent adds one row to that Agent's timeline — *"{count} review comments submitted"*. The row records only the submission: it never claims completion and never carries comment, patch, path, or identifier content |
-| Review defaults | Panel language (Auto / 中文 / English) and default diff layout (Auto / Unified / Split), configured under **Settings → Plugins → Review defaults** and stored per host |
-| AI review & explain | Explain a hunk with local rules or ask an Agent for an AI explanation; run a full review of the changeset with an Agent; results separate verified facts from AI inference |
+| Review defaults | Panel language (Auto / 中文 / English), diff layout (Auto / Unified / Split), reviewer strategy and Provider / Model / Thinking, cache, token-usage display, and the default Economical / Balanced / Deep preset. Settings are host-scoped under **Settings → Plugins → Review Deck** |
+| AI review & explain | Explain a hunk, review one file, or review the current target. The preset sets risk coverage and default depth; Targeted / Full can override patch context per run. Reviewers prefer Read-only/Plan; OMP Ask is approval-gated. Presets reuse the selected Reviewer model; results show the preset, permission mode, Cached / Fresh, and token usage |
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
 | Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
 | File-level actions | Mark a whole file reviewed in one tap, ask an Agent to explain a whole file, or revert all of a file's changes at once — comment-anchored hunks are skipped automatically |
@@ -50,7 +50,7 @@ flowchart TB
 
 ## Architecture
 
-Review Deck is a Paseo **0.10.1+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.10.1+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; AI review results use a separate bounded cache at `~/.paseo/review-deck/ai-review-cache.json` (30-day TTL, 256-entry cap). Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -72,10 +72,12 @@ flowchart LR
         Git["GitRunner"]
         Parse["DiffParser · FindingDetector"]
         Store["StateStore"]
+        AiCache["AiReviewCacheStore"]
         Svc --> Anchor
         Svc --> Git
         Svc --> Parse
         Svc --> Store
+        Svc --> AiCache
     end
 
     ClientEntry["index.client.tsx (repo root)<br/>panels · Command Center · /review-deck<br/>timeline · settings · header / composer entries"]

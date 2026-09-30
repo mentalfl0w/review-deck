@@ -7,6 +7,7 @@ import type {
   ReviewAnchor,
   ReviewAnchorIssue,
   ReviewScope,
+  PollAiReviewResult,
   ReviewSections,
 } from "../../shared/review";
 import { hunkHeaderParts } from "../diffView";
@@ -30,15 +31,16 @@ import {
 import { viewModeKeys } from "../tools";
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
-import { ActionButton, Segmented, SeverityBadge } from "./ui";
+import { ActionButton, Segmented, SeverityBadge, StringGroup } from "./ui";
 import { HunkCard } from "./HunkCard";
 import { FileView } from "./FileView";
 import { CommentSheet } from "./CommentSheet";
 import { AnchorIssues } from "./AnchorIssues";
+import { AiReviewMeta } from "./AiReviewMeta";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentReviewMeta, agentReviewBusy, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -80,6 +82,9 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   aiExplanation: ExplainHunkAiResult | null;
   agentReview: string | null;
   agentSections: ReviewSections | null;
+  agentReviewMeta: Pick<PollAiReviewResult, "provider" | "model" | "thinkingOptionId" | "reviewerPermissionMode" | "resultSource" | "mode" | "depth" | "reviewPreset" | "usage"> | null;
+  agentReviewBusy: boolean;
+  showAiReviewUsage: boolean;
   activeCommentDraft: FileCommentDraft | undefined;
   activeSavedComment: FileCommentEntry | null;
   onCommentBodyChange: (body: string) => void;
@@ -205,9 +210,9 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             />
             <ActionButton
               variant="secondary"
-              label={t("agentFileReviewLabel")}
+              label={agentReviewBusy ? t("aiReviewRunning") : t("agentFileReviewLabel")}
               tooltip={agentsLoading ? t("agentsLoading") : selectedAgentId ? t("agentFileReviewHint") : t("agentActionNoAgentHint")}
-              disabled={agentsLoading || !selectedAgentId}
+              disabled={agentsLoading || !selectedAgentId || agentReviewBusy}
               onPress={() => { if (selectedAgentId) void onRunAgentReview(selectedAgentId, selectedFile.path); }}
               theme={theme}
               layout={layout}
@@ -298,8 +303,7 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             analysisStale={analysisStale}
             explanation={explanation}
             aiExplanation={aiExplanation}
-            agentReview={agentReview}
-            agentSections={agentSections}
+            showAiReviewUsage={showAiReviewUsage}
             selection={lineSelection}
             onLinePress={onLinePress}
             onLineTap={onLineTap}
@@ -308,6 +312,27 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
           />
         )}
 
+        {agentReview ? (
+          <View style={styles.analysisBlock}>
+            <Text style={styles.label}>
+              {agentReviewMeta
+                ? t("aiReviewLabel", { provider: agentReviewMeta.provider, model: agentReviewMeta.model })
+                : t("aiReview")}
+            </Text>
+            {agentReviewMeta ? <AiReviewMeta details={agentReviewMeta} showUsage={showAiReviewUsage} t={t} styles={styles} /> : null}
+            {agentSections && (
+              agentSections.verifiedFacts.length > 0 ||
+              agentSections.aiInference.length > 0 ||
+              agentSections.humanVerificationRecommended.length > 0
+            ) ? (
+              <>
+                <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
+                <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
+                <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
+              </>
+            ) : <Text selectable style={styles.rawReview}>{agentReview}</Text>}
+          </View>
+        ) : null}
         <View style={styles.commentArea}>
         <AnchorIssues
           theme={theme}

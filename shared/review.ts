@@ -85,6 +85,29 @@ export const reviewRequestSchema = z.object({
 });
 export type ReviewRequest = z.infer<typeof reviewRequestSchema>;
 
+export const aiReviewModeSchema = z.enum(["hunk", "file", "target"]);
+export type AiReviewMode = z.infer<typeof aiReviewModeSchema>;
+export const aiReviewDepthSchema = z.enum(["targeted", "full"]);
+export type AiReviewDepth = z.infer<typeof aiReviewDepthSchema>;
+export const aiReviewBudgetPresetSchema = z.enum(["economical", "balanced", "deep"]);
+export type AiReviewBudgetPreset = z.infer<typeof aiReviewBudgetPresetSchema>;
+export const aiReviewPermissionModeSchema = z.enum(["read-only", "ask"]);
+export type AiReviewPermissionMode = z.infer<typeof aiReviewPermissionModeSchema>;
+export const aiReviewPresetDefaultDepth: Record<AiReviewBudgetPreset, AiReviewDepth> = {
+  economical: "targeted",
+  balanced: "targeted",
+  deep: "full",
+};
+export const aiReviewResultSourceSchema = z.enum(["cached", "fresh"]);
+export type AiReviewResultSource = z.infer<typeof aiReviewResultSourceSchema>;
+export const aiReviewUsageSchema = z.object({
+  inputTokens: z.number().nonnegative().optional(),
+  outputTokens: z.number().nonnegative().optional(),
+  cachedTokens: z.number().nonnegative().optional(),
+  contextTokens: z.number().nonnegative().optional(),
+}).strict();
+export type AiReviewUsage = z.infer<typeof aiReviewUsageSchema>;
+
 export const severitySchema = z.enum(["critical", "high", "medium", "low", "informational"]);
 export const evidenceKindSchema = z.enum([
   "verified_fact",
@@ -181,12 +204,18 @@ export const explainHunkAiResultSchema = explainHunkResultSchema.extend({
   status: z.enum(["idle", "error", "permission", "timeout"]),
   provider: z.string(),
   model: z.string(),
+  thinkingOptionId: z.string().nullable().optional(),
+  reviewerPermissionMode: aiReviewPermissionModeSchema.optional(),
+  resultSource: aiReviewResultSourceSchema.optional(),
+  mode: z.literal("hunk").optional(),
+  reviewPreset: aiReviewBudgetPresetSchema.optional(),
+  usage: aiReviewUsageSchema.optional(),
 });
 export type ExplainHunkAiResult = z.infer<typeof explainHunkAiResultSchema>;
 
-// Async read-only AI review: the plugin host RPC layer times out long reviews,
-// so the read-only flows (AI评审变更块 / AI评审文件) start a transient child
-// agent with a start RPC and the client polls for the result.
+// Async AI review RPCs use a transient child agent, then poll its result.
+// The server validates workspace binding and a native Read-only/Plan or
+// approval-gated Ask provider mode before creating the child.
 export const aiReviewStatusSchema = z.enum(["running", "idle", "error", "permission", "timeout"]);
 export type AiReviewStatus = z.infer<typeof aiReviewStatusSchema>;
 
@@ -196,14 +225,20 @@ export const pollAiReviewResultSchema = z.object({
   sections: reviewSectionsSchema,
   provider: z.string(),
   model: z.string(),
+  thinkingOptionId: z.string().nullable().optional(),
+  reviewerPermissionMode: aiReviewPermissionModeSchema.optional(),
+  resultSource: aiReviewResultSourceSchema.optional(),
+  mode: aiReviewModeSchema.optional(),
+  depth: aiReviewDepthSchema.optional(),
+  reviewPreset: aiReviewBudgetPresetSchema.optional(),
+  usage: aiReviewUsageSchema.optional(),
 });
 export type PollAiReviewResult = z.infer<typeof pollAiReviewResultSchema>;
 
-// The async read-only review RPCs carry an explicit workspace binding: the
-// reviewed cwd is derived from the workspace id (the server revalidates the
-// claimed workspace's directory and the parent agent's workspace/cwd before
-// any child is created), and pollAiReview repeats the start-time
-// workspace/agent binding so a request id alone never resolves a review.
+// The async AI review RPCs carry an explicit workspace binding: the reviewed
+// cwd is derived from the workspace id (the server revalidates the claimed
+// directory and parent agent binding before any child is created), and poll
+// repeats the start-time workspace/agent binding so a request id alone never resolves a review.
 export const startExplainHunkAi = defineRpc({
   name: "review-deck.start-explain-hunk-ai",
   input: reviewRequestSchema.extend({
@@ -215,7 +250,12 @@ export const startExplainHunkAi = defineRpc({
 });
 export const startRunReview = defineRpc({
   name: "review-deck.start-run-review",
-  input: reviewRequestSchema.extend({ agentId: z.string().min(1), workspaceId: z.string().min(1) }),
+  input: reviewRequestSchema.extend({
+    reviewMode: z.enum(["file", "target"]),
+    reviewDepthOverride: aiReviewDepthSchema.optional(),
+    agentId: z.string().min(1),
+    workspaceId: z.string().min(1),
+  }),
   output: z.object({ requestId: z.string().min(1) }),
 });
 // The requestId is a per-request capability (never the transient child's
@@ -229,6 +269,11 @@ export const pollAiReview = defineRpc({
     agentId: z.string().min(1),
   }),
   output: pollAiReviewResultSchema,
+});
+export const clearAiReviewCache = defineRpc({
+  name: "review-deck.clear-ai-review-cache",
+  input: z.object({}),
+  output: z.object({ cleared: z.boolean() }),
 });
 export const explainFile = defineRpc({
   name: "review-deck.explain-file",

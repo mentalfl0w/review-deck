@@ -1,5 +1,5 @@
 {
-  "//": "Compile config for tests/anchor-engine.test.ts: CommonJS output through the same path mapping the target-fingerprint suite uses (@getpaseo/plugin resolves through its exports map, which the legacy node10 resolution used for CJS emit cannot read on its own). Type checking stays the project's own --noEmit run.",
+  "//": "Compile the ReviewService integration suites as CommonJS through the same path mapping used for the anchor engine (@getpaseo/plugin resolves through its exports map, which legacy node10 resolution cannot read for CJS emit).",
   "compilerOptions": {
     "module": "commonjs",
     "moduleResolution": "node10",
@@ -19,6 +19,7 @@
   },
   "files": [
     "../server/ReviewService.ts",
-    "anchor-engine.test.ts"
+    "anchor-engine.test.ts",
+    "ai-review-service.test.ts"
   ]
 }

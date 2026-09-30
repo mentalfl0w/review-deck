@@ -20,6 +20,7 @@ import { QueueModal } from "./components/QueueModal";
 import { MoreModal } from "./components/MoreModal";
 import { ManageModal } from "./components/ManageModal";
 import { reviewDeckSettings } from "../shared/review-settings";
+import type { AiReviewBudgetPreset, AiReviewDepth } from "../shared/review";
 
 /** The host surface the deck consumes, shared by the workspace and agent
  * panel contexts, plus the optional preferred agent target. Both host prop
@@ -42,6 +43,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const t = useMemo(() => makeT(locale), [locale]);
   const [actionError, setActionError] = useState<string | null>(null);
   const configuredDiffMode = settings.status === "ready" ? settings.values.diffMode : "auto";
+  const showAiReviewUsage = settings.status === "ready" ? settings.values.showAiReviewUsage : true;
+  const defaultReviewPreset: AiReviewBudgetPreset =
+    settings.status === "ready" ? settings.values.defaultReviewPreset : "balanced";
   const defaultDiffMode: DiffMode = configuredDiffMode === "auto"
     ? (layout.compact ? "unified" : "split")
     : configuredDiffMode;
@@ -57,6 +61,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [compactFilesOpen, setCompactFilesOpen] = useState(layout.compact);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [reviewDepthOverride, setReviewDepthOverride] = useState<AiReviewDepth | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const appliedPreferredAgentId = useRef<string | null>(null);
   const hasAppliedPreferredAgent = useRef(false);
@@ -65,6 +70,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
   }, []);
   const scopeApi = useReviewScope(workspaceId);
+  useEffect(() => {
+    setReviewDepthOverride(null);
+  }, [scopeApi.selectedWorkspaceId]);
   const agentsApi = useAgents({
     selectedWorkspaceId: scopeApi.selectedWorkspaceId,
     reviewCwd: scopeApi.reviewCwd,
@@ -155,6 +163,11 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     clearHunkComment: actionsApi.clearHunkComment,
     refreshProjectComments: commentsApi.refreshProjectComments,
   });
+  const runReviewForAgent = useCallback((agentId: string, filePath?: string) => {
+    const depthOverride = reviewDepthOverride;
+    setReviewDepthOverride(null);
+    void agentApi.runAgentReview(agentId, filePath, depthOverride ?? undefined);
+  }, [agentApi.runAgentReview, reviewDepthOverride]);
   const fileViewApi = useFileView({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
@@ -308,7 +321,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
       fileReviewed={snapshotApi.selectedFile ? snapshotApi.selectedFile.hunks.every((hunk) => snapshotApi.decisions.some((decision) => decision.hunkId === hunk.id)) : false}
       onMarkFileReviewed={() => void actionsApi.markFileReviewed()}
       onExplainFile={() => void agentApi.explainWholeFile()}
-      onRunAgentReview={(agentId, filePath) => void agentApi.runAgentReview(agentId, filePath)}
+      onRunAgentReview={runReviewForAgent}
       onRevertFile={() => void actionsApi.revertFileReview()}
       revertNotice={actionsApi.revertNotice}
       onMarkReviewed={() => void actionsApi.markReviewed()}
@@ -332,6 +345,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
       aiExplanation={agentApi.aiExplanation}
       agentReview={agentApi.agentReview}
       agentSections={agentApi.agentSections}
+      agentReviewMeta={agentApi.agentReviewMeta}
+      agentReviewBusy={agentApi.agentReviewBusy}
+      showAiReviewUsage={showAiReviewUsage}
       activeCommentDraft={actionsApi.activeCommentDraft}
       activeSavedComment={actionsApi.activeSavedComment}
       onCommentBodyChange={actionsApi.setCommentBody}
@@ -496,6 +512,13 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
         agentsLoading={agentsApi.agentsLoading}
         selectedAgentId={selectedAgentId}
         onSelectAgent={setSelectedAgentId}
+        onRunTargetReview={() => {
+          if (selectedAgentId) runReviewForAgent(selectedAgentId);
+        }}
+        agentReviewBusy={agentApi.agentReviewBusy}
+        defaultReviewPreset={defaultReviewPreset}
+        reviewDepthOverride={reviewDepthOverride}
+        onReviewDepthOverrideChange={setReviewDepthOverride}
         onScopeChange={scopeApi.setScope}
         filePath={scopeApi.filePath}
         onFilePathChange={scopeApi.setFilePath}

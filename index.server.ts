@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { ReviewService } from "./server/ReviewService";
 import {
+  clearAiReviewCache,
   clearAllReviewStates,
   clearHunkState,
   clearReviewState,
@@ -41,6 +42,9 @@ export default function contribute(server: PluginServerContext) {
   server.handle(startExplainHunkAi, async (input, context) => reviewService.startExplainHunkAi(input, context));
   server.handle(startRunReview, async (input, context) => reviewService.startRunReview(input, context));
   server.handle(pollAiReview, async ({ requestId, workspaceId, agentId }) => reviewService.pollAiReview({ requestId, workspaceId, agentId }));
+  server.handle(clearAiReviewCache, async () => ({
+    cleared: await reviewService.clearAiReviewCache(),
+  }));
   server.handle(hunkDecision, async (input) => ({
     savedAt: await reviewService.recordDecision(input),
   }));

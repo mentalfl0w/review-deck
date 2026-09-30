@@ -1,28 +1,48 @@
 /**
- * Node-runnable contract test for the v0.8 Review Deck enhancement schemas:
+ * Node-runnable contract test for Review Deck settings v3 and the v0.8
+ * enhancement schemas:
  *
- *  - shared/review-settings.ts — host-scoped v1 presentation defaults: the
- *    panel locale (auto | zh | en) and default diff layout
- *    (auto | unified | split). Only harmless display preferences may live in
- *    settings; agent identity, scopes, paths, comments and review state must
- *    never be persisted there.
+ *  - shared/review-settings.ts — host-scoped v3 settings: panel locale/layout,
+ *    reviewer strategy, Paseo-discovered provider/model/thinking, cache and
+ *    usage display, plus a default Economical/Balanced/Deep review preset.
+ *    The v1 -> v3 migration adds defaults; the v2 -> v3 migration preserves the
+ *    reviewer configuration and maps the old Targeted/Full default to the
+ *    nearest preset. Per-run depth overrides are not persisted in settings.
+ *    Workspace/project/agent identities, paths, comments, and review state
+ *    must never be persisted there.
  *  - shared/review-handoff.ts — the version-1 "review-deck-handoff" timeline
  *    item payload: exactly a positive commentCount and an ISO-8601
  *    submittedAt. The schema is .strict(): a row never carries review content,
  *    file paths, cwd, workspace/project/agent identifiers, or any other
  *    field — and it never claims the Agent's work completed.
  *
- * The shared modules are loaded through createRequire at runtime: Node's
- * type stripping runs .ts files as ESM, where a relative import needs an
- * explicit ".ts" extension, which the repository's Bundler-resolution
- * typecheck forbids. Every required export is asserted present and cast to a
- * minimal structural type, so an export rename fails this test with a clear
- * message instead of a silent undefined.
+ * The shared modules are loaded through createRequire at runtime: Node's type
+ * stripping runs .ts files as ESM, where relative imports need an explicit
+ * extension that the repository's Bundler-resolution typecheck forbids.
  *
  * Run: node tests/review-settings-timeline.test.ts
  */
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
+import { createRequire, registerHooks } from "node:module";
+
+// The shared modules import each other with Bundler-style specifiers (no file
+// extension), which is what tsconfig's Bundler resolution expects and what the
+// Paseo bundler accepts, but which Node's ESM loader never guesses. The sync
+// resolve hook below bridges exactly that gap for this test: a relative
+// specifier that has no extension is retried as ".ts" so the type-stripped
+// module graph loads the same way the bundler resolves it.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    try {
+      return nextResolve(specifier, context);
+    } catch (error) {
+      if (specifier.startsWith(".") && !/\.[cm]?[jt]s$/.test(specifier)) {
+        return nextResolve(`${specifier}.ts`, context);
+      }
+      throw error;
+    }
+  },
+});
 
 type ZodIssue = { path: Array<string | number> };
 type SafeParseOk<T> = { success: true; data: T };
@@ -30,6 +50,17 @@ type SafeParseFail = { success: false; error: { issues: ZodIssue[] } };
 type MinimalSchema<T> = {
   parse(input: unknown): T;
   safeParse(input: unknown): SafeParseOk<T> | SafeParseFail;
+};
+type ReviewDeckSettingsValues = {
+  locale: string;
+  diffMode: string;
+  reviewerStrategy: string;
+  reviewerProvider: string;
+  reviewerModel: string;
+  reviewerThinkingOptionId: string;
+  aiReviewCacheEnabled: boolean;
+  showAiReviewUsage: boolean;
+  defaultReviewPreset: string;
 };
 
 const requireFromRepo = createRequire(import.meta.url);
@@ -40,6 +71,7 @@ function requireExport<T>(moduleExports: Record<string, unknown>, name: string):
 }
 
 const settingsModule = requireFromRepo("../shared/review-settings.ts") as Record<string, unknown>;
+const reviewModule = requireFromRepo("../shared/review.ts") as Record<string, unknown>;
 const handoffModule = requireFromRepo("../shared/review-handoff.ts") as Record<string, unknown>;
 
 const reviewDeckSettings = requireExport<{
@@ -47,8 +79,9 @@ const reviewDeckSettings = requireExport<{
   scope: "host";
   version: number;
   schema: unknown;
+  migrate?: (values: unknown, fromVersion: number) => unknown;
 }>(settingsModule, "reviewDeckSettings");
-const reviewDeckSettingsSchema = requireExport<MinimalSchema<{ locale: string; diffMode: string }>>(
+const reviewDeckSettingsSchema = requireExport<MinimalSchema<ReviewDeckSettingsValues>>(
   settingsModule,
   "reviewDeckSettingsSchema",
 );
@@ -60,6 +93,11 @@ const reviewDiffModeSettingSchema = requireExport<{ options: readonly string[] }
   settingsModule,
   "reviewDiffModeSettingSchema",
 );
+const aiReviewDepthSchema = requireExport<{ options: readonly string[] }>(reviewModule, "aiReviewDepthSchema");
+const aiReviewBudgetPresetSchema = requireExport<{ options: readonly string[] }>(
+  reviewModule,
+  "aiReviewBudgetPresetSchema",
+);
 const reviewHandoffTimelineKind = requireExport<string>(handoffModule, "reviewHandoffTimelineKind");
 const reviewHandoffTimelineVersion = requireExport<number>(handoffModule, "reviewHandoffTimelineVersion");
 const reviewHandoffTimelineSchema = requireExport<MinimalSchema<{ commentCount: number; submittedAt: string }>>(
@@ -69,62 +107,165 @@ const reviewHandoffTimelineSchema = requireExport<MinimalSchema<{ commentCount: 
 
 const VALID_SUBMITTED_AT = "2026-09-08T10:20:30.000Z";
 
+// Fresh installs and v1 migrations use Balanced, the middle-cost profile.
+const V3_DEFAULTS: ReviewDeckSettingsValues = {
+  locale: "auto",
+  diffMode: "auto",
+  reviewerStrategy: "inherit",
+  reviewerProvider: "",
+  reviewerModel: "",
+  reviewerThinkingOptionId: "",
+  aiReviewCacheEnabled: true,
+  showAiReviewUsage: true,
+  defaultReviewPreset: "balanced",
+};
+
 // ---------------------------------------------------------------------------
-// 1. Review Deck settings: a HOST-scoped v1 definition whose schema carries
-//    exactly the two harmless display defaults.
+// 1. Review Deck settings: host-scoped v3 defaults and accepted values.
 // ---------------------------------------------------------------------------
 assert.equal(reviewDeckSettings.id, "review-deck", "settings id must be review-deck");
 assert.equal(reviewDeckSettings.scope, "host", "review defaults must be host-scoped (never per-workspace)");
-assert.equal(reviewDeckSettings.version, 1, "review defaults must be version 1");
+assert.equal(reviewDeckSettings.version, 3, "review defaults must be version 3");
 assert.equal(reviewDeckSettings.schema, reviewDeckSettingsSchema, "settings must expose the same schema they validate with");
 
-// 1a. Default values: an empty document parses to auto/auto.
 assert.deepEqual(
   reviewDeckSettingsSchema.parse({}),
-  { locale: "auto", diffMode: "auto" },
-  "missing settings must default to locale auto and diffMode auto",
+  V3_DEFAULTS,
+  "fresh installs default to Balanced with cache and token usage on",
 );
-
-// 1b. Accepted enum values: each locale and each diff mode parses, and an
-//     omitted key still receives its default.
 for (const locale of ["auto", "zh", "en"]) {
-  const parsed = reviewDeckSettingsSchema.parse({ locale });
-  assert.equal(parsed.locale, locale, `locale ${locale} must be accepted`);
-  assert.equal(parsed.diffMode, "auto", "omitted diffMode must default to auto");
+  assert.deepEqual(reviewDeckSettingsSchema.parse({ locale }), { ...V3_DEFAULTS, locale });
 }
 for (const diffMode of ["auto", "unified", "split"]) {
-  const parsed = reviewDeckSettingsSchema.parse({ diffMode });
-  assert.equal(parsed.diffMode, diffMode, `diffMode ${diffMode} must be accepted`);
-  assert.equal(parsed.locale, "auto", "omitted locale must default to auto");
+  assert.deepEqual(reviewDeckSettingsSchema.parse({ diffMode }), { ...V3_DEFAULTS, diffMode });
 }
+for (const reviewerStrategy of ["inherit", "custom"]) {
+  assert.deepEqual(reviewDeckSettingsSchema.parse({ reviewerStrategy }), { ...V3_DEFAULTS, reviewerStrategy });
+}
+for (const defaultReviewPreset of ["economical", "balanced", "deep"]) {
+  assert.deepEqual(
+    reviewDeckSettingsSchema.parse({ defaultReviewPreset }),
+    { ...V3_DEFAULTS, defaultReviewPreset },
+    `preset ${defaultReviewPreset} must be accepted`,
+  );
+}
+assert.deepEqual(reviewLocaleSettingSchema.options, ["auto", "zh", "en"]);
+assert.deepEqual(reviewDiffModeSettingSchema.options, ["auto", "unified", "split"]);
+assert.deepEqual(aiReviewBudgetPresetSchema.options, ["economical", "balanced", "deep"]);
+assert.deepEqual(aiReviewDepthSchema.options, ["targeted", "full"], "Targeted/Full remain per-run overrides");
+
 assert.deepEqual(
   reviewDeckSettingsSchema.parse({ locale: "en", diffMode: "split" }),
-  { locale: "en", diffMode: "split" },
-  "an explicit locale+diffMode combination must be accepted",
+  { ...V3_DEFAULTS, locale: "en", diffMode: "split" },
+  "explicit locale and diff layout remain independent settings",
+);
+assert.deepEqual(
+  reviewDeckSettingsSchema.parse({
+    reviewerStrategy: "custom",
+    reviewerProvider: "anthropic",
+    reviewerModel: "claude-elegy",
+    reviewerThinkingOptionId: "high",
+    aiReviewCacheEnabled: false,
+    showAiReviewUsage: false,
+    defaultReviewPreset: "deep",
+  }),
+  {
+    ...V3_DEFAULTS,
+    reviewerStrategy: "custom",
+    reviewerProvider: "anthropic",
+    reviewerModel: "claude-elegy",
+    reviewerThinkingOptionId: "high",
+    aiReviewCacheEnabled: false,
+    showAiReviewUsage: false,
+    defaultReviewPreset: "deep",
+  },
+  "custom reviewer settings and budget preset round-trip",
 );
 
-// The leaf enums are exported, so the accepted values are the advertised ones.
-assert.deepEqual(reviewLocaleSettingSchema.options, ["auto", "zh", "en"], "locale enum must stay auto|zh|en");
-assert.deepEqual(reviewDiffModeSettingSchema.options, ["auto", "unified", "split"], "diffMode enum must stay auto|unified|split");
-
-// 1c. Rejection of invalid values: out-of-enum and wrong-typed values fail on
-//     the offending field.
 const settingsRejections: Array<{ values: unknown; path: string; label: string }> = [
   { values: { locale: "fr" }, path: "locale", label: "locale outside auto|zh|en" },
   { values: { locale: 5 }, path: "locale", label: "non-string locale" },
   { values: { locale: null }, path: "locale", label: "null locale" },
   { values: { diffMode: "side-by-side" }, path: "diffMode", label: "diffMode outside auto|unified|split" },
   { values: { diffMode: 3 }, path: "diffMode", label: "non-string diffMode" },
+  { values: { reviewerStrategy: "workspace" }, path: "reviewerStrategy", label: "reviewerStrategy outside inherit|custom" },
+  { values: { reviewerStrategy: true }, path: "reviewerStrategy", label: "non-string reviewerStrategy" },
+  { values: { reviewerProvider: 5 }, path: "reviewerProvider", label: "non-string reviewerProvider" },
+  { values: { reviewerModel: null }, path: "reviewerModel", label: "null reviewerModel" },
+  { values: { reviewerThinkingOptionId: false }, path: "reviewerThinkingOptionId", label: "non-string reviewerThinkingOptionId" },
+  { values: { aiReviewCacheEnabled: "yes" }, path: "aiReviewCacheEnabled", label: "non-boolean aiReviewCacheEnabled" },
+  { values: { showAiReviewUsage: 1 }, path: "showAiReviewUsage", label: "non-boolean showAiReviewUsage" },
+  { values: { defaultReviewPreset: "fast" }, path: "defaultReviewPreset", label: "unknown review preset" },
 ];
 for (const { values, path, label } of settingsRejections) {
   const result = reviewDeckSettingsSchema.safeParse(values);
   assert.equal(result.success, false, `${label} must be rejected`);
   if (!result.success) {
-    assert.ok(
-      result.error.issues.some((issue) => issue.path[0] === path),
-      `${label} must fail on the ${path} field`,
-    );
+    assert.ok(result.error.issues.some((issue) => issue.path[0] === path), `${label} must fail on ${path}`);
   }
+}
+
+// Migrations retain the user's harmless preferences and reviewer configuration.
+assert.equal(typeof reviewDeckSettings.migrate, "function", "reviewDeckSettings must define migrations");
+const migrate = reviewDeckSettings.migrate;
+assert.ok(migrate, "migration must be callable after the typeof check");
+
+assert.deepEqual(
+  reviewDeckSettingsSchema.parse(migrate({ locale: "zh", diffMode: "split" }, 1)),
+  { ...V3_DEFAULTS, locale: "zh", diffMode: "split" },
+  "v1 migration preserves display settings and adds v3 reviewer defaults",
+);
+assert.deepEqual(
+  reviewDeckSettingsSchema.parse(migrate({ locale: "en" }, 1)),
+  { ...V3_DEFAULTS, locale: "en" },
+  "a v1 document without diffMode still defaults to auto",
+);
+
+const v2CustomSettings = {
+  locale: "zh",
+  diffMode: "split",
+  reviewerStrategy: "custom",
+  reviewerProvider: "omp",
+  reviewerModel: "model-x",
+  reviewerThinkingOptionId: "high",
+  aiReviewCacheEnabled: false,
+  showAiReviewUsage: false,
+  defaultReviewDepth: "full",
+};
+assert.deepEqual(
+  reviewDeckSettingsSchema.parse(migrate(v2CustomSettings, 2)),
+  {
+    ...V3_DEFAULTS,
+    locale: "zh",
+    diffMode: "split",
+    reviewerStrategy: "custom",
+    reviewerProvider: "omp",
+    reviewerModel: "model-x",
+    reviewerThinkingOptionId: "high",
+    aiReviewCacheEnabled: false,
+    showAiReviewUsage: false,
+    defaultReviewPreset: "deep",
+  },
+  "v2 Full depth maps to Deep without losing the custom reviewer settings",
+);
+assert.deepEqual(
+  reviewDeckSettingsSchema.parse(migrate({ locale: "en", diffMode: "unified", defaultReviewDepth: "targeted" }, 2)),
+  { ...V3_DEFAULTS, locale: "en", diffMode: "unified", defaultReviewPreset: "balanced" },
+  "v2 Targeted depth maps to Balanced",
+);
+const futureSettings = { locale: "en", defaultReviewPreset: "deep", futureOption: true };
+assert.equal(migrate(futureSettings, 3), futureSettings, "same-version settings are not reset by migration");
+assert.equal(migrate(futureSettings, 4), futureSettings, "future-version settings are not downgraded by migration");
+
+// Non-object input is handed to the schema untouched: the migration never
+// fabricates a document out of a corrupt store.
+const nonObjectInputs: unknown[] = [null, undefined, 7, "review-deck", []];
+for (const input of nonObjectInputs) {
+  assert.equal(
+    migrate(input, 1),
+    input,
+    `migration must pass a non-object document (${JSON.stringify(input)}) through unchanged`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -229,10 +370,12 @@ for (const extra of forbiddenPayloads) {
 }
 
 console.log("review-settings-timeline: all assertions passed");
-console.log("verdict: reviewDeckSettings is a host-scoped v1 definition (id review-deck) whose schema defaults");
-console.log("         locale to auto and diffMode to auto, accepts locale auto|zh|en and diffMode");
-console.log("         auto|unified|split, and rejects out-of-enum or wrong-typed values on the offending");
-console.log("         field. The version-1 review-deck-handoff timeline row is content-minimal: exactly a");
-console.log("         positive integer commentCount plus an ISO-8601 submittedAt, strictly parsed — review");
-console.log("         content, patch text, file paths, hunk ids, cwd, and workspace/project/agent");
+console.log("verdict: reviewDeckSettings is a host-scoped v3 definition whose schema defaults");
+console.log("         locale/diffMode to auto and the reviewer to inherit + no provider/model/thinking +");
+console.log("         cache on + usage on + Balanced preset. It accepts Economical/Balanced/Deep budgets");
+console.log("         and Targeted/Full per-run overrides, rejects invalid values, maps v2 Full to Deep");
+console.log("         and v2 Targeted to Balanced, preserving reviewer settings during migration.");
+console.log("         Corrupt non-object documents pass through unchanged. The version-1 handoff row is content-minimal:");
+console.log("         exactly a positive integer commentCount plus an ISO-8601 submittedAt, strictly parsed —");
+console.log("         review content, patch text, file paths, hunk ids, cwd, and workspace/project/agent");
 console.log("         identifiers are all rejected, so the row can record only that a submission happened.");

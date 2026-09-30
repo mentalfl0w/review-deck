@@ -11,6 +11,7 @@ import {
   type ExplainHunkResult,
   type PollAiReviewResult,
   type ReviewLocale,
+  type AiReviewDepth,
   type ReviewScope,
   type ReviewSections,
   type ReviewSnapshot,
@@ -24,6 +25,7 @@ const READONLY_REVIEW_POLL_CAP_MS = 300_000;
 const READONLY_REVIEW_POLL_INTERVAL_MS = 3_000;
 /** A poll result that is no longer running — the only kind `apply` receives. */
 type SettledPollResult = PollAiReviewResult & { status: "idle" | "error" | "permission" | "timeout" };
+type AiReviewDisplayMetadata = Pick<PollAiReviewResult, "provider" | "model" | "thinkingOptionId" | "reviewerPermissionMode" | "resultSource" | "mode" | "depth" | "reviewPreset" | "usage">;
 
 /**
  * Agent-driven analysis: deterministic explain / AI explain / file or
@@ -84,6 +86,8 @@ export function useAgentReview(params: {
   const [aiExplainBusy, setAiExplainBusy] = useState<string | null>(null);
   const [agentReview, setAgentReview] = useState<string | null>(null);
   const [agentSections, setAgentSections] = useState<ReviewSections | null>(null);
+  const [agentReviewMeta, setAgentReviewMeta] = useState<AiReviewDisplayMetadata | null>(null);
+  const [agentReviewBusy, setAgentReviewBusy] = useState(false);
   const [agentFeedback, setAgentFeedback] = useState<AgentFeedbackMap>({});
   const [findingsOpen, setFindingsOpen] = useState(true);
   // Feedback for the file-scoped revision action (`reviseFileFromComment`),
@@ -99,9 +103,15 @@ export function useAgentReview(params: {
   const analysisRunRef = useRef(0);
   const localeRef = useRef(locale);
   localeRef.current = locale;
+  const beginAnalysisRun = useCallback(() => {
+    setAiExplainBusy(null);
+    setAgentReviewBusy(false);
+    analysisRunRef.current += 1;
+    return analysisRunRef.current;
+  }, []);
   const explainSelected = useCallback(async () => {
     if (!reviewCwd || !selected) return;
-    const run = ++analysisRunRef.current;
+    const run = beginAnalysisRun();
     const requestedLocale = localeRef.current;
     try {
       setActionError(null);
@@ -121,13 +131,13 @@ export function useAgentReview(params: {
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [baseRef, explainRpc, filePath, headRef, locale, reviewCwd, scope, selected]);
+  }, [baseRef, beginAnalysisRun, explainRpc, filePath, headRef, locale, reviewCwd, scope, selected]);
 
   /** Whole-file deterministic explain: mirrors explainSelected but targets
    * every hunk of the file; the result reuses the explanation pipeline. */
   const explainWholeFile = useCallback(async () => {
     if (!reviewCwd || !selectedFile) return;
-    const run = ++analysisRunRef.current;
+    const run = beginAnalysisRun();
     const requestedLocale = localeRef.current;
     try {
       setActionError(null);
@@ -147,7 +157,7 @@ export function useAgentReview(params: {
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }
-  }, [baseRef, explainFileRpc, filePath, headRef, locale, reviewCwd, scope, selectedFile]);
+  }, [baseRef, beginAnalysisRun, explainFileRpc, filePath, headRef, locale, reviewCwd, scope, selectedFile]);
   /**
    * Polls a started read-only review (startExplainHunkAi / startRunReview)
    * every few seconds until a non-"running" status arrives, capped at
@@ -187,7 +197,7 @@ export function useAgentReview(params: {
 
   const explainWithAgent = useCallback(async (agentId: string) => {
     if (!reviewCwd || !selected) return;
-    const run = ++analysisRunRef.current;
+    const run = beginAnalysisRun();
     const requestedLocale = localeRef.current;
     setActionError(null);
     setAiExplainBusy(agentId);
@@ -210,6 +220,12 @@ export function useAgentReview(params: {
           status: result.status,
           provider: result.provider,
           model: result.model,
+          thinkingOptionId: result.thinkingOptionId,
+          reviewerPermissionMode: result.reviewerPermissionMode,
+          resultSource: result.resultSource,
+          ...(result.mode === "hunk" ? { mode: "hunk" as const } : {}),
+          usage: result.usage,
+          reviewPreset: result.reviewPreset,
         });
         setFindingsOpen(true);
         setStale(false);
@@ -223,28 +239,46 @@ export function useAgentReview(params: {
       // response must not clear the newer request's busy state.
       if (run === analysisRunRef.current) setAiExplainBusy(null);
     }
-  }, [baseRef, filePath, headRef, locale, pollUntilDone, reviewCwd, scope, selected, startExplainHunkAiRpc, t, workspaceId]);
+  }, [baseRef, beginAnalysisRun, filePath, headRef, locale, pollUntilDone, reviewCwd, scope, selected, startExplainHunkAiRpc, t, workspaceId]);
 
-  const runAgentReview = useCallback(async (agentId: string, requestFilePath?: string) => {
+  const runAgentReview = useCallback(async (agentId: string, requestFilePath?: string, reviewDepthOverride?: AiReviewDepth) => {
     if (!reviewCwd) return;
-    const run = ++analysisRunRef.current;
+    const run = beginAnalysisRun();
     const requestedLocale = localeRef.current;
-    const targetPath = (requestFilePath ?? filePath).trim();
+    const selectedFilePath = requestFilePath?.trim() ?? "";
+    const targetPath = selectedFilePath || filePath.trim();
     setActionError(null);
+    setAgentReview(null);
+    setAgentSections(null);
+    setAgentReviewMeta(null);
+    setAgentReviewBusy(true);
     try {
       const { requestId } = await startRunReviewRpc({
         cwd: reviewCwd,
         workspaceId,
         scope,
+        reviewMode: selectedFilePath ? "file" : "target",
         locale: requestedLocale,
         ...(scope === "commits" ? { baseRef, headRef } : {}),
         ...(targetPath ? { filePath: targetPath } : {}),
+        ...(reviewDepthOverride ? { reviewDepthOverride } : {}),
         agentId,
       });
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       await pollUntilDone(requestId, run, requestedLocale, workspaceId, agentId, (result) => {
         setAgentReview(result.review);
         setAgentSections(result.sections);
+        setAgentReviewMeta({
+          provider: result.provider,
+          model: result.model,
+          thinkingOptionId: result.thinkingOptionId,
+          reviewerPermissionMode: result.reviewerPermissionMode,
+          resultSource: result.resultSource,
+          mode: result.mode,
+          depth: result.depth,
+          usage: result.usage,
+          reviewPreset: result.reviewPreset,
+        });
         setFindingsOpen(true);
         setStale(false);
         if (result.status !== "idle") setActionError(t("agentFinishedStatus", { status: result.status }));
@@ -252,8 +286,10 @@ export function useAgentReview(params: {
     } catch (error) {
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (run === analysisRunRef.current) setAgentReviewBusy(false);
     }
-  }, [baseRef, filePath, headRef, locale, pollUntilDone, reviewCwd, scope, startRunReviewRpc, t, workspaceId]);
+  }, [baseRef, beginAnalysisRun, filePath, headRef, locale, pollUntilDone, reviewCwd, scope, setStale, startRunReviewRpc, t, workspaceId]);
 
   /**
    * Current-block revision driven by the comment dock: sends the user's
@@ -352,6 +388,8 @@ export function useAgentReview(params: {
     setAiExplanation(null);
     setAgentReview(null);
     setAgentSections(null);
+    setAgentReviewMeta(null);
+    setAgentReviewBusy(false);
     setStale(false);
     setAgentFeedback({});
     setFileReviseFeedback({});
@@ -365,6 +403,8 @@ export function useAgentReview(params: {
     aiExplainBusy,
     agentReview,
     agentSections,
+    agentReviewMeta,
+    agentReviewBusy,
     agentFeedback,
     fileReviseFeedback,
     findingsOpen,

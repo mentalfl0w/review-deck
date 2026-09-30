@@ -4,7 +4,6 @@ import type {
   ExplainHunkAiResult,
   ExplainHunkResult,
   ReviewScope,
-  ReviewSections,
 } from "../../shared/review";
 import {
   derivePairs,
@@ -27,10 +26,11 @@ import { ActionButton, FindingGroup, HoverTooltip, Segmented, StringGroup } from
 import { DiffView } from "./DiffView";
 import { FileView } from "./FileView";
 import { lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
+import { AiReviewMeta } from "./AiReviewMeta";
 
 /** A single change block: navigation, diff mode, review/reject/explain
  * actions, the diff or file-context body and the findings disclosure. */
-export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection }: {
+export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, showAiReviewUsage, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -60,8 +60,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   analysisStale: boolean;
   explanation: ExplainHunkResult | null;
   aiExplanation: ExplainHunkAiResult | null;
-  agentReview: string | null;
-  agentSections: ReviewSections | null;
+  showAiReviewUsage: boolean;
   selection: LineSelectionState;
   onLinePress: (side: LineSide, line: number, extend: boolean) => void;
   onLineTap: (side: LineSide, line: number) => void;
@@ -82,14 +81,6 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   const verifiedFindings = selectedFindings.filter((finding) => finding.evidenceKind === "verified_fact");
   const inferenceFindings = selectedFindings.filter((finding) => finding.evidenceKind === "ai_inference");
   const humanFindings = selectedFindings.filter((finding) => finding.evidenceKind === "human_verification_recommended");
-  // The block-level agent actions always target the agent selected in More;
-  // there is no per-block agent list and no arbitrary array fallback.
-  const agentHasSections = Boolean(
-    agentSections &&
-    (agentSections.verifiedFacts.length > 0 ||
-      agentSections.aiInference.length > 0 ||
-      agentSections.humanVerificationRecommended.length > 0),
-  );
   // The submit-ready range of the live selection: null while the user has
   // selected nothing (or the machine dropped the selection), a single-line
   // range while the compact pairing still awaits its end tap.
@@ -286,6 +277,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
             {aiExplanation ? (
               <View style={styles.analysisBlock}>
                 <Text style={styles.label}>{t("aiReviewLabel", { provider: aiExplanation.provider, model: aiExplanation.model })}</Text>
+                <AiReviewMeta details={aiExplanation} showUsage={showAiReviewUsage} t={t} styles={styles} />
                 <StringGroup label={t("findingsVerified")} items={aiExplanation.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsInference")} items={aiExplanation.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={aiExplanation.humanVerificationRecommended} t={t} styles={styles} />
@@ -294,19 +286,7 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
                 ) : null}
               </View>
             ) : null}
-            {agentReview ? (
-              <View style={styles.analysisBlock}>
-                <Text style={styles.label}>{t("aiReview")}</Text>
-                {agentHasSections && agentSections ? (
-                  <>
-                    <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
-                    <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
-                    <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
-                  </>
-                ) : <Text selectable style={styles.rawReview}>{agentReview}</Text>}
-              </View>
-            ) : null}
-            {!explanation && !aiExplanation && !agentReview && selectedFindings.length === 0 ? (
+            {!explanation && !aiExplanation && selectedFindings.length === 0 ? (
               <Text style={styles.muted}>{t("analysisHint")}</Text>
             ) : null}
           </View>

@@ -3,6 +3,12 @@ import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import type {
+  AiReviewDepth,
+  AiReviewBudgetPreset,
+  AiReviewMode,
+  AiReviewPermissionMode,
+  AiReviewResultSource,
+  AiReviewUsage,
   AnchorState,
   ExplainHunkResult,
   LineRangeSelection,
@@ -22,7 +28,12 @@ import type {
   ReviewStateResult,
   FileViewRow,
 } from "../shared/review";
-import type { ReviewDeckSettingsHandle } from "../shared/review-settings";
+import { aiReviewPresetDefaultDepth } from "../shared/review";
+import {
+  reviewDeckSettingsSchema,
+  type ReviewDeckSettingsHandle,
+  type ReviewDeckSettingsValues,
+} from "../shared/review-settings";
 import {
   reviewHandoffTimelineKind,
   reviewHandoffTimelineSchema,
@@ -43,12 +54,24 @@ import { severityRank } from "./diff/FindingDetector";
 import { DiffParser, hunkBodyLines, parseRange, type Hunk } from "./diff/DiffParser";
 import { GitRunner } from "./git/GitRunner";
 import { StateStore, type StateEntry, type StateFile } from "./persistence/StateStore";
+import {
+  AiReviewCacheStore,
+  type AiReviewCacheEntry,
+} from "./persistence/AiReviewCacheStore";
+import {
+  AI_REVIEW_PROMPT_VERSION,
+  AI_REVIEW_SCHEMA_VERSION,
+  buildAiReviewPrompt,
+  promptHunk,
+  type AiReviewPromptFile,
+} from "./ai-review-prompt";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
 export interface ReviewServiceDependencies {
   settings?: ReviewDeckSettingsHandle;
   store?: StateStore;
+  aiReviewCacheStore?: AiReviewCacheStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -65,11 +88,60 @@ function emptyReviewSections(): ReviewSections {
 }
 /** The transient child handle surface pollAiReview needs: waitForFinish plus
  * timeline access for the last-assistant-text recovery fallback. */
+type TransientAgentUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  contextWindowUsedTokens?: number;
+};
 type TransientReviewChildHandle = {
   id: string;
-  waitForFinish(timeoutMs?: number): Promise<{ status: "idle" | "error" | "permission" | "timeout"; error: string | null; lastMessage: string | null }>;
+  waitForFinish(timeoutMs?: number): Promise<{
+    status: "idle" | "error" | "permission" | "timeout";
+    error: string | null;
+    lastMessage: string | null;
+    final?: { lastUsage?: TransientAgentUsage | null } | null;
+  }>;
   timeline?: { refetch(options?: { limit?: number }): Promise<unknown> };
 };
+type TransientReviewEntry = {
+  handle: TransientReviewChildHandle | null;
+  cachedResult?: Pick<AiReviewCacheEntry, "review" | "sections" | "usage">;
+  locale: ReviewLocale | undefined;
+  provider: string;
+  model: string | null;
+  workspaceId: string;
+  agentId: string;
+  startedAt: number;
+  mode: AiReviewMode;
+  depth?: AiReviewDepth;
+  reviewPreset?: AiReviewBudgetPreset;
+  reviewerPermissionMode: AiReviewPermissionMode;
+  resultSource: AiReviewResultSource;
+  cacheEnabled: boolean;
+  cacheKey?: string;
+  inputFingerprint?: string;
+  thinkingOptionId: string | null;
+};
+function toAiReviewUsage(usage: TransientAgentUsage | null | undefined): AiReviewUsage | undefined {
+  if (!usage) return undefined;
+  const result: AiReviewUsage = {};
+  if (typeof usage.inputTokens === "number" && Number.isFinite(usage.inputTokens) && usage.inputTokens >= 0) {
+    result.inputTokens = usage.inputTokens;
+  }
+  if (typeof usage.outputTokens === "number" && Number.isFinite(usage.outputTokens) && usage.outputTokens >= 0) {
+    result.outputTokens = usage.outputTokens;
+  }
+  if (typeof usage.cachedInputTokens === "number" && Number.isFinite(usage.cachedInputTokens) && usage.cachedInputTokens >= 0) {
+    result.cachedTokens = usage.cachedInputTokens;
+  }
+  if (typeof usage.contextWindowUsedTokens === "number" && Number.isFinite(usage.contextWindowUsedTokens) && usage.contextWindowUsedTokens >= 0) {
+    result.contextTokens = usage.contextWindowUsedTokens;
+  }
+  return result.inputTokens !== undefined || result.outputTokens !== undefined || result.cachedTokens !== undefined || result.contextTokens !== undefined
+    ? result
+    : undefined;
+}
 /** Structural slice of the daemon's fetch_agent_timeline payload. */
 type TransientTimelinePayload = {
   entries?: Array<{ item?: { type?: string; text?: unknown; content?: unknown } }>;
@@ -154,47 +226,26 @@ function deterministicCopy(locale: ReviewLocale | undefined): DeterministicCopy 
   return DETERMINISTIC_COPY[locale === "zh" ? "zh" : "en"];
 }
 
-function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "explain"): string[] {
-  if (locale === "zh") {
-    return mode === "review"
-      ? [
-        "请为人工评审者审查当前 Git 变更。",
-        "不要修改文件。使用只读工具检查调用方、被调用方、相关测试和当前文件。",
-        "请使用简体中文回答；代码、文件路径、函数名、Git 标头和命令输出保持原文。",
-        "请严格使用以下标题：已确认事实、AI 推断、建议人工确认。",
-        "仅报告直接由提供的快照或你实际执行的命令支持的已确认事实。",
-        "除非实际运行过，否则不要声称测试或构建已通过。",
-        "每条发现必须包含对应的变更块 ID。",
-      ]
-      : [
-        "请用简体中文向人工评审者评审这一个变更块。",
-        "不要修改文件。使用只读工具检查调用方、被调用方、相关测试和当前文件。",
-        "请严格使用以下标题：已确认事实、AI 推断、建议人工确认。",
-        "仅报告直接由提供的 diff 或你实际执行的命令支持的已确认事实。",
-        "除非实际运行过，否则不要声称测试或构建已通过。",
-        "每条发现必须包含对应的变更块 ID。",
-        "代码、文件路径、函数名、Git 标头和命令输出保持原文。",
-      ];
-  }
-  return mode === "review"
-    ? [
-      "Review the current Git changeset for a human reviewer.",
-      "Do not edit files. Inspect callers, callees, related tests, and the current files with your read-only tools.",
-      "Respond in English. Keep code, file paths, symbol names, Git headers, and command output unchanged.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "Only report VERIFIED FACTS that are directly supported by the supplied snapshot or commands you actually ran.",
-      "Every finding must include a hunk id. Never claim that tests or builds passed unless you ran them.",
-    ]
-    : [
-      "Review this single change block for a human reviewer.",
-      "Do not edit files. Inspect callers, callees, related tests, and the current files with your read-only tools.",
-      "Respond in English. Keep code, file paths, symbol names, Git headers, and command output unchanged.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "Only report VERIFIED FACTS that are directly supported by the supplied diff or commands you actually ran.",
-      "Every finding must include the hunk id. Never claim that tests or builds passed unless you ran them.",
-    ];
-}
 
+
+const STRICT_READ_ONLY_MODE_NAMES = new Set(["readonly", "readonlymode", "plan", "planmode"]);
+const APPROVAL_GATED_MODE_NAMES = new Set(["ask", "alwaysask", "alwaysaskmode"]);
+function resolveReviewerMode(modes: readonly { id: string; label: string }[]): {
+  id: string;
+  permissionMode: AiReviewPermissionMode;
+} | null {
+  for (const mode of modes) {
+    if (STRICT_READ_ONLY_MODE_NAMES.has(mode.id.toLowerCase().replace(/[^a-z0-9]/g, "")) || STRICT_READ_ONLY_MODE_NAMES.has(mode.label.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
+      return { id: mode.id, permissionMode: "read-only" };
+    }
+  }
+  for (const mode of modes) {
+    if (APPROVAL_GATED_MODE_NAMES.has(mode.id.toLowerCase().replace(/[^a-z0-9]/g, "")) || APPROVAL_GATED_MODE_NAMES.has(mode.label.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
+      return { id: mode.id, permissionMode: "ask" };
+    }
+  }
+  return null;
+}
 
 /**
  * Composes the Git runner, diff parser, language heuristics, and state store
@@ -203,33 +254,18 @@ function agentInstructions(locale: ReviewLocale | undefined, mode: "review" | "e
  * the decision state file are injected dependencies rather than module globals.
  */
 export class ReviewService {
-  /** Retain the server settings capability for server-side settings consumers. */
+  /** Retain the host settings capability for server-side review configuration. */
   private readonly settings: ReviewDeckSettingsHandle | undefined;
   private readonly store: StateStore;
+  private readonly aiReviewCacheStore: AiReviewCacheStore;
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
   private readonly gitFactory: (cwd: string) => GitRunner;
   private readonly anchorFileViewCache = new Map<string, ReviewAnchorFileView>();
-  // Read-only reviews started by startRunReview/startExplainHunkAi, keyed by
-  // a per-request capability (randomUUID) that is NEVER the child agent id —
-  // the child id is globally discoverable through the agent registry, the
-  // capability is not. Each entry records the workspace/agent binding the
-  // review was started under, and pollAiReview refuses any poll whose
-  // workspace/agent does not match it. Entries live until the turn finishes
-  // (pollAiReview deletes them) or the TTL sweep evicts abandoned ones.
-  // Nothing here ever runs on the selected workspace Agent's stream.
-  private readonly transientReviewAgents = new Map<
-    string,
-    {
-      handle: TransientReviewChildHandle;
-      locale: ReviewLocale | undefined;
-      provider: string;
-      model: string | null;
-      workspaceId: string;
-      agentId: string;
-      startedAt: number;
-    }
-  >();
+  // Request UUIDs are unguessable capabilities, never child agent IDs. Polling
+  // stays bound to the workspace/agent selected when this one-shot review began.
+  private readonly transientReviewAgents = new Map<string, TransientReviewEntry>();
+
   private sweepTransientReviewAgents(): void {
     const now = Date.now();
     for (const [id, entry] of this.transientReviewAgents) {
@@ -240,6 +276,7 @@ export class ReviewService {
   constructor(dependencies: ReviewServiceDependencies = {}) {
     this.settings = dependencies.settings;
     this.store = dependencies.store ?? new StateStore();
+    this.aiReviewCacheStore = dependencies.aiReviewCacheStore ?? new AiReviewCacheStore();
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
     this.gitFactory = dependencies.gitFactory ?? ((cwd) => new GitRunner(cwd));
@@ -1364,69 +1401,208 @@ export class ReviewService {
     return sections;
   }
 
-  /**
-   * Starts the AI评审文件 (whole-file read-only review) flow: the workspace
-   * binding is validated (the parent agent must belong to the claimed
-   * workspace and run in the reviewed worktree), then the locale review
-   * prompt is built, the transient child agent is created WITHOUT waiting,
-   * and a per-request capability (never the child's discoverable agent id) is
-   * returned as the requestId the client polls. The result is delivered
-   * through pollAiReview so the plugin RPC layer is never blocked past its
-   * timeout.
-   */
-  async startRunReview(
-    input: ReviewRequest & { agentId: string; workspaceId: string },
-    context: PluginHandlerContext,
-  ): Promise<{ requestId: string }> {
-    const snapshot = await this.createSnapshot(input);
-    const locale = input.locale ?? "en";
-    const hunkContext = snapshot.files
-      .flatMap((file) => file.hunks)
-      .map((hunk) => `${hunk.id} ${hunk.filePath} ${hunk.header}${hunk.functionHint ? ` (enclosing: ${hunk.functionHint})` : ""}\n${hunk.patch}`)
-      .join("\n")
-      .slice(0, 160_000);
-    const prompt = [
-      ...agentInstructions(locale, "review"),
-      locale === "zh" ? `工作区：${snapshot.worktreePath}` : `Workspace: ${snapshot.worktreePath}`,
-      locale === "zh" ? `评审指纹：${snapshot.targetFingerprint}` : `Review fingerprint: ${snapshot.targetFingerprint}`,
-      locale === "zh" ? "变更块：" : "Hunks:",
-      hunkContext || (locale === "zh" ? "（没有找到文本变更块。）" : "(No text hunks found.)"),
-    ].join("\n\n");
-    const requestId = await this.startTransientReviewAgent(
-      { agentId: input.agentId, workspaceId: input.workspaceId, worktreePath: snapshot.worktreePath, locale: input.locale, prompt },
-      context,
-    );
-    return { requestId };
+  private async readReviewerSettings(locale: ReviewLocale | undefined): Promise<ReviewDeckSettingsValues> {
+    if (!this.settings) return reviewDeckSettingsSchema.parse({});
+    const state = await this.settings.read();
+    if (state.status !== "ready") {
+      throw new Error(
+        locale === "zh"
+          ? `Review Deck 设置无效：${state.error}。请先在设置中修复。`
+          : `Review Deck settings are invalid: ${state.error}. Repair them in Settings before starting an AI review.`,
+      );
+    }
+    return state.values;
   }
 
   /**
-   * Resolves the transient review child's create config from the SELECTED
-   * workspace Agent's own snapshot, after a fail-closed workspace-bound agent
-   * gate (the same shape processProjectReview enforces): the refreshed parent
-   * must belong to the claimed workspace, the claimed workspace's directory
-   * must be the reviewed worktree, and the parent agent must run in that same
-   * worktree. Any mismatch throws a clear locale-aware error BEFORE any
-   * child is created or any prompt is sent — a foreign workspace Agent can
-   * never be bound to another workspace's diff. The daemon's
-   * create_agent_request schema requires config.provider in combined
-   * "provider/model" format, so the resolved provider joins the parent's
-   * provider and model into a single "<provider>/<model>" string; the
-   * parent's own values are returned separately as display labels for Review
-   * Deck. Never hardcodes a model and never falls back to running on the
-   * parent's stream — when the parent snapshot cannot be resolved a clear
-   * locale-aware error is thrown.
+   * Starts one file- or target-scoped AI review. Settings, workspace binding,
+   * provider/model availability, and the selected permission mode are resolved before any
+   * cache lookup or child creation.
    */
+  async startRunReview(
+    input: ReviewRequest & { reviewMode: "file" | "target"; reviewDepthOverride?: AiReviewDepth; agentId: string; workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<{ requestId: string }> {
+    const snapshot = await this.createSnapshot(input);
+    const settings = await this.readReviewerSettings(input.locale);
+    const reviewPreset = settings.defaultReviewPreset;
+    const depth = input.reviewDepthOverride ?? aiReviewPresetDefaultDepth[reviewPreset];
+    const prompt = this.buildAiReviewPrompt(
+      snapshot,
+      input.reviewMode,
+      depth,
+      input.locale ?? "en",
+      reviewPreset,
+      undefined,
+      input.filePath,
+    );
+    const reviewer = await this.resolveReviewerConfiguration(
+      { agentId: input.agentId, workspaceId: input.workspaceId, worktreePath: snapshot.worktreePath, locale: input.locale },
+      settings,
+      context,
+    );
+    return {
+      requestId: await this.startAiReviewRequest({
+        snapshot,
+        prompt,
+        reviewer,
+        settings,
+        agentId: input.agentId,
+        workspaceId: input.workspaceId,
+        locale: input.locale,
+      }, context),
+    };
+  }
+
+  private buildAiReviewPrompt(
+    snapshot: ReviewSnapshot,
+    mode: AiReviewMode,
+    depth: AiReviewDepth,
+    locale: ReviewLocale,
+    preset: AiReviewBudgetPreset,
+    selectedHunk?: Hunk,
+    filePath?: string,
+  ): ReturnType<typeof buildAiReviewPrompt> {
+    const toPromptFile = (file: ReviewSnapshot["files"][number]): AiReviewPromptFile => ({
+      path: file.path,
+      hunks: file.hunks.map((hunk) => promptHunk({
+        path: hunk.filePath,
+        header: hunk.header,
+        patch: hunk.patch,
+        context: hunk.functionHint ?? hunk.header,
+        findings: hunk.findings.map(({ severity, category }) => ({ severity, category })),
+      })),
+    });
+    let files: AiReviewPromptFile[];
+    if (mode === "hunk") {
+      if (!selectedHunk) throw new Error("A selected hunk is required for a hunk review.");
+      const file = snapshot.files.find((candidate) => candidate.hunks.some((hunk) => hunk.id === selectedHunk.id));
+      if (!file) throw new Error("The selected hunk is not part of the current review snapshot.");
+      const promptFile = toPromptFile({ ...file, hunks: [selectedHunk] });
+      files = [promptFile];
+    } else if (mode === "file") {
+      const file = snapshot.files.find((candidate) => candidate.path === filePath);
+      if (!file) {
+        throw new Error(
+          locale === "zh"
+            ? `文件 ${filePath ?? "（未选择）"} 不在当前评审目标中。`
+            : `File ${filePath ?? "(not selected)"} is not part of the current review target.`,
+        );
+      }
+      files = [toPromptFile(file)];
+    } else {
+      files = snapshot.files.map(toPromptFile);
+    }
+    return buildAiReviewPrompt({
+      mode,
+      depth,
+      preset,
+      locale,
+      scope: snapshot.scope,
+      workspace: snapshot.worktreePath,
+      targetFingerprint: snapshot.targetFingerprint,
+      files,
+    });
+  }
+
+  private async startAiReviewRequest(
+    input: {
+      snapshot: ReviewSnapshot;
+      prompt: ReturnType<typeof buildAiReviewPrompt>;
+      reviewer: { provider: string; model: string | null; thinkingOptionId: string | null; modeId: string; reviewerPermissionMode: AiReviewPermissionMode; configProvider: string };
+      settings: ReviewDeckSettingsValues;
+      agentId: string;
+      workspaceId: string;
+      locale: ReviewLocale | undefined;
+    },
+    context: PluginHandlerContext,
+  ): Promise<string> {
+    const { prompt, reviewer, settings } = input;
+    const depth = prompt.mode === "hunk" ? undefined : prompt.depth;
+    const reviewPreset = prompt.mode === "hunk" ? undefined : prompt.preset;
+    const cacheKey = sha256(canonicalJson({
+      workspaceId: input.workspaceId,
+      mode: prompt.mode,
+      depth: prompt.depth,
+      reviewPreset: reviewPreset ?? null,
+      inputFingerprint: prompt.inputFingerprint,
+      provider: reviewer.provider,
+      model: reviewer.model,
+      thinkingOptionId: reviewer.thinkingOptionId,
+      modeId: reviewer.modeId,
+      locale: prompt.locale,
+      promptVersion: prompt.promptVersion,
+      schemaVersion: prompt.schemaVersion,
+    }));
+
+    this.sweepTransientReviewAgents();
+    if (settings.aiReviewCacheEnabled) {
+      let cached: AiReviewCacheEntry | null = null;
+      try {
+        cached = await this.aiReviewCacheStore.get(cacheKey);
+      } catch {
+        // Cache corruption/unavailability cannot block a fresh review.
+      }
+      if (
+        cached
+        && cached.key === cacheKey
+        && cached.mode === prompt.mode
+        && cached.provider === reviewer.provider
+        && cached.model === reviewer.model
+        && cached.thinking === reviewer.thinkingOptionId
+        && cached.promptVersion === prompt.promptVersion
+        && cached.schemaVersion === prompt.schemaVersion
+        && cached.inputFingerprint === prompt.inputFingerprint
+        && cached.depth === depth
+      ) {
+        const requestId = randomUUID();
+        this.transientReviewAgents.set(requestId, {
+          handle: null,
+          cachedResult: { review: cached.review, sections: cached.sections, usage: cached.usage },
+          locale: input.locale,
+          provider: reviewer.provider,
+          model: reviewer.model,
+          workspaceId: input.workspaceId,
+          agentId: input.agentId,
+          startedAt: Date.now(),
+          mode: prompt.mode,
+          reviewerPermissionMode: reviewer.reviewerPermissionMode,
+          depth,
+          ...(reviewPreset ? { reviewPreset } : {}),
+          resultSource: "cached",
+          cacheEnabled: true,
+          cacheKey,
+          inputFingerprint: prompt.inputFingerprint,
+          thinkingOptionId: reviewer.thinkingOptionId,
+        });
+        return requestId;
+      }
+    }
+
+    return this.startTransientReviewAgent({
+      agentId: input.agentId,
+      workspaceId: input.workspaceId,
+      worktreePath: input.snapshot.worktreePath,
+      locale: input.locale,
+      prompt: prompt.prompt,
+      reviewer,
+      mode: prompt.mode,
+      depth,
+      ...(reviewPreset ? { reviewPreset } : {}),
+      cacheEnabled: settings.aiReviewCacheEnabled,
+      cacheKey,
+      inputFingerprint: prompt.inputFingerprint,
+    }, context);
+  }
+
   private async resolveParentAgentConfig(
     input: { agentId: string; workspaceId: string; worktreePath: string; locale: ReviewLocale | undefined },
     context: PluginHandlerContext,
   ): Promise<{
-    /** Combined "provider/model" string for the daemon create config. */
-    provider: string;
-    /** Parent provider id reported back to Review Deck. */
     agentProvider: string;
-    /** Parent model id (or null when the parent has none) for Review Deck. */
     agentModel: string | null;
     thinkingOptionId: string | null;
+    availableModes: Array<{ id: string; label: string; description?: string }>;
   }> {
     const handle = context.paseo.agents.ref(input.agentId);
     let agent: {
@@ -1436,6 +1612,7 @@ export class ReviewService {
       model?: string | null;
       thinkingOptionId?: string | null;
       effectiveThinkingOptionId?: string | null;
+      availableModes?: Array<{ id: string; label: string; description?: string }> | null;
     } | null | undefined;
     try {
       const fresh = await handle.refresh();
@@ -1446,23 +1623,17 @@ export class ReviewService {
     if (!agent || !agent.provider) {
       throw new Error(
         input.locale === "zh"
-          ? `无法解析所选工作区 Agent（${input.agentId}）的配置，不能创建只读评审子 Agent。评审未运行在所选工作区 Agent 的会话流上。`
-          : `Could not resolve the selected workspace Agent (${input.agentId}) configuration, so the read-only review child agent could not be created. The review did not run on the selected workspace Agent's stream.`,
+          ? `无法解析所选工作区 Agent（${input.agentId}）的配置，不能创建评审子 Agent。评审未在所选工作区 Agent 的会话流中运行。`
+          : `Could not resolve the selected workspace Agent (${input.agentId}) configuration, so the review child agent could not be created. The review did not run on the selected workspace Agent's stream.`,
       );
     }
-    // Workspace-bound agent gate: the refreshed parent must belong to the
-    // claimed workspace. A stale id pointing at a workspace-bound agent of
-    // another workspace is refused here, never silently substituted.
     if (agent.workspaceId !== input.workspaceId) {
       throw new Error(
         input.locale === "zh"
-          ? `所选 Agent（${input.agentId}）属于工作区 ${agent.workspaceId ?? "（无）"}，不是所选工作区 ${input.workspaceId}。不能创建只读评审子 Agent，也未使用其他 Agent 代替。`
-          : `Selected agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not the selected workspace ${input.workspaceId}. The read-only review child agent was not created and no other agent was substituted.`,
+          ? `所选 Agent（${input.agentId}）属于工作区 ${agent.workspaceId ?? "（无）"}，不是所选工作区 ${input.workspaceId}。不能创建评审子 Agent，也未使用其他 Agent 代替。`
+          : `Selected agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not the selected workspace ${input.workspaceId}. The review child agent was not created and no other agent was substituted.`,
       );
     }
-    // The claimed workspace itself must resolve and its directory must BE the
-    // reviewed worktree: a workspace id alone never authorizes a cwd outside
-    // that workspace.
     const workspaceHandle = context.paseo.workspaces.ref(input.workspaceId);
     let workspace: { workspaceDirectory?: string | null } | null | undefined;
     try {
@@ -1475,59 +1646,160 @@ export class ReviewService {
     if (!workspaceDirectory) {
       throw new Error(
         input.locale === "zh"
-          ? `无法解析所选工作区 ${input.workspaceId} 的目录，不能创建只读评审子 Agent。`
-          : `Could not resolve the directory of workspace ${input.workspaceId}, so the read-only review child agent could not be created.`,
+          ? `无法解析所选工作区 ${input.workspaceId} 的目录，不能创建评审子 Agent。`
+          : `Could not resolve the directory of workspace ${input.workspaceId}, so the review child agent could not be created.`,
       );
     }
     if (!(await this.directoriesMatch(workspaceDirectory, input.worktreePath))) {
       throw new Error(
         input.locale === "zh"
-          ? `评审目录 ${input.worktreePath} 不是所选工作区 ${input.workspaceId}（${workspaceDirectory}）的目录。不能创建只读评审子 Agent。`
-          : `The reviewed worktree ${input.worktreePath} is not the directory of the selected workspace ${input.workspaceId} (${workspaceDirectory}). The read-only review child agent was not created.`,
+          ? `评审目录 ${input.worktreePath} 不是所选工作区 ${input.workspaceId}（${workspaceDirectory}）的目录。不能创建评审子 Agent。`
+          : `The reviewed worktree ${input.worktreePath} is not the directory of the selected workspace ${input.workspaceId} (${workspaceDirectory}). The review child agent was not created.`,
       );
     }
-    // The parent agent must actually run in the reviewed worktree.
     if (!agent.cwd || !(await this.directoriesMatch(agent.cwd, input.worktreePath))) {
       throw new Error(
         input.locale === "zh"
-          ? `所选 Agent（${input.agentId}）运行于 ${agent.cwd ?? "（未知）"}，不是评审目录 ${input.worktreePath}。不能创建只读评审子 Agent，也未使用其他 Agent 代替。`
-          : `Selected agent ${input.agentId} runs in ${agent.cwd ?? "(unknown)"}, not the reviewed worktree ${input.worktreePath}. The read-only review child agent was not created and no other agent was substituted.`,
+          ? `所选 Agent（${input.agentId}）运行于 ${agent.cwd ?? "（未知）"}，不是评审目录 ${input.worktreePath}。不能创建评审子 Agent，也未使用其他 Agent 代替。`
+          : `Selected agent ${input.agentId} runs in ${agent.cwd ?? "(unknown)"}, not the reviewed worktree ${input.worktreePath}. The review child agent was not created and no other agent was substituted.`,
       );
     }
     return {
-      provider: agent.model ? `${agent.provider}/${agent.model}` : agent.provider,
       agentProvider: agent.provider,
       agentModel: agent.model ?? null,
       thinkingOptionId: agent.thinkingOptionId ?? agent.effectiveThinkingOptionId ?? null,
+      availableModes: agent.availableModes ?? [],
+    };
+  }
+
+  private async resolveReviewerConfiguration(
+    input: { agentId: string; workspaceId: string; worktreePath: string; locale: ReviewLocale | undefined },
+    settings: ReviewDeckSettingsValues,
+    context: PluginHandlerContext,
+  ): Promise<{
+    provider: string;
+    model: string | null;
+    thinkingOptionId: string | null;
+    modeId: string;
+    reviewerPermissionMode: AiReviewPermissionMode;
+    configProvider: string;
+  }> {
+    const parent = await this.resolveParentAgentConfig(input, context);
+    let provider = parent.agentProvider;
+    let model = parent.agentModel;
+    let thinkingOptionId = parent.thinkingOptionId;
+    let modes = parent.availableModes;
+
+    if (settings.reviewerStrategy === "custom") {
+      const configuredProvider = settings.reviewerProvider;
+      const configuredModel = settings.reviewerModel;
+      const unavailable = input.locale === "zh"
+        ? `设置的评审模型 ${configuredProvider || "（未选择 Provider）"}/${configuredModel || "（未选择 Model）"} 当前不可用。请在 Review Deck 设置中选择可用模型；没有回退到工作区 Agent。`
+        : `The configured reviewer model ${configuredProvider || "(provider not selected)"}/${configuredModel || "(model not selected)"} is unavailable. Choose an available model in Review Deck settings; no fallback to the workspace Agent was made.`;
+      if (!configuredProvider || !configuredModel) throw new Error(unavailable);
+
+      let providerEntry;
+      try {
+        const catalog = await context.paseo.providers.snapshot({ cwd: input.worktreePath });
+        providerEntry = catalog.entries.find((entry) => entry.provider === configuredProvider);
+      } catch {
+        throw new Error(unavailable);
+      }
+      if (!providerEntry || providerEntry.enabled === false || providerEntry.status !== "ready") {
+        throw new Error(unavailable);
+      }
+      const selectedModel = providerEntry.models?.find(
+        (candidate) => candidate.provider === configuredProvider && candidate.id === configuredModel && candidate.isSelectable !== false,
+      );
+      if (!selectedModel) throw new Error(unavailable);
+
+      provider = configuredProvider;
+      model = selectedModel.id;
+      if (settings.reviewerThinkingOptionId) {
+        const selectedThinking = selectedModel.thinkingOptions?.some(
+          (option) => option.id === settings.reviewerThinkingOptionId,
+        );
+        if (!selectedThinking) {
+          throw new Error(
+            input.locale === "zh"
+              ? `设置的思考选项 ${settings.reviewerThinkingOptionId} 对评审模型 ${provider}/${model} 不可用。请更新 Review Deck 设置。`
+              : `The configured thinking option ${settings.reviewerThinkingOptionId} is unavailable for reviewer model ${provider}/${model}. Update Review Deck settings.`,
+          );
+        }
+        thinkingOptionId = settings.reviewerThinkingOptionId;
+      } else {
+        thinkingOptionId = selectedModel.defaultThinkingOptionId ?? null;
+      }
+      modes = providerEntry.modes ?? [];
+    } else {
+      const parentMode = resolveReviewerMode(modes);
+      if (!parentMode || parentMode.permissionMode === "ask") {
+        let providerEntry;
+        try {
+          const catalog = await context.paseo.providers.snapshot({ cwd: input.worktreePath });
+          providerEntry = catalog.entries.find((entry) => entry.provider === provider);
+        } catch {
+          providerEntry = null;
+        }
+        if (!providerEntry || providerEntry.enabled === false || providerEntry.status !== "ready") {
+          if (!parentMode) {
+            throw new Error(
+              input.locale === "zh"
+                ? `无法验证 Provider ${provider} 的只读或审批门控评审模式；评审未启动。`
+                : `Could not verify a read-only or approval-gated review mode for provider ${provider}; the review was not started.`,
+            );
+          }
+        } else {
+          const providerModes = providerEntry.modes ?? [];
+          const providerMode = resolveReviewerMode(providerModes);
+          if (!parentMode || providerMode?.permissionMode === "read-only") modes = providerModes;
+        }
+      }
+    }
+
+    const reviewerMode = resolveReviewerMode(modes);
+    if (!reviewerMode) {
+      throw new Error(
+        input.locale === "zh"
+          ? `Provider ${provider} 没有可用的只读/Plan 或 Ask 审批门控模式；评审未启动。`
+          : `Provider ${provider} has no read-only/plan or approval-gated Ask mode; the review was not started.`,
+      );
+    }
+    return {
+      provider,
+      model,
+      thinkingOptionId,
+      modeId: reviewerMode.id,
+      reviewerPermissionMode: reviewerMode.permissionMode,
+      configProvider: model ? `${provider}/${model}` : provider,
     };
   }
 
   /**
-   * Creates the transient read-only review child agent (combined
-   * "provider/model" derived from the selected workspace Agent, no separate
-   * model key, optional thinkingOptionId) and registers it in
-   * transientReviewAgents under a fresh per-request capability — a randomUUID
-   * that is the requestId the client polls. The child's own agent id is
-   * globally discoverable through the agent registry, so it is NEVER exposed
-   * as the poll credential. Does NOT wait: the wait happens in pollAiReview
-   * so the plugin RPC layer is never blocked past its timeout. On create
-   * failure a clear locale-aware error is thrown; the review NEVER falls back
-   * to running on the selected workspace Agent's stream.
+   * Creates the configured transient reviewer and stores a request capability
+   * for polling. Its child ID is never exposed.
    */
   private async startTransientReviewAgent(
-    input: { agentId: string; workspaceId: string; worktreePath: string; locale: ReviewLocale | undefined; prompt: string },
+    input: {
+      agentId: string;
+      workspaceId: string;
+      worktreePath: string;
+      locale: ReviewLocale | undefined;
+      prompt: string;
+      reviewer: { provider: string; model: string | null; thinkingOptionId: string | null; modeId: string; reviewerPermissionMode: AiReviewPermissionMode; configProvider: string };
+      mode: AiReviewMode;
+      depth?: AiReviewDepth;
+      reviewPreset?: AiReviewBudgetPreset;
+      cacheEnabled: boolean;
+      cacheKey: string;
+      inputFingerprint: string;
+    },
     context: PluginHandlerContext,
   ): Promise<string> {
-    this.sweepTransientReviewAgents();
-    const resolved = await this.resolveParentAgentConfig(
-      { agentId: input.agentId, workspaceId: input.workspaceId, worktreePath: input.worktreePath, locale: input.locale },
-      context,
-    );
-    // config.provider already carries the combined "provider/model" string the
-    // daemon requires; a separate model key must NOT be sent.
     const agentConfig = {
-      provider: resolved.provider,
-      ...(resolved.thinkingOptionId ? { thinkingOptionId: resolved.thinkingOptionId } : {}),
+      provider: input.reviewer.configProvider,
+      modeId: input.reviewer.modeId,
+      ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
     };
     let child: TransientReviewChildHandle;
     try {
@@ -1535,26 +1807,35 @@ export class ReviewService {
         config: agentConfig,
         cwd: input.worktreePath,
         parent: input.agentId,
-        title: input.locale === "zh" ? "Review Deck 只读评审" : "Review Deck read-only review",
+        title: input.locale === "zh" ? "Review Deck AI 评审" : "Review Deck AI review",
         autoArchive: true,
         prompt: input.prompt,
       });
     } catch (error) {
       throw new Error(
         input.locale === "zh"
-          ? `只读评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未运行在所选工作区 Agent 的会话流上。`
-          : `Failed to create the read-only review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
+          ? `评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未在所选工作区 Agent 的会话流中运行。`
+          : `Failed to create the review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
       );
     }
     const requestId = randomUUID();
     this.transientReviewAgents.set(requestId, {
       handle: child,
       locale: input.locale,
-      provider: resolved.agentProvider,
-      model: resolved.agentModel,
+      provider: input.reviewer.provider,
+      model: input.reviewer.model,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
       startedAt: Date.now(),
+      mode: input.mode,
+      reviewerPermissionMode: input.reviewer.reviewerPermissionMode,
+      depth: input.depth,
+      ...(input.reviewPreset ? { reviewPreset: input.reviewPreset } : {}),
+      resultSource: "fresh",
+      cacheEnabled: input.cacheEnabled,
+      cacheKey: input.cacheKey,
+      inputFingerprint: input.inputFingerprint,
+      thinkingOptionId: input.reviewer.thinkingOptionId,
     });
     return requestId;
   }
@@ -1601,15 +1882,8 @@ export class ReviewService {
   }
 
   /**
-   * Polls a running read-only review. Each poll waits on the transient child
-   * for a short window; the daemon reports "timeout" while the turn is still
-   * running, so only idle/error/permission resolve the final result (review
-   * text, sections, status, parent display labels — exactly like the old
-   * blocking flow) and delete the entry. The requestId is a per-request
-   * capability that is never the child's agent id; it must also match the
-   * workspace/agent binding recorded at start time, and any unknown or
-   * mismatched request (a foreign workspace's capability, a stale agent
-   * reselection) returns a clear error and is never resolved.
+   * Polls a one-shot reviewer. Cache hits use the same request capability and
+   * result contract as fresh runs; fresh runs preserve status and token usage.
    */
   async pollAiReview(input: { requestId: string; workspaceId: string; agentId: string }): Promise<PollAiReviewResult> {
     this.sweepTransientReviewAgents();
@@ -1623,71 +1897,159 @@ export class ReviewService {
         model: "",
       };
     }
-    let result: { status: "idle" | "error" | "permission" | "timeout"; error: string | null; lastMessage: string | null };
+    if (entry.cachedResult) {
+      this.transientReviewAgents.delete(input.requestId);
+      return {
+        status: "idle",
+        review: entry.cachedResult.review,
+        sections: entry.cachedResult.sections,
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: "cached",
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+        ...(entry.cachedResult.usage ? { usage: entry.cachedResult.usage } : {}),
+      };
+    }
+    if (!entry.handle) {
+      this.transientReviewAgents.delete(input.requestId);
+      return {
+        status: "error",
+        review: "The AI review request has no active reviewer.",
+        sections: emptyReviewSections(),
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: "fresh",
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      };
+    }
+    let result: Awaited<ReturnType<TransientReviewChildHandle["waitForFinish"]>>;
     try {
       result = await entry.handle.waitForFinish(READONLY_REVIEW_POLL_WAIT_MS);
     } catch {
-      // Transient wait failure: the child is still alive; keep polling.
-      return { status: "running", review: "", sections: emptyReviewSections(), provider: entry.provider, model: entry.model ?? "unknown" };
+      return {
+        status: "running",
+        review: "",
+        sections: emptyReviewSections(),
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: "fresh",
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      };
     }
+    const usage = toAiReviewUsage(result.final?.lastUsage);
     if (result.status === "timeout") {
-      // The daemon reports "timeout" when the wait window elapsed while the
-      // turn was still running — keep polling.
-      return { status: "running", review: "", sections: emptyReviewSections(), provider: entry.provider, model: entry.model ?? "unknown" };
+      return {
+        status: "running",
+        review: "",
+        sections: emptyReviewSections(),
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: "fresh",
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+        ...(usage ? { usage } : {}),
+      };
     }
+
     this.transientReviewAgents.delete(input.requestId);
     const locale = entry.locale ?? "en";
-    // waitForFinish can settle (idle) with no final lastMessage when the turn
-    // ended after a tool call while the actual reply sits earlier in the
-    // timeline — recover it before falling back to the wait error/text.
-    const review =
+    const assistantText =
       result.lastMessage?.trim()
         ? result.lastMessage
-        : ((await this.extractLastAssistantText(entry.handle)) ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text."));
+        : await this.extractLastAssistantText(entry.handle);
+    const review = assistantText ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
+    const sections = this.parseReviewSections(review);
+    if (result.status === "idle" && assistantText && entry.cacheEnabled && entry.cacheKey && entry.inputFingerprint) {
+      try {
+        await this.aiReviewCacheStore.put({
+          key: entry.cacheKey,
+          mode: entry.mode,
+          provider: entry.provider,
+          model: entry.model,
+          thinking: entry.thinkingOptionId,
+          promptVersion: AI_REVIEW_PROMPT_VERSION,
+          schemaVersion: AI_REVIEW_SCHEMA_VERSION,
+          inputFingerprint: entry.inputFingerprint,
+          review: assistantText,
+          sections,
+          ...(entry.depth ? { depth: entry.depth } : {}),
+          ...(usage ? { usage } : {}),
+        });
+      } catch {
+        // A successful review remains usable even when the optional cache is unavailable.
+      }
+    }
     return {
       status: result.status,
       review,
-      sections: this.parseReviewSections(review),
+      sections,
       provider: entry.provider,
       model: entry.model ?? "unknown",
+      thinkingOptionId: entry.thinkingOptionId,
+      reviewerPermissionMode: entry.reviewerPermissionMode,
+      resultSource: "fresh",
+      mode: entry.mode,
+      ...(entry.depth ? { depth: entry.depth } : {}),
+      ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      ...(usage ? { usage } : {}),
     };
   }
 
+  async clearAiReviewCache(): Promise<boolean> {
+    await this.aiReviewCacheStore.clear();
+    return true;
+  }
+
   /**
-   * Starts the AI评审变更块 (single change block) read-only review: the
-   * workspace binding is validated (the parent agent must belong to the
-   * claimed workspace and run in the reviewed worktree), then the prompt —
-   * which only asks for a read-only review of the given hunk, never to edit
-   * files — is composed, the transient child agent is created WITHOUT
-   * waiting, and a per-request capability (never the child's discoverable
-   * agent id) is returned as the requestId the client polls; the result
-   * (including the parent display provider/model) arrives through
-   * pollAiReview.
+   * Starts a cached review of one selected hunk and returns the same
+   * per-request capability used by file and target reviews.
    */
   async startExplainHunkAi(
     input: ReviewRequest & { hunkId: string; agentId: string; workspaceId: string },
     context: PluginHandlerContext,
   ): Promise<{ requestId: string }> {
     const snapshot = await this.createSnapshot(input);
-    const locale = input.locale ?? "en";
-    const copy = deterministicCopy(locale);
     const hunk = this.findHunk(snapshot, input.hunkId);
-    const prompt = [
-      ...agentInstructions(locale, "explain"),
-      locale === "zh" ? `工作区：${snapshot.worktreePath}` : `Workspace: ${snapshot.worktreePath}`,
-      locale === "zh" ? `评审指纹：${snapshot.targetFingerprint}` : `Review fingerprint: ${snapshot.targetFingerprint}`,
-      locale === "zh" ? `变更块 ID：${hunk.id}` : `Hunk id: ${hunk.id}`,
-      copy.formatLabel(copy.file, hunk.filePath),
-      locale === "zh" ? `变更块标头：${hunk.header}` : `Hunk header: ${hunk.header}`,
-      locale === "zh" ? `完整变更块 diff：\n${hunk.patch}` : `Exact hunk diff:\n${hunk.patch}`,
-      ...(hunk.functionHint ? [copy.formatLabel(copy.enclosingSymbol, hunk.functionHint)] : []),
-      ...(hunk.language ? [copy.formatLabel(copy.language, displayLanguage(hunk.language))] : []),
-    ].join("\n\n");
-    const requestId = await this.startTransientReviewAgent(
-      { agentId: input.agentId, workspaceId: input.workspaceId, worktreePath: snapshot.worktreePath, locale: input.locale, prompt },
+    const settings = await this.readReviewerSettings(input.locale);
+    const prompt = this.buildAiReviewPrompt(
+      snapshot,
+      "hunk",
+      "targeted",
+      input.locale ?? "en",
+      settings.defaultReviewPreset,
+      hunk,
+    );
+    const reviewer = await this.resolveReviewerConfiguration(
+      { agentId: input.agentId, workspaceId: input.workspaceId, worktreePath: snapshot.worktreePath, locale: input.locale },
+      settings,
       context,
     );
-    return { requestId };
+    return {
+      requestId: await this.startAiReviewRequest({
+        snapshot,
+        prompt,
+        reviewer,
+        settings,
+        agentId: input.agentId,
+        workspaceId: input.workspaceId,
+        locale: input.locale,
+      }, context),
+    };
   }
 
   private async resolveReviewTarget(request: ReviewRequest): Promise<ReviewTarget> {

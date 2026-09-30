@@ -1,5 +1,5 @@
 import { Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import type { ReviewScope, ReviewSnapshot } from "../../shared/review";
+import type { AiReviewBudgetPreset, AiReviewDepth, ReviewScope, ReviewSnapshot } from "../../shared/review";
 import {
   scopeDescKeys,
   type AgentInfo,
@@ -14,7 +14,7 @@ import { ActionButton, HoverTooltip, Segmented } from "./ui";
 
 /** Centered "More & management" modal: scope/refs/path inputs, the Agent
  * registry/selection surface and the safety (review-state) actions. */
-export function MoreModal({ theme, layout, t, styles, open, onClose, agents, agentsLoading, selectedAgentId, onSelectAgent, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
+export function MoreModal({ theme, layout, t, styles, open, onClose, agents, agentsLoading, selectedAgentId, onSelectAgent, onRunTargetReview, agentReviewBusy, defaultReviewPreset, reviewDepthOverride, onReviewDepthOverrideChange, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -25,6 +25,11 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
   agentsLoading: boolean;
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string) => void;
+  onRunTargetReview: () => void;
+  agentReviewBusy: boolean;
+  defaultReviewPreset: AiReviewBudgetPreset;
+  reviewDepthOverride: AiReviewDepth | null;
+  onReviewDepthOverrideChange: (depth: AiReviewDepth | null) => void;
   scopeOptions: ReadonlyArray<{ value: ReviewScope; label: string }>;
   scope: ReviewScope;
   onScopeChange: (scope: ReviewScope) => void;
@@ -43,6 +48,18 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
   onClearCurrentReview: () => void;
   onManage: () => void;
 }) {
+  const presetLabel = t(
+    defaultReviewPreset === "economical"
+      ? "settingsReviewPresetEconomical"
+      : defaultReviewPreset === "balanced"
+        ? "settingsReviewPresetBalanced"
+        : "settingsReviewPresetDeep",
+  );
+  const depthOverrideOptions: ReadonlyArray<{ value: "preset" | AiReviewDepth; label: string }> = [
+    { value: "preset", label: t("aiReviewDepthUsePreset") },
+    { value: "targeted", label: t("settingsReviewDepthTargeted") },
+    { value: "full", label: t("settingsReviewDepthFull") },
+  ];
   return (
     <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable style={styles.centeredModalWrap} onPress={onClose}>
@@ -130,7 +147,33 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
                 })
               )}
             </View>
-
+            <View style={styles.modalSection}>
+              <Text style={styles.sectionTitle}>{t("aiReviewDepthOverrideLabel")}</Text>
+              <Text style={styles.scopeDesc}>{t("aiReviewDepthOverrideHint", { preset: presetLabel })}</Text>
+              <Segmented
+                options={depthOverrideOptions}
+                value={reviewDepthOverride ?? "preset"}
+                onChange={(value) => onReviewDepthOverrideChange(value === "preset" ? null : value)}
+                theme={theme}
+                layout={layout}
+                stretch={layout.compact}
+              />
+            </View>
+            <View style={styles.modalSection}>
+              <Text style={styles.scopeDesc}>{t("aiReviewTargetHint")}</Text>
+              <ActionButton
+                variant="primary"
+                label={agentReviewBusy ? t("aiReviewRunning") : t("aiReviewTargetAction")}
+                tooltip={t("aiReviewTargetHint")}
+                disabled={agentsLoading || !selectedAgentId || !snapshot || snapshot.totalHunks === 0 || !selected || agentReviewBusy}
+                onPress={() => {
+                  onClose();
+                  onRunTargetReview();
+                }}
+                theme={theme}
+                layout={layout}
+              />
+            </View>
             <View style={{ gap: 10 }}>
               <Text style={styles.sectionTitle}>{t("moreSafetyTitle")}</Text>
               <Text style={styles.scopeDesc}>{t("reviewStateDesc")}</Text>

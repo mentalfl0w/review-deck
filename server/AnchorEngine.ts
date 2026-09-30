@@ -43,7 +43,7 @@ import type {
   ReviewScope,
   ReviewStateCurrentHunk,
 } from "../shared/review";
-import { hunkFingerprint, parseRange } from "./diff/DiffParser";
+import { hunkBodyLines, hunkFingerprint, parseRange } from "./diff/DiffParser";
 import type { StateEntry } from "./persistence/StateStore";
 import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
 
@@ -101,33 +101,13 @@ export type ReviewAnchorFileView = {
 };
 
 /**
- * The body lines of the patch's FIRST hunk (a hunk patch carries exactly one
- * `@@` section; a second one is ignored rather than mis-attributed to the
- * first). Trailing empty lines and the `\ No newline at end of file` marker
- * carry no line content and are dropped.
- */
-function patchBodyLines(patch: string): string[] {
-  const lines = patch.split("\n");
-  const headerAt = lines.findIndex((line) => line.startsWith("@@ "));
-  if (headerAt === -1) return [];
-  const body: string[] = [];
-  for (let index = headerAt + 1; index < lines.length; index++) {
-    const line = lines[index];
-    if (line.startsWith("@@ ")) break;
-    if (line === "" || line.startsWith("\\")) continue;
-    body.push(line);
-  }
-  return body;
-}
-
-/**
  * One side of a hunk's patch: context lines and that side's own +/- lines, in
  * file order, which is exactly a contiguous run of absolute line numbers
  * starting at the side's start line in the hunk header.
  */
 function sideLinesFor(range: HunkRange, patch: string, side: AnchorSide): HunkSideLines {
   const lines: string[] = [];
-  for (const line of patchBodyLines(patch)) {
+  for (const line of hunkBodyLines(patch)) {
     const prefix = line[0];
     if (prefix === " ") lines.push(line.slice(1));
     else if (side === "old" ? prefix === "-" : prefix === "+") lines.push(line.slice(1));

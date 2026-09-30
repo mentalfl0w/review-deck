@@ -40,7 +40,7 @@ import {
 import { RepoMutexRegistry } from "./util/mutex";
 import { displayLanguage } from "./lang/languages";
 import { severityRank } from "./diff/FindingDetector";
-import { DiffParser, parseRange, type Hunk } from "./diff/DiffParser";
+import { DiffParser, hunkBodyLines, parseRange, type Hunk } from "./diff/DiffParser";
 import { GitRunner } from "./git/GitRunner";
 import { StateStore, type StateEntry, type StateFile } from "./persistence/StateStore";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
@@ -1804,22 +1804,16 @@ export class ReviewService {
         newNo++;
       }
       cursor = startIdx;
-      const bodyLines = hunk.hunkPatch.split("\n");
-      const headerAt = bodyLines.findIndex((line) => line.startsWith("@@ "));
-      if (headerAt === -1) continue; // no hunk header: cannot classify, treat as stale
+      const bodyLines = hunkBodyLines(hunk.hunkPatch);
       const pendingDels: string[] = [];
       let targetIdx = startIdx;
       let stale = false;
-      for (let i = headerAt + 1; i < bodyLines.length; i++) {
-        const line = bodyLines[i];
-        if (line === "") continue; // trailing artifact of the patch's final newline
+      for (const line of bodyLines) {
         const prefix = line[0];
-        if (prefix === "\\") continue; // "\ No newline at end of file" marker
         if (prefix === "-") {
           pendingDels.push(line.slice(1));
           continue;
         }
-        if (prefix !== "+" && prefix !== " ") continue; // unknown line: best-effort ignore
         const text = line.slice(1);
         if (fileLines[targetIdx] !== text) {
           stale = true;
@@ -1891,26 +1885,21 @@ export class ReviewService {
     let oldNo = 1;
     let newNo = 1;
     for (const { hunk } of sorted) {
-      const bodyLines = hunk.hunkPatch.split("\n");
-      const headerAt = bodyLines.findIndex((line) => line.startsWith("@@ "));
-      if (headerAt === -1) continue; // no hunk header: cannot classify, treat as stale
-      for (let i = headerAt + 1; i < bodyLines.length; i++) {
-        const line = bodyLines[i];
-        if (line === "") continue; // trailing artifact of the patch's final newline
+      const bodyLines = hunkBodyLines(hunk.hunkPatch);
+      for (const line of bodyLines) {
         const prefix = line[0];
-        if (prefix === "\\") continue; // "\ No newline at end of file" marker
+        const text = line.slice(1);
         if (prefix === "-") {
-          rows.push({ kind: "del", text: line.slice(1), hunkId: hunk.hunkId, oldLine: oldNo, newLine: null });
+          rows.push({ kind: "del", text, hunkId: hunk.hunkId, oldLine: oldNo, newLine: null });
           oldNo++;
         } else if (prefix === "+") {
-          rows.push({ kind: "add", text: line.slice(1), hunkId: hunk.hunkId, oldLine: null, newLine: newNo });
+          rows.push({ kind: "add", text, hunkId: hunk.hunkId, oldLine: null, newLine: newNo });
           newNo++;
         } else if (prefix === " ") {
-          rows.push({ kind: "context", text: line.slice(1), hunkId: hunk.hunkId, oldLine: oldNo, newLine: newNo });
+          rows.push({ kind: "context", text, hunkId: hunk.hunkId, oldLine: oldNo, newLine: newNo });
           oldNo++;
           newNo++;
         }
-        // Unknown lines are ignored (best effort).
       }
     }
     return rows;

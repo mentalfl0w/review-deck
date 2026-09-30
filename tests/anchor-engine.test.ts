@@ -43,7 +43,7 @@ import {
   anchorTextHash,
   buildLineRangeAnchor,
 } from "../server/AnchorEngine";
-import { hunkFingerprint } from "../server/diff/DiffParser";
+import { hunkBodyLines, hunkFingerprint } from "../server/diff/DiffParser";
 import { StateStore, type StateEntry } from "../server/persistence/StateStore";
 import { ReviewService } from "../server/ReviewService";
 import { hunkChangeId, hunkContentId } from "../server/util/crypto";
@@ -1371,6 +1371,64 @@ async function main(): Promise<void> {
       const anchor = requireRangeAnchor(state.decisions[0]?.anchor);
       assert.equal(anchor.startLine, hunkB.newStart + 3);
       assert.equal(anchor.selectedTextPreview, "LINE-TWENTY");
+
+      const twoSectionsPatch = [
+        "diff --git a/app.txt b/app.txt",
+        "index 1111111..2222222 100644",
+        "--- a/app.txt",
+        "+++ b/app.txt",
+        "@@ -1,1 +1,1 @@",
+        " line-1",
+        "@@ -3,1 +3,1 @@",
+        " line-3",
+        "",
+      ].join("\n");
+      assert.deepEqual(hunkBodyLines(twoSectionsPatch), [" line-1"], "body parsing stops at the next hunk");
+      const overlaid = await service.fileView({
+        cwd: repo,
+        scope: "working",
+        filePath: "app.txt",
+        targetFingerprint: snapshotB.targetFingerprint,
+        hunks: [{
+          hunkId: "H-first",
+          filePath: "app.txt",
+          hunkHeader: "@@ -1,1 +1,1 @@",
+          hunkPatch: twoSectionsPatch,
+        }],
+      });
+      assert.deepEqual(
+        overlaid.rows.slice(0, 3).map((row) => [row.text, row.hunkId]),
+        [["line-1", "H-first"], ["line-2", null], ["line-3", null]],
+        "the file view does not attribute later hunk rows to the first hunk",
+      );
+
+      const deletedPatch = [
+        "diff --git a/deleted.txt b/deleted.txt",
+        "--- a/deleted.txt",
+        "+++ /dev/null",
+        "@@ -1,1 +0,0 @@",
+        "-first",
+        "@@ -10,1 +9,0 @@",
+        "-second",
+        "",
+      ].join("\n");
+      const patchOnly = await service.fileView({
+        cwd: repo,
+        scope: "working",
+        filePath: "deleted.txt",
+        targetFingerprint: snapshotB.targetFingerprint,
+        hunks: [{
+          hunkId: "H-deleted",
+          filePath: "deleted.txt",
+          hunkHeader: "@@ -1,1 +0,0 @@",
+          hunkPatch: deletedPatch,
+        }],
+      });
+      assert.deepEqual(
+        patchOnly.rows.map((row) => [row.kind, row.text]),
+        [["del", "first"]],
+        "patch-only assembly does not attribute later hunk rows to the first hunk",
+      );
     }
 
     console.log("  full-file Level 3 matching reads real Git workspace content.");

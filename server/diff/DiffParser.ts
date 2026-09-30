@@ -25,6 +25,28 @@ export function parseRange(header: string): { oldStart: number; oldCount: number
   };
 }
 
+/**
+ * Raw, valid body rows from the first hunk in a hunk patch. A hunk patch
+ * represents one hunk; if concatenated input contains another hunk or file,
+ * stop there rather than attributing its rows to the first. Trailing empty
+ * artifacts, no-newline markers, and unrecognized metadata are excluded.
+ */
+export function hunkBodyLines(patch: string): string[] {
+  const lines = patch.split("\n");
+  const headerAt = lines.findIndex((line) => line.startsWith("@@ "));
+  if (headerAt === -1) return [];
+  const body: string[] = [];
+  for (let index = headerAt + 1; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.startsWith("@@ ") || line.startsWith("diff --git ")) break;
+    if (line === "" || line.startsWith("\\")) continue;
+    const prefix = line[0];
+    if (prefix !== " " && prefix !== "+" && prefix !== "-") continue;
+    body.push(line);
+  }
+  return body;
+}
+
 function unquoteGitPath(value: string): string {
   const bytes: number[] = [];
   for (let i = 0; i < value.length; i++) {

@@ -1,5 +1,6 @@
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import type { AnchorState, ProjectReviewComment, ReviewAnchor, ReviewScope, ReviewSnapshot } from "../shared/review";
+import type { ActiveReviewBatch } from "../shared/review-batch";
 import type { StringKey } from "./i18n";
 
 export type SelectedHunk = ReviewSnapshot["files"][number]["hunks"][number];
@@ -172,6 +173,16 @@ export type ProjectCommentsByTarget = Array<{
   targetFingerprint: string;
   files: Array<{ filePath: string; comments: ProjectReviewComment[] }>;
 }>;
+
+export type ProjectReviewWorkspaceGroup = {
+  key: string;
+  workspaceId: string | null;
+  cwd: string;
+  comments: ProjectReviewComment[];
+  eligibleAgents: AgentEntry[];
+  selectedAgentId: string;
+  activeBatch: ActiveReviewBatch | null;
+};
 export type ViewMode = "diff" | "blockFile" | "fullChanges";
 
 export const viewModeKeys: Array<{ value: ViewMode; key: StringKey }> = [

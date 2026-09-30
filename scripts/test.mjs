@@ -28,11 +28,15 @@ await run(process.execPath, ["--experimental-strip-types", "tests/state-store.te
 await run(process.execPath, ["--experimental-strip-types", "tests/line-range-selection.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-prompt.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-cache.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-store.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-prompt.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/project-review-workspaces.test.ts"]);
 await run(process.execPath, [tsc, "-p", "tests/tsconfig.target-fingerprint.json"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-tests/tests/target-fingerprint.test.js"]);
 await run(process.execPath, [tsc, "-p", "tests/tsconfig.anchor-engine.json"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/anchor-engine.test.js"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/ai-review-service.test.js"]);
+await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/review-batch-service.test.js"]);
 const outputDirectory = await mkdtemp(join(tmpdir(), "review-deck-tooltip-"));
 try {
   await run(process.execPath, [

@@ -8,73 +8,43 @@ import {
   type ProjectReviewSummary,
   type ReviewScope,
 } from "../../shared/review";
-import type { AgentInfo } from "../tools";
+import type { AgentEntry } from "../tools";
+import { groupProjectReviewComments } from "../project-review-workspaces";
 import { getReviewCountStore } from "../review-count-store";
 import type { TFunc } from "../i18n";
 
+
 /**
- * Project comment queue: the saved project comments list, the batch
- * process/delete flow with its run guards, the processing agent selection and
- * the queue modal visibility. Resets on project or workspace switch.
+ * Project queue: saved comments, per-workspace Agent selection, batch
+ * submission results, and the queue modal. Project changes reset all state;
+ * workspace changes reset only results for the prior workspace context.
  */
 export function useProjectComments(params: {
   effectiveProjectId: string;
   selectedWorkspaceId: string;
-  reviewCwd: string | null;
-  projectAgents: AgentInfo[];
-  /** Agent-context panels default the batch handoff to the hosting agent;
-   * absent in workspace panels, where the first-valid selection policy runs. */
+  projectAgents: AgentEntry[];
+  /** Agent-context panels prefer their hosting Agent for that Agent's workspace. */
   preferredAgentId?: string | null;
   t: TFunc;
 }) {
-  const { effectiveProjectId, selectedWorkspaceId, reviewCwd, projectAgents, preferredAgentId, t } = params;
+  const { effectiveProjectId, selectedWorkspaceId, projectAgents, preferredAgentId, t } = params;
   const listProjectCommentsRpc = useRpc(listProjectReviewComments);
   const processProjectCommentsRpc = useRpc(processProjectReview);
-  const [selectedProcessAgent, setSelectedProcessAgent] = useState("");
+  const [selectedProcessAgentsByWorkspace, setSelectedProcessAgentsByWorkspace] = useState<Record<string, string>>({});
   const [projectComments, setProjectComments] = useState<ProjectReviewSummary | null>(null);
   const [projectCommentsLoading, setProjectCommentsLoading] = useState(false);
   const [projectCommentsError, setProjectCommentsError] = useState<string | null>(null);
   const [processingProject, setProcessingProject] = useState(false);
-  const [processResult, setProcessResult] = useState<ProcessProjectReviewResult | null>(null);
+  const [processResult, setProcessResult] = useState<ProcessProjectReviewResult[] | null>(null);
   const [processError, setProcessError] = useState<string | null>(null);
   const [projectNotice, setProjectNotice] = useState<string | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const projectRunRef = useRef(0);
   const projectCommentsRequestRef = useRef(0);
-  const appliedPreferredProcessAgentId = useRef<string | null>(null);
-  const hasAppliedPreferredProcessAgent = useRef(false);
 
-  const projectAgentOptions = useMemo(() => projectAgents.map((agent) => ({
-    value: agent.id,
-    label: `${agent.title ?? agent.id} · ${agent.provider ?? "?"} / ${agent.model ?? t("noAgentModel")}`,
-  })), [projectAgents, t]);
-  useEffect(() => {
-    // Agent-context panels hand the batch off to the same validated agent as
-    // the single-hunk flows. Apply that preference once after a non-empty
-    // workspace-scoped list settles, then preserve a valid choice the user
-    // makes in the queue picker.
-    const validIds = new Set(projectAgents.map((agent) => agent.id));
-    if (preferredAgentId) {
-      const preferredChanged = !hasAppliedPreferredProcessAgent.current ||
-        appliedPreferredProcessAgentId.current !== preferredAgentId;
-      if (preferredChanged) {
-        if (projectAgents.length === 0) {
-          setSelectedProcessAgent("");
-          return;
-        }
-        hasAppliedPreferredProcessAgent.current = true;
-        appliedPreferredProcessAgentId.current = preferredAgentId;
-        setSelectedProcessAgent(validIds.has(preferredAgentId) ? preferredAgentId : "");
-        return;
-      }
-      setSelectedProcessAgent((current) => (validIds.has(current) ? current : ""));
-      return;
-    }
-    hasAppliedPreferredProcessAgent.current = false;
-    appliedPreferredProcessAgentId.current = null;
-    setSelectedProcessAgent((current) =>
-      validIds.has(current) ? current : (projectAgents[0]?.id ?? ""));
-  }, [projectAgents, preferredAgentId]);
+  const selectWorkspaceAgent = useCallback((groupKey: string, agentId: string) => {
+    setSelectedProcessAgentsByWorkspace((current) => ({ ...current, [groupKey]: agentId }));
+  }, []);
 
   const refreshProjectComments = useCallback(async (projectId: string = effectiveProjectId) => {
     // Bind this request to the project it was started for; a project switch or
@@ -118,6 +88,7 @@ export function useProjectComments(params: {
     // token) actually lands.
     projectRunRef.current += 1;
     projectCommentsRequestRef.current += 1;
+    setSelectedProcessAgentsByWorkspace({});
     setProcessResult(null);
     setProcessError(null);
     setProjectNotice(null);
@@ -141,20 +112,30 @@ export function useProjectComments(params: {
     setProcessingProject(false);
   }, [selectedWorkspaceId]);
 
+  const workspaceGroups = useMemo(
+    () => groupProjectReviewComments({
+      comments: projectComments?.comments ?? [],
+      batches: projectComments?.batches ?? [],
+      agents: projectAgents,
+      selectedAgentByWorkspace: selectedProcessAgentsByWorkspace,
+      preferredAgentId,
+    }),
+    [preferredAgentId, projectAgents, projectComments, selectedProcessAgentsByWorkspace],
+  );
+
   const processProject = useCallback(async () => {
-    if (!effectiveProjectId || !selectedProcessAgent) return;
-    // The loaded comments must belong to the current project and must be fully
-    // loaded; never process another project's list or a still-loading one.
+    if (!effectiveProjectId) return;
     if (projectComments === null || projectCommentsLoading || projectComments.projectId !== effectiveProjectId) return;
     if (projectComments.commentCount === 0) return;
-    if (!reviewCwd) return;
-    // The agent must belong to the currently selected workspace; a stale
-    // selection (workspace switched underneath the dropdown) is refused here,
-    // and the server re-validates the same binding before any run.
-    if (!projectAgents.some((agent) => agent.id === selectedProcessAgent)) {
-      setProcessError(t("processProjectAgentMismatch"));
-      return;
-    }
+
+    const assignments = workspaceGroups.flatMap((group) => {
+      if (!group.workspaceId || group.activeBatch || !group.selectedAgentId) return [];
+      const agent = group.eligibleAgents.find((candidate) => candidate.id === group.selectedAgentId);
+      if (!agent?.cwd) return [];
+      return [{ group, agent }];
+    });
+    if (assignments.length === 0) return;
+
     const run = projectRunRef.current + 1;
     projectRunRef.current = run;
     setProcessingProject(true);
@@ -162,25 +143,37 @@ export function useProjectComments(params: {
     setProjectNotice(null);
     setProcessResult(null);
     try {
-      const result = await processProjectCommentsRpc({
-        projectId: effectiveProjectId,
-        agentId: selectedProcessAgent,
-        workspaceId: selectedWorkspaceId,
-        workspaceCwd: reviewCwd,
+      const settled = await Promise.allSettled(assignments.map(({ group, agent }) =>
+        processProjectCommentsRpc({
+          projectId: effectiveProjectId,
+          agentId: agent.id,
+          workspaceId: group.workspaceId!,
+          workspaceCwd: agent.cwd!,
+          commentIds: group.comments.map((comment) => comment.id),
+        }),
+      ));
+      if (run !== projectRunRef.current) return;
+      const submitted: ProcessProjectReviewResult[] = [];
+      const failures: string[] = [];
+      settled.forEach((result, index) => {
+        if (result.status === "fulfilled") submitted.push(result.value);
+        else failures.push(`${assignments[index]!.group.cwd}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
       });
-      // A project switch or a newer run superseded this one; drop the stale result.
-      if (run !== projectRunRef.current) return;
-      setProcessResult(result);
+      setProcessResult(submitted.length > 0 ? submitted : null);
+      setProcessError(failures.length > 0 ? failures.join("\n") : null);
+      const pendingWorkspaceCount = workspaceGroups.filter((group) =>
+        !group.activeBatch && (!group.workspaceId || !group.selectedAgentId),
+      ).length;
+      setProjectNotice(
+        pendingWorkspaceCount > 0
+          ? t("processProjectWorkspacesPending", { count: pendingWorkspaceCount })
+          : null,
+      );
       void refreshProjectComments();
-    } catch (error) {
-      if (run !== projectRunRef.current) return;
-      setProcessError(error instanceof Error ? error.message : String(error));
     } finally {
-      // Only the run that started the indicator may clear it: a superseded run
-      // must not stop the newer run's spinner.
       if (run === projectRunRef.current) setProcessingProject(false);
     }
-  }, [effectiveProjectId, processProjectCommentsRpc, projectAgents, projectComments, projectCommentsLoading, refreshProjectComments, reviewCwd, selectedProcessAgent, selectedWorkspaceId, t]);
+  }, [effectiveProjectId, processProjectCommentsRpc, projectComments, projectCommentsLoading, refreshProjectComments, t, workspaceGroups]);
 
   const openProjectQueue = useCallback(() => {
     setQueueOpen(true);
@@ -192,7 +185,9 @@ export function useProjectComments(params: {
     projectComments.projectId === effectiveProjectId &&
     !projectCommentsLoading &&
     projectComments.commentCount > 0 &&
-    projectAgents.length > 0 &&
+    workspaceGroups.some((group) =>
+      Boolean(group.workspaceId && group.selectedAgentId && !group.activeBatch),
+    ) &&
     !processingProject;
   const commentsByTarget = useMemo(() => {
     const targets = new Map<string, {
@@ -228,8 +223,8 @@ export function useProjectComments(params: {
     processResult,
     processError,
     projectNotice,
-    selectedProcessAgent,
-    setSelectedProcessAgent,
+    workspaceGroups,
+    selectWorkspaceAgent,
     queueOpen,
     setQueueOpen,
     refreshProjectComments,
@@ -237,6 +232,5 @@ export function useProjectComments(params: {
     openProjectQueue,
     canProcessProject,
     commentsByTarget,
-    projectAgentOptions,
   };
 }

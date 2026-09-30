@@ -62,8 +62,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(clearAllReviewStates, async () => ({
     cleared: await reviewService.clearAllReviewStates(),
   }));
-  server.handle(listProjectReviewComments, async ({ projectId }) => ({
-    project: await reviewService.listProjectReviewComments(projectId),
+  server.handle(listProjectReviewComments, async ({ projectId }, context) => ({
+    project: await reviewService.listProjectReviewComments(projectId, context),
   }));
   server.handle(getProjectReviewCommentCount, async ({ projectId }) => reviewService.getProjectReviewCommentCount(projectId));
   server.handle(processProjectReview, async (input, context) => reviewService.processProjectReview(input, context));
@@ -71,6 +71,20 @@ export default function contribute(server: PluginServerContext) {
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),
   );
 
+  const stopTurnStarted = server.on("agent.turn_started", async (event, context) =>
+    reviewService.handleAgentTurnStarted(event, context),
+  );
+  const stopTurnEnded = server.on("agent.turn_ended", async (event, context) =>
+    reviewService.handleAgentTurnEnded(event, context),
+  );
+  const stopAgentArchived = server.on("agent.archived", async (event, context) =>
+    reviewService.handleAgentArchived(event, context),
+  );
   const stopMaintenance = reviewService.startMaintenance(MAINTENANCE_INTERVAL_MS);
-  return stopMaintenance;
+  return () => {
+    stopTurnEnded();
+    stopTurnStarted();
+    stopAgentArchived();
+    stopMaintenance();
+  };
 }

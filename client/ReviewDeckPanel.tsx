@@ -76,6 +76,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const agentsApi = useAgents({
     selectedWorkspaceId: scopeApi.selectedWorkspaceId,
     reviewCwd: scopeApi.reviewCwd,
+    projectId: scopeApi.effectiveProjectId,
   });
   const snapshotApi = useReviewSnapshot({
     reviewCwd: scopeApi.reviewCwd,
@@ -115,7 +116,6 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const commentsApi = useProjectComments({
     effectiveProjectId: scopeApi.effectiveProjectId,
     selectedWorkspaceId: scopeApi.selectedWorkspaceId,
-    reviewCwd: scopeApi.reviewCwd,
     projectAgents: agentsApi.projectAgents,
     preferredAgentId,
     t,
@@ -484,12 +484,8 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
         commentsByTarget={commentsApi.commentsByTarget}
         projectIdentity={scopeApi.projectIdentity}
         effectiveProjectId={scopeApi.effectiveProjectId}
-        activeWorkspaceName={activeWorkspaceName}
-        reviewCwd={scopeApi.reviewCwd}
-        projectAgentOptions={commentsApi.projectAgentOptions}
-        selectedProcessAgent={commentsApi.selectedProcessAgent}
-        onSelectProcessAgent={commentsApi.setSelectedProcessAgent}
-        projectAgentCount={agentsApi.projectAgents.length}
+        workspaceGroups={commentsApi.workspaceGroups}
+        onSelectWorkspaceAgent={commentsApi.selectWorkspaceAgent}
         agentsLoading={agentsApi.agentsLoading}
         canProcessProject={commentsApi.canProcessProject}
         processingProject={commentsApi.processingProject}

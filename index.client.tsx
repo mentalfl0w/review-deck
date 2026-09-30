@@ -2,11 +2,17 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { ReviewDeckAgentPanel } from "./client/ReviewDeckAgentPanel";
 import { ReviewDeckPanel } from "./client/ReviewDeckPanel";
 import { ReviewDeckSettings } from "./client/ReviewDeckSettings";
+import { ReviewBatchTimelineItem, type ReviewBatchTimelineItemProps } from "./client/components/ReviewBatchTimelineItem";
 import { ReviewHandoffTimelineItem } from "./client/components/ReviewHandoffTimelineItem";
 import { getAgentRegistry } from "./client/agent-registry";
 import { getReviewCountStore } from "./client/review-count-store";
 import { registerReviewEntries } from "./client/review-entries";
 import { getProjectReviewCommentCount } from "./shared/review";
+import {
+  reviewBatchTimelineKind,
+  reviewBatchTimelineSchema,
+  reviewBatchTimelineVersion,
+} from "./shared/review-batch";
 import {
   reviewHandoffTimelineKind,
   reviewHandoffTimelineSchema,
@@ -64,6 +70,28 @@ export default function contribute(client: PluginClientContext) {
     version: reviewHandoffTimelineVersion,
     schema: reviewHandoffTimelineSchema,
     Component: ReviewHandoffTimelineItem,
+  });
+  // Version-1 rows for one ReviewBatch. Timeline item props expose no
+  // navigation, so the contribution captures client.openPanel here and hands
+  // the renderer a callback bound to the agent that owns the timeline; the
+  // callback only ever receives the schema-validated workspace id.
+  client.addTimelineRenderer({
+    kind: reviewBatchTimelineKind,
+    version: reviewBatchTimelineVersion,
+    schema: reviewBatchTimelineSchema,
+    Component: function ReviewBatchTimelineRow(props: Omit<ReviewBatchTimelineItemProps, "onOpenReviewDeck">) {
+      return (
+        <ReviewBatchTimelineItem
+          {...props}
+          onOpenReviewDeck={(workspaceId) =>
+            client.openPanel("review-deck-agent", {
+              workspaceId,
+              agentId: props.agentId,
+              location: "workspace",
+            })}
+        />
+      );
+    },
   });
   client.addSettingsScreen({
     id: "review-defaults",

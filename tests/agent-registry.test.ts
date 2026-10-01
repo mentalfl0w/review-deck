@@ -31,7 +31,7 @@ import type {
 } from "@getpaseo/client";
 import type {
   PluginButton,
-  PluginButtonMenuEntry,
+  PluginButtonContentProps,
   PluginButtonRegistration,
   PluginClientOpenPanelOptions,
   PluginComposerPillContribution,
@@ -39,7 +39,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
 import type { RegistryAgent } from "../client/agent-registry";
-import type { ReviewEntryHost } from "../client/review-entries";
+import type { ReviewEntryHost, ReviewPillMenuAction } from "../client/review-entries";
 
 // Production modules use bundler-style extensionless imports, which node's
 // type stripping does not resolve, so the real client modules are loaded here
@@ -285,6 +285,7 @@ function createFakeHost() {
   const live = new Map<string, RegistrationLog>();
   const opened: Array<{ id: string; options: PluginClientOpenPanelOptions }> = [];
   const popoverWorkspaces: string[] = [];
+  const pillActionsByContent = new WeakMap<object, readonly ReviewPillMenuAction[]>();
   const register = (contribution: FakeContribution): PluginButtonRegistration => {
     const record: RegistrationLog = { id: contribution.id, contribution, updates: [], removed: false };
     all.push(record);
@@ -312,15 +313,24 @@ function createFakeHost() {
       popoverWorkspaces.push(workspaceId);
       return () => null;
     },
+    createPillMenu(actions) {
+      const Content = (_props: PluginButtonContentProps) => null;
+      pillActionsByContent.set(Content, actions);
+      return Content;
+    },
   };
-  const menuItem = (id: string, itemId: string): Extract<PluginButtonMenuEntry, { kind: "item" }> => {
+  const menuActions = (id: string): readonly ReviewPillMenuAction[] => {
     const record = live.get(id);
     assert.ok(record, `registration ${id} must be live`);
     const behavior = record.contribution.button.behavior;
-    if (behavior.kind !== "menu") throw new Error(`registration ${id} must expose a menu`);
-    const item = behavior.items.find((entry): entry is Extract<PluginButtonMenuEntry, { kind: "item" }> =>
-      entry.kind === "item" && entry.id === itemId);
-    if (!item) throw new Error(`menu item ${itemId} must exist`);
+    if (behavior.kind !== "popover") throw new Error(`registration ${id} must expose a popover`);
+    const actions = pillActionsByContent.get(behavior.Content);
+    assert.ok(actions, `registration ${id} must expose Pill actions`);
+    return actions;
+  };
+  const menuItem = (id: string, itemId: string): ReviewPillMenuAction => {
+    const item = menuActions(id).find((entry) => entry.id === itemId);
+    if (!item) throw new Error(`Pill action ${itemId} must exist`);
     return item;
   };
   return {
@@ -334,11 +344,12 @@ function createFakeHost() {
       assert.ok(record, `registration ${id} must be live`);
       return record.contribution.button.behavior;
     },
+    menuActions,
     menuItem,
     async selectMenuItem(id: string, itemId: string) {
       const item = menuItem(id, itemId);
       assert.notEqual(item.disabled, true, `menu item ${itemId} must be enabled`);
-      if (item.behavior.kind === "action") await item.behavior.onPress();
+      await item.onPress();
       return item;
     },
   };
@@ -806,12 +817,22 @@ async function main() {
     assert.equal(host.live.get("review-pill-agent-a")?.contribution.button.label, "Review · 3");
     assert.equal(host.live.get("review-pill-agent-d")?.contribution.button.label, "Review · 3");
 
-    // Clicking the Header opens its status popover; the Agent Pill opens its menu.
+    // The Header uses its status popover; the Agent Pill uses a settings-aware action popover.
     const headerBehavior = host.press("review-header-ws-1");
     assert.equal(headerBehavior.kind, "popover");
     assert.deepEqual(host.popoverWorkspaces, ["ws-1"]);
     const pillBehavior = host.press("review-pill-agent-a");
-    assert.equal(pillBehavior.kind, "menu");
+    assert.equal(pillBehavior.kind, "popover");
+    assert.deepEqual(
+      host.menuActions("review-pill-agent-a").map(({ id, labelKey }) => [id, labelKey]),
+      [
+        ["open-review-deck", "reviewBatchOpenReviewDeck"],
+        ["open-queue", "reviewEntryOpenQueue"],
+        ["run-targeted-ai-review", "reviewEntryRunTargeted"],
+        ["submit-pending-comments", "reviewEntrySubmitComments"],
+      ],
+      "the menu passes translation keys to content that reads the current settings",
+    );
     await host.selectMenuItem("review-pill-agent-a", "open-review-deck");
     await host.selectMenuItem("review-pill-agent-a", "open-queue");
     assert.deepEqual(host.opened, [

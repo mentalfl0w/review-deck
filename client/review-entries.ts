@@ -18,6 +18,7 @@ import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
 import { openOwnedEntries, USABLE_AGENT_STATUSES, type AgentRegistry, type OwnedEntriesGateOptions } from "./agent-registry";
 import type { ReviewCountStore } from "./review-count-store";
 import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./review-entry-status-store";
+import type { StringKey } from "./i18n";
 
 /**
  * Native Review Deck entry points:
@@ -32,8 +33,8 @@ import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./rev
  * Git snapshots are read only after the user opens the Header Popover.
  *
  * Header buttons open the native status popover. Composer pills open a
- * workspace-bound action menu and exist only for live Agents with a workspace.
- * The menu disables AI review and batch submission when the workspace, Agent,
+ * workspace-bound action popover and exist only for live Agents with a workspace.
+ * The popover disables AI review and batch submission when the workspace, Agent,
  * diff target, or active-run state is not safe.
  * An unreachable workspace list is retried in a bounded burst and, once that
  * burst is spent, re-armed at the retry policy's tail delay, so the headers
@@ -42,8 +43,6 @@ import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./rev
  * bootstrap leaves no subscription behind.
  */
 
-const WORKSPACE_PANEL_ID = "review-deck";
-const WORKSPACE_QUEUE_PANEL_ID = "review-deck-queue";
 const AGENT_PANEL_ID = "review-deck-agent";
 const AGENT_QUEUE_PANEL_ID = "review-deck-agent-queue";
 const AGENT_TARGETED_REVIEW_PANEL_ID = "review-deck-agent-targeted-review";
@@ -56,6 +55,7 @@ export type ReviewEntryHost = {
   addComposerPill(contribution: PluginComposerPillContribution): PluginButtonRegistration;
   openPanel(id: string, options: PluginClientOpenPanelOptions): void;
   createHeaderPopover(workspaceId: string): ComponentType<PluginButtonContentProps>;
+  createPillMenu(actions: readonly ReviewPillMenuAction[]): ComponentType<PluginButtonContentProps>;
 };
 
 type Entry = {
@@ -82,7 +82,6 @@ export type ReviewEntriesOptions = {
   registry: AgentRegistry;
   counts: ReviewCountStore;
   statuses?: ReviewEntryStatusStore;
-  labels?: ReviewEntryLabels;
   submitPendingComments?(input: { workspaceId: string; agentId: string }): Promise<void>;
   /** Test seams for the workspace bootstrap; production uses the defaults. */
   retryDelaysMs?: readonly number[];
@@ -90,18 +89,13 @@ export type ReviewEntriesOptions = {
 };
 
 export type ReviewEntries = { stop(): void };
-export type ReviewEntryLabels = {
-  openDeck: string;
-  openQueue: string;
-  runTargeted: string;
-  submitComments: string;
-};
-
-const DEFAULT_ENTRY_LABELS: ReviewEntryLabels = {
-  openDeck: "Open Review Deck",
-  openQueue: "Open Queue",
-  runTargeted: "Review Current Changes with AI",
-  submitComments: "Submit pending comments",
+export type ReviewPillMenuAction = {
+  id: "open-review-deck" | "open-queue" | "run-targeted-ai-review" | "submit-pending-comments";
+  labelKey: StringKey;
+  icon: string;
+  disabled?: boolean;
+  separatorBefore?: boolean;
+  onPress(): void | Promise<void>;
 };
 
 /** Prefer actionable comments, then stale anchors, then unread findings. */
@@ -157,74 +151,55 @@ function pillMenuBehavior(
   client: ReviewEntryHost,
   target: PillMenuTarget,
   status: ReviewWorkspaceIndicators | null,
-  labels: ReviewEntryLabels,
   refreshStatus: (workspaceId: string) => Promise<void>,
   submitPendingComments?: ReviewEntriesOptions["submitPendingComments"],
 ): PluginButtonBehavior {
-  return {
-    kind: "menu",
-    items: [
-      {
-        kind: "item",
-        id: "open-review-deck",
-        title: labels.openDeck,
-        icon: BUTTON_ICON,
-        behavior: {
-          kind: "action",
-          onPress: () => client.openPanel(AGENT_PANEL_ID, {
-            workspaceId: target.workspaceId,
-            agentId: target.agentId,
-            location: "workspace",
-          }),
-        },
+  const actions: ReviewPillMenuAction[] = [
+    {
+      id: "open-review-deck",
+      labelKey: "reviewBatchOpenReviewDeck",
+      icon: BUTTON_ICON,
+      onPress: () => client.openPanel(AGENT_PANEL_ID, {
+        workspaceId: target.workspaceId,
+        agentId: target.agentId,
+        location: "workspace",
+      }),
+    },
+    {
+      id: "open-queue",
+      labelKey: "reviewEntryOpenQueue",
+      icon: "ListTodo",
+      onPress: () => client.openPanel(AGENT_QUEUE_PANEL_ID, {
+        workspaceId: target.workspaceId,
+        agentId: target.agentId,
+        location: "workspace",
+      }),
+    },
+    {
+      id: "run-targeted-ai-review",
+      labelKey: "reviewEntryRunTargeted",
+      icon: "Sparkles",
+      disabled: !canRunTargetedReview(status, target),
+      onPress: () => client.openPanel(AGENT_TARGETED_REVIEW_PANEL_ID, {
+        workspaceId: target.workspaceId,
+        agentId: target.agentId,
+        location: "workspace",
+      }),
+    },
+    {
+      id: "submit-pending-comments",
+      labelKey: "reviewEntrySubmitComments",
+      icon: "Send",
+      disabled: !canSubmitPendingComments(status, target, Boolean(submitPendingComments)),
+      separatorBefore: true,
+      onPress: async () => {
+        if (!submitPendingComments) throw new Error("Workspace comment submission is unavailable.");
+        await submitPendingComments({ workspaceId: target.workspaceId, agentId: target.agentId });
+        await refreshStatus(target.workspaceId);
       },
-      {
-        kind: "item",
-        id: "open-queue",
-        title: labels.openQueue,
-        icon: "ListTodo",
-        behavior: {
-          kind: "action",
-          onPress: () => client.openPanel(AGENT_QUEUE_PANEL_ID, {
-            workspaceId: target.workspaceId,
-            agentId: target.agentId,
-            location: "workspace",
-          }),
-        },
-      },
-      {
-        kind: "item",
-        id: "run-targeted-ai-review",
-        title: labels.runTargeted,
-        icon: "Sparkles",
-        disabled: !canRunTargetedReview(status, target),
-        behavior: {
-          kind: "action",
-          onPress: () => client.openPanel(AGENT_TARGETED_REVIEW_PANEL_ID, {
-            workspaceId: target.workspaceId,
-            agentId: target.agentId,
-            location: "workspace",
-          }),
-        },
-      },
-      { kind: "separator", id: "submit-divider" },
-      {
-        kind: "item",
-        id: "submit-pending-comments",
-        title: labels.submitComments,
-        icon: "Send",
-        disabled: !canSubmitPendingComments(status, target, Boolean(submitPendingComments)),
-        behavior: {
-          kind: "action",
-          onPress: async () => {
-            if (!submitPendingComments) throw new Error("Workspace comment submission is unavailable.");
-            await submitPendingComments({ workspaceId: target.workspaceId, agentId: target.agentId });
-            await refreshStatus(target.workspaceId);
-          },
-        },
-      },
-    ],
-  };
+    },
+  ];
+  return { kind: "popover", Content: client.createPillMenu(actions) };
 }
 
 
@@ -247,7 +222,6 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
   const trackedProjects = new Set<string>();
   const trackedWorkspaces = new Set<string>();
   const workspaces = new Map<string, PaseoWorkspace>();
-  const labels = options.labels ?? DEFAULT_ENTRY_LABELS;
   let lastBootstraps = registry.getSnapshot().bootstraps;
   let stopped = false;
 
@@ -299,7 +273,6 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
           client,
           target,
           status,
-          labels,
           (workspaceId) => statuses.refresh(workspaceId),
           options.submitPendingComments,
         );
@@ -415,7 +388,6 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
               client,
               target,
               status,
-              labels,
               (workspaceId) => statuses.refresh(workspaceId),
               options.submitPendingComments,
             ),

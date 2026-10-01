@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSettings, type PluginAgentPanelProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { useRpc, useSettings, type PluginAgentPanelProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n";
 import { scopeKeys, type DiffMode, type ViewMode } from "./tools";
@@ -20,6 +20,8 @@ import { QueueModal } from "./components/QueueModal";
 import { MoreModal } from "./components/MoreModal";
 import { ManageModal } from "./components/ManageModal";
 import { reviewDeckSettings } from "../shared/review-settings";
+import { markWorkspaceReviewResultsRead } from "../shared/review-activity";
+import { getReviewEntryStatusStore } from "./review-entry-status-store";
 import type { AiReviewBudgetPreset, AiReviewDepth } from "../shared/review";
 
 /** The host surface the deck consumes, shared by the workspace and agent
@@ -27,15 +29,27 @@ import type { AiReviewBudgetPreset, AiReviewDepth } from "../shared/review";
  * shapes ({@link PluginWorkspacePanelProps} and {@link PluginAgentPanelProps})
  * satisfy it; workspace registrations stay byte-for-byte compatible. */
 export type ReviewDeckPanelProps = Pick<PluginWorkspacePanelProps, "theme" | "layout" | "workspaceId"> & {
-  /** Agent-context panels preselect the hosting agent: selected once the
-   * registry settles, and only when the workspace scope admits it. Absent in
-   * workspace panels, where the selection policy is unchanged. */
+  /** Agent-context panels preselect the hosting Agent once the registry settles. */
   preferredAgentId?: string | null;
+  /** Dedicated native entry variants can open the existing queue immediately. */
+  initialQueueOpen?: boolean;
+  /** Targeted Review Pill entry starts a working-tree targeted review after the snapshot settles. */
+  autoRunTargetedReview?: boolean;
+  /** Queue-only panel variants do not count as opening unread AI findings. */
+  markAiReviewResultsReadOnOpen?: boolean;
 };
 
 /** Review Deck panel: a minimal composition layer wiring the domain hooks to
  * the presentational components. */
-export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }: ReviewDeckPanelProps) {
+export function ReviewDeckPanel({
+  theme,
+  layout,
+  workspaceId,
+  preferredAgentId,
+  initialQueueOpen = false,
+  autoRunTargetedReview = false,
+  markAiReviewResultsReadOnOpen = true,
+}: ReviewDeckPanelProps) {
   const settings = useSettings(reviewDeckSettings);
   const [manualLocale, setManualLocale] = useState<Locale | null>(null);
   const configuredLocale = settings.status === "ready" ? settings.values.locale : "auto";
@@ -65,6 +79,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const appliedPreferredAgentId = useRef<string | null>(null);
   const hasAppliedPreferredAgent = useRef(false);
+  const initialQueueOpenedForRef = useRef<string | null>(null);
+  const autoRunTargetedStartedRef = useRef(false);
+  const markReadRpc = useRpc(markWorkspaceReviewResultsRead);
   const [detailHeight, setDetailHeight] = useState(0);
   const handleDetailHeightChange = useCallback((height: number) => {
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
@@ -73,6 +90,17 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
   useEffect(() => {
     setReviewDepthOverride(null);
   }, [scopeApi.selectedWorkspaceId]);
+  const markedReadWorkspaceRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!markAiReviewResultsReadOnOpen || !scopeApi.workspace || markedReadWorkspaceRef.current === workspaceId) return;
+    markedReadWorkspaceRef.current = workspaceId;
+    void markReadRpc({ workspaceId })
+      .then(() => getReviewEntryStatusStore().refresh(workspaceId))
+      .catch(() => {
+        // Keep unread state when the read acknowledgement cannot be persisted.
+        if (markedReadWorkspaceRef.current === workspaceId) markedReadWorkspaceRef.current = null;
+      });
+  }, [markAiReviewResultsReadOnOpen, markReadRpc, scopeApi.workspace, workspaceId]);
   const agentsApi = useAgents({
     selectedWorkspaceId: scopeApi.selectedWorkspaceId,
     reviewCwd: scopeApi.reviewCwd,
@@ -92,6 +120,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     agentRevision: agentsApi.agentRevision,
     setActionError,
   });
+  useEffect(() => {
+    if (!snapshotApi.snapshot) return;
+    void getReviewEntryStatusStore().refresh(workspaceId);
+  }, [snapshotApi.anchorIssues, snapshotApi.snapshot, workspaceId]);
   // The v1.3 line-range selection: scoped to the shown target and change block,
   // so it can never describe lines of a hunk that is no longer on screen.
   const lineSelectionApi = useLineSelection({
@@ -120,6 +152,11 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     preferredAgentId,
     t,
   });
+  useEffect(() => {
+    if (!initialQueueOpen || !scopeApi.workspace || initialQueueOpenedForRef.current === workspaceId) return;
+    initialQueueOpenedForRef.current = workspaceId;
+    commentsApi.openProjectQueue();
+  }, [commentsApi.openProjectQueue, initialQueueOpen, scopeApi.workspace, workspaceId]);
   const actionsApi = useReviewActions({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
@@ -163,11 +200,47 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, preferredAgentId }
     clearHunkComment: actionsApi.clearHunkComment,
     refreshProjectComments: commentsApi.refreshProjectComments,
   });
-  const runReviewForAgent = useCallback((agentId: string, filePath?: string) => {
-    const depthOverride = reviewDepthOverride;
+  const runReviewForAgent = useCallback((
+    agentId: string,
+    filePath?: string,
+    requestedDepth?: AiReviewDepth,
+  ) => {
+    const depthOverride = requestedDepth ?? reviewDepthOverride;
     setReviewDepthOverride(null);
     void agentApi.runAgentReview(agentId, filePath, depthOverride ?? undefined);
   }, [agentApi.runAgentReview, reviewDepthOverride]);
+  useEffect(() => {
+    if (
+      !autoRunTargetedReview ||
+      autoRunTargetedStartedRef.current ||
+      !preferredAgentId ||
+      selectedAgentId !== preferredAgentId ||
+      agentsApi.agentsLoading ||
+      snapshotApi.loading ||
+      snapshotApi.stale ||
+      !snapshotApi.snapshot ||
+      snapshotApi.snapshot.totalHunks === 0 ||
+      agentApi.agentReviewBusy
+    ) return;
+    autoRunTargetedStartedRef.current = true;
+    runReviewForAgent(preferredAgentId, undefined, "targeted");
+  }, [
+    agentApi.agentReviewBusy,
+    agentsApi.agentsLoading,
+    autoRunTargetedReview,
+    preferredAgentId,
+    runReviewForAgent,
+    selectedAgentId,
+    snapshotApi.loading,
+    snapshotApi.snapshot,
+    snapshotApi.stale,
+  ]);
+  useEffect(() => {
+    if (!markAiReviewResultsReadOnOpen || !agentApi.agentReviewMeta || agentApi.agentReviewBusy) return;
+    void markReadRpc({ workspaceId })
+      .then(() => getReviewEntryStatusStore().refresh(workspaceId))
+      .catch(() => undefined);
+  }, [agentApi.agentReviewBusy, agentApi.agentReviewMeta, markAiReviewResultsReadOnOpen, markReadRpc, workspaceId]);
   const fileViewApi = useFileView({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,

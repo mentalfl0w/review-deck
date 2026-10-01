@@ -11,6 +11,7 @@ import {
 import type { AgentEntry } from "../tools";
 import { groupProjectReviewComments } from "../project-review-workspaces";
 import { getReviewCountStore } from "../review-count-store";
+import { getReviewEntryStatusStore } from "../review-entry-status-store";
 import type { TFunc } from "../i18n";
 
 
@@ -68,13 +69,14 @@ export function useProjectComments(params: {
       getReviewCountStore().setCount(projectId, result.project?.commentCount ?? 0);
       if (requestId !== projectCommentsRequestRef.current) return;
       setProjectComments(result.project);
+      void getReviewEntryStatusStore().refresh(selectedWorkspaceId);
     } catch (error) {
       if (requestId !== projectCommentsRequestRef.current) return;
       setProjectCommentsError(error instanceof Error ? error.message : String(error));
     } finally {
       if (requestId === projectCommentsRequestRef.current) setProjectCommentsLoading(false);
     }
-  }, [effectiveProjectId, listProjectCommentsRpc]);
+  }, [effectiveProjectId, listProjectCommentsRpc, selectedWorkspaceId]);
 
   useEffect(() => {
     // Processing results, notices and loaded comments belong to one project:

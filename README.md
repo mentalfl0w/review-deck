@@ -24,8 +24,8 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Project comments queue | The top queue aggregates every saved comment for the current project, grouped by workspace, scope, and file |
 | AI processing | Group project comments by workspace and submit each group to an Agent in that workspace. Only explicit `COMPLETED` outcomes remove comments; stale, failed, and unresolved comments stay queued |
 | Agent-context Review Deck | Open Review Deck bound to the Agent of the current workspace — its own panel entry, the Command Center item **Open Review Deck for this Agent**, or the **`/review-deck`** slash command in an Agent chat; the Agent is preselected as the review target |
-| Paseo-native entries | Workspace header buttons and Agent composer pills open the Review Deck for their bound workspace/Agent. Pills are re-registered when an Agent's workspace placement changes; badges show the project's pending comment count. |
-| Review Batch timeline | One stable row per workspace batch updates from submitted/running to completed/partial/failed counts and includes **Open Review Deck**. Its payload contains workspace ID, status, outcome counts, and timestamps — never comment text, comment IDs, file paths, or cwd |
+| Paseo-native entries | Workspace Header badges prioritize actionable pending comments, then stale/ambiguous comments, then unread AI findings; the native popover shows review progress, queue state, active reviews, and Deck/Queue actions. Agent Composer Pill menus open the Deck or Queue, start a targeted review, or submit that workspace's comments; run/submit actions are gated by workspace, Agent, diff, and batch state. |
+| Review timelines | `review-deck-batch` rows update by stable id from submitted/running to completed/partial/failed. AI-review rows summarize completion, finding/high-risk counts, and token usage. Both contain status metadata only — never findings, comment text/IDs, file paths, patches, or cwd. |
 | Review defaults | Panel language (Auto / 中文 / English), diff layout (Auto / Unified / Split), reviewer strategy and Provider / Model / Thinking, cache, token-usage display, and the default Economical / Balanced / Deep preset. Settings are host-scoped under **Settings → Plugins → Review Deck** |
 | AI review & explain | Explain a hunk, review one file, or review the current target. The preset sets risk coverage and default depth; Targeted / Full can override patch context per run. Reviewers prefer Read-only/Plan; OMP Ask is approval-gated. Codex/OpenCode receive Paseo `outputSchema`; other providers use Markdown-only prompts. Invalid structured responses fall back to the existing parser, and the UI consumes the same sections either way. |
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
@@ -104,12 +104,13 @@ flowchart LR
 ```
 
 
-- **index.client.tsx** is the Paseo 0.10 client runtime entry — it registers both Review Deck panels, Command Center items, the `/review-deck` slash command, legacy and ReviewBatch timeline renderers, Review defaults screen, and subscription-backed workspace header / Agent composer entries.
+- **index.client.tsx** is the Paseo 0.10 client runtime entry — it registers Review Deck and queue/targeted-review panels, Command Center items, `/review-deck`, handoff / batch / AI-review timeline renderers, Review defaults, a workspace status popover, and subscription-backed Agent composer menus.
 - **index.server.ts** is the Paseo 0.10 server runtime entry — it retains the settings handle, constructs `ReviewService`, registers RPC and `agent.turn_started` / `agent.turn_ended` lifecycle handlers, and starts maintenance; cleanup removes both hooks and stops maintenance.
 - **client/** owns presentation and intent only — every mutation goes through an RPC.
 - **shared/review.ts** is the single source of truth for review RPC request/response shapes (zod), imported by both sides.
 - **shared/review-batch.ts** defines ReviewBatch state and the strict `review-deck-batch` v1 timeline payload. The stable timeline item id replaces one row as status changes; the data includes only workspace ID, status, outcome counts, and timestamps.
 - **shared/review-handoff.ts** retains the version-1 `review-deck-handoff` renderer for older timeline rows; its content-minimal payload records only a positive comment count and ISO submission timestamp.
+- **shared/review-activity.ts** defines metadata-only workspace indicators, the on-demand working-tree summary, per-workspace read marking, and the strict `review-deck-ai-review` timeline payload. Badge refresh never parses Git; detailed block counts load only when the Header Popover opens.
 - **server/** composes small, injectable classes: `GitRunner` wraps Git invocations with output limits, `StateStore` validates and atomically migrates the v2 review envelope, `ReviewBatchStore` persists batch transitions in a strict versioned envelope, `DiffParser` provides the shared single-hunk body parser, `AnchorEngine` resolves anchors without auto-selecting ambiguity, and `ReviewService` orchestrates Git review and Agent batches.
 
 - **Agent updates are event-driven.** One owned agent subscription feeds the panel registry and composer pills; workspace activity and agent updates trigger fingerprint-only snapshot checks, with a 60-second fallback.
@@ -119,7 +120,7 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 
 ## Usage
 
-1. **Open the panel.** Use the workspace header's **Review** button, or from an Agent use the composer **Review** pill. The Command Center (**⌘K / Ctrl+K**) and `/review-deck` command remain available. Agent-context entries preselect that Agent as the review target.
+1. **Open the panel.** Use the workspace Header **Review** button for its status popover, then choose **Open Review Deck** or **Open Queue**. In an Agent composer, the **Review** Pill menu offers those actions plus **Run Targeted AI Review** and **Submit pending comments** when safe. The Command Center (**⌘K / Ctrl+K**) and `/review-deck` command remain available.
 2. **Pick a project and workspace.** Use the pickers at the top of the panel. Selecting a project or workspace brings that workspace to the Paseo foreground.
 3. **Browse and select the change.** Work through the changed files; each file shows its hunks with the exact diff next to the change details. Click a line number to select it; Shift-click extends a range on desktop, while compact layouts use two taps.
 4. **Leave a comment.** Save a comment against the selected line range, or leave the selection empty to keep the hunk-level anchor.
@@ -136,6 +137,8 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 - **Timeline rows are status records, not review content.** The `review-deck-batch` row updates by stable id and stores only workspace id, status, outcome counts, and timestamps; comment ids, text, paths, cwd, and patch content stay out of timeline data.
 - **Commit scopes are read-only.** Branch and commit scopes support commenting and feedback, but hunk rejection is available only for working-tree and staged changes.
 - **Agent availability depends on workspace.** Project batches need an eligible Agent in each target workspace; AI review and explain still use an Agent in the current workspace. Without a batch Agent, comments stay queued, while deterministic analysis and manual review remain available.
+- **Notifications are in-app only.** v1.7 uses Header/Pill badges, popovers, and Agent timeline summaries; Paseo exposes no generic plugin-generated OS push-notification API.
+- **Unread AI findings follow the one-hour run TTL.** Completed file/target finding counts stay unread across reloads until Review Deck opens for that workspace or the transient ReviewRun metadata expires. Opening a Queue-only panel does not mark findings read.
 
 ## Safety controls
 

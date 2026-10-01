@@ -29,6 +29,8 @@ await run(process.execPath, ["--experimental-strip-types", "tests/state-store.te
 await run(process.execPath, ["--experimental-strip-types", "tests/line-range-selection.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-prompt.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-cache.test.ts"]);
+await run(process.execPath, [tsc, "-p", "tests/tsconfig.git-runner.json"]);
+await run(process.execPath, ["node_modules/.cache/review-deck-git-runner-tests/tests/git-runner.test.js"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-run-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/structured-review.test.ts"]);

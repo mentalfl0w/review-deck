@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { detectLocale, makeT } from "./client/i18n";
+
 import type {
   PluginAgentPanelProps,
   PluginButtonContentProps,
@@ -12,6 +12,7 @@ import { ReviewDeckSettings } from "./client/ReviewDeckSettings";
 import { ReviewAiReviewTimelineItem, type ReviewAiReviewTimelineItemProps } from "./client/components/ReviewAiReviewTimelineItem";
 import { ReviewBatchTimelineItem, type ReviewBatchTimelineItemProps } from "./client/components/ReviewBatchTimelineItem";
 import { ReviewHeaderPopover } from "./client/components/ReviewHeaderPopover";
+import { ReviewPillMenu } from "./client/components/ReviewPillMenu";
 import { ReviewHandoffTimelineItem } from "./client/components/ReviewHandoffTimelineItem";
 import { groupProjectReviewComments, type WorkspaceDirectoryOwner } from "./client/project-review-workspaces";
 import { getAgentRegistry, USABLE_AGENT_STATUSES } from "./client/agent-registry";
@@ -263,13 +264,6 @@ export default function contribute(client: PluginClientContext) {
     });
   };
 
-  const entryT = makeT(detectLocale());
-  const entryLabels = {
-    openDeck: entryT("reviewBatchOpenReviewDeck"),
-    openQueue: entryT("reviewEntryOpenQueue"),
-    runTargeted: entryT("reviewEntryRunTargeted"),
-    submitComments: entryT("reviewEntrySubmitComments"),
-  };
   const entries = registerReviewEntries({
     client: {
       addHeaderButton: (contribution) => client.addHeaderButton(contribution),
@@ -291,12 +285,14 @@ export default function contribute(client: PluginClientContext) {
           />
         );
       },
+      createPillMenu: (actions) => function ReviewPillMenuContent(props: PluginButtonContentProps) {
+        return <ReviewPillMenu {...props} actions={actions} />;
+      },
     },
     paseo: client.paseo,
     registry,
     counts,
     statuses,
-    labels: entryLabels,
     submitPendingComments,
   });
 

@@ -6,10 +6,12 @@
  * version, or fails run validation raises ReviewRunStoreError and is left
  * byte-identical, so a damaged store is visible rather than quietly reset; only
  * ENOENT means "nothing stored yet". A run holds identifiers, the review mode,
- * the run status, the prompt/schema versions, and the non-content reviewer
- * metadata needed to rebuild the transient entry — never prompt text, diff
- * patches, review output, or cached result bodies, and the strict schema
- * rejects any document that tries to smuggle one in.
+ * the run status, the prompt/schema versions, the v1.7 completion/read metadata
+ * (completedAt, findingCount, highRiskFindingCount, readAt), and the
+ * non-content reviewer metadata needed to rebuild the transient entry — never
+ * prompt text, diff patches, review output, or cached result bodies, and the
+ * strict schema rejects any document that tries to smuggle one in. The v1.7
+ * keys are optional, so a document written before v1.7 loads unchanged.
  *
  * Writes are serialized per store instance and land through a same-directory
  * temp file renamed into place, so concurrent creates cannot lose entries and
@@ -334,6 +336,107 @@ try {
   assert.deepStrictEqual(await removals.list(), []);
   assert.deepStrictEqual(await readStore(removePath), { version: REVIEW_RUN_VERSION, runs: [] });
   assert.deepStrictEqual(await tempFiles(removePath), []);
+
+  // -------------------------------------------------------------------------
+  // 6b. v1.7 completion/read metadata is optional, strict, and content-free:
+  //     a terminal run may carry its completion time, its finding tally, and
+  //     the moment the user opened Review Deck for it, a pre-v1.7 document
+  //     still loads byte-identical, and malformed or contradictory metadata is
+  //     rejected without a write.
+  // -------------------------------------------------------------------------
+  const metadataPath = join(root, "metadata", "runs.json");
+  const metadata = store(metadataPath);
+  const completedAt = "2026-01-01T00:10:00.000Z";
+  const readAt = "2026-01-01T00:20:00.000Z";
+  const completedRun: ReviewRun = {
+    ...run("m-completed"),
+    status: "completed",
+    completedAt,
+    findingCount: 3,
+    highRiskFindingCount: 2,
+  };
+  assert.deepStrictEqual(await metadata.create(completedRun), completedRun);
+  assert.deepStrictEqual(await metadata.get("m-completed"), completedRun);
+  const readRun: ReviewRun = { ...completedRun, requestId: "m-read", readAt };
+  await metadata.create(readRun);
+  assert.deepStrictEqual(await metadata.get("m-read"), readRun);
+  // Zero findings are a valid tally (a clean review), and an abandoned run
+  // keeps the completion time and read mark it finished with.
+  const zeroRun: ReviewRun = { ...completedRun, requestId: "m-zero", findingCount: 0, highRiskFindingCount: 0 };
+  const abandonedRun: ReviewRun = { ...completedRun, requestId: "m-abandoned", status: "abandoned" };
+  await metadata.create(zeroRun);
+  await metadata.create(abandonedRun);
+  assert.deepStrictEqual(
+    (await metadata.list()).map((entry) => entry.requestId),
+    ["m-completed", "m-read", "m-zero", "m-abandoned"],
+  );
+  // A version-1 document written before v1.7 (no completion metadata) loads
+  // as-is and is left byte-identical.
+  const legacyPath = join(root, "legacy-v17", "runs.json");
+  await mkdir(dirname(legacyPath), { recursive: true });
+  const legacyDocument = JSON.stringify({
+    version: REVIEW_RUN_VERSION,
+    runs: [run("legacy-1"), cachedRun("legacy-2")],
+  });
+  await writeFile(legacyPath, legacyDocument, "utf8");
+  assert.deepStrictEqual(
+    (await store(legacyPath).list()).map((entry) => entry.requestId),
+    ["legacy-1", "legacy-2"],
+  );
+  assert.strictEqual(await readRaw(legacyPath), legacyDocument, "a pre-v1.7 document must stay byte-identical");
+
+  const beforeInvalidMetadata = await readRaw(metadataPath);
+  const invalidMetadata = [
+    { ...completedRun, requestId: "m-x", completedAt: "yesterday" },
+    { ...completedRun, requestId: "m-x", completedAt: 1767225600000 },
+    { ...completedRun, requestId: "m-x", findingCount: -1 },
+    { ...completedRun, requestId: "m-x", findingCount: 2.5 },
+    { ...completedRun, requestId: "m-x", findingCount: "3" },
+    { ...completedRun, requestId: "m-x", highRiskFindingCount: 9 },
+    { ...completedRun, requestId: "m-x", findingCount: 2, highRiskFindingCount: 3 },
+    { ...completedRun, requestId: "m-x", highRiskFindingCount: undefined },
+    { ...completedRun, requestId: "m-x", findingCount: undefined },
+    { ...completedRun, requestId: "m-x", readAt: "yesterday" },
+    { ...completedRun, requestId: "m-x", readAt: 123 },
+    // A run still in flight has neither a completion time nor a read mark.
+    { ...run("m-x"), completedAt },
+    { ...run("m-x"), readAt },
+    { ...run("m-x"), findingCount: 4 },
+    // Metadata only: a stamped run still rejects content keys outright.
+    { ...completedRun, requestId: "m-x", review: "SECRET REVIEW TEXT" },
+    { ...completedRun, requestId: "m-x", futureField: true },
+  ] as unknown as ReviewRun[];
+  for (const invalid of invalidMetadata) {
+    await assert.rejects(
+      metadata.create(invalid),
+      (error) => error instanceof ReviewRunStoreError && error.message.includes(metadataPath),
+      `create must reject invalid v1.7 metadata: ${JSON.stringify(invalid).slice(0, 80)}`,
+    );
+  }
+  assert.strictEqual(await readRaw(metadataPath), beforeInvalidMetadata, "an invalid stamp must not write");
+  assert.ok(!beforeInvalidMetadata.includes("SECRET"), "no review content may reach the store");
+
+  // update() stamps a terminal transition in one write, and the same
+  // contradictory stamps are refused there too.
+  const terminalTransition = await metadata.update("m-completed", (entry) => ({
+    ...entry,
+    status: "failed",
+    findingCount: 0,
+    highRiskFindingCount: 0,
+  }));
+  assert.deepStrictEqual(terminalTransition, {
+    ...completedRun,
+    status: "failed",
+    findingCount: 0,
+    highRiskFindingCount: 0,
+  });
+  const beforeInvalidStamp = await readRaw(metadataPath);
+  await assert.rejects(
+    metadata.update("m-read", (entry) => ({ ...entry, status: "abandoned", highRiskFindingCount: 4 })),
+    (error) => error instanceof ReviewRunStoreError && error.message.includes(metadataPath),
+  );
+  assert.strictEqual(await readRaw(metadataPath), beforeInvalidStamp);
+  assert.deepStrictEqual(await tempFiles(metadataPath), []);
 
   // -------------------------------------------------------------------------
   // 7. Fail closed: a malformed, unsupported, content-bearing, or duplicate-id

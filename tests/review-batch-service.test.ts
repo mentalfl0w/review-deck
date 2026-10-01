@@ -73,7 +73,28 @@ async function run(): Promise<void> {
       ["agent-c", lifecycleAgent("agent-c", "workspace-c", workspaceC)],
       ["agent-d", lifecycleAgent("agent-d", "workspace-d", workspaceD)],
     ]);
+    const workspaces = new Map([
+      ["workspace-a", { id: "workspace-a", projectId: PROJECT_ID, workspaceDirectory: workspaceA, archivingAt: null }],
+      ["workspace-b", { id: "workspace-b", projectId: PROJECT_ID, workspaceDirectory: workspaceB, archivingAt: null }],
+      ["workspace-c", { id: "workspace-c", projectId: PROJECT_ID, workspaceDirectory: workspaceC, archivingAt: null }],
+      ["workspace-d", { id: "workspace-d", projectId: PROJECT_ID, workspaceDirectory: workspaceD, archivingAt: null }],
+      ["workspace-shared", { id: "workspace-shared", projectId: PROJECT_ID, workspaceDirectory: workspaceA, archivingAt: null }],
+    ]);
     const paseo = {
+      workspaces: {
+        ref(workspaceId: string) {
+          const workspace = workspaces.get(workspaceId);
+          if (!workspace) throw new Error(`Unknown fake workspace: ${workspaceId}`);
+          return {
+            refresh: async () => workspace,
+            current: () => workspace,
+          };
+        },
+        list: async ({ filter }: { filter: { projectId: string } }) => ({
+          entries: [...workspaces.values()].filter((workspace) => workspace.projectId === filter.projectId),
+          pageInfo: { hasMore: false },
+        }),
+      },
       agents: {
         ref(agentId: string) {
           const agent = agents.get(agentId);
@@ -396,6 +417,27 @@ async function run(): Promise<void> {
     assert.deepEqual(timedOutBatch?.outcomes, { "comment-c1": "unresolved" });
     assert.ok(afterStartTimeout?.comments.some((entry) => entry.id === "comment-c1"));
     assert.deepEqual(afterStartTimeout?.batches, [], "a submitted batch that never starts releases its claim after the grace period");
+    // A single eligible Agent cannot claim a cwd shared by another workspace.
+    const legacyEntry: StateEntry = { ...commentEntry("legacy-shared", "workspace-a", workspaceA), workspaceId: undefined };
+    const stateAfterSetup = await stateStore.load();
+    stateAfterSetup["target-legacy-shared"] = [legacyEntry];
+    await stateStore.save(stateAfterSetup);
+    const batchesBeforeAmbiguousLegacy = await batchStore.listByProject(PROJECT_ID);
+    await assert.rejects(
+      () => service.processProjectReview({
+        projectId: PROJECT_ID,
+        agentId: "agent-a",
+        workspaceId: "workspace-a",
+        workspaceCwd: workspaceA,
+        commentIds: ["legacy-shared"],
+      }, handlerContext),
+      /Legacy comment workspace ownership is ambiguous/,
+    );
+    assert.equal(
+      (await batchStore.listByProject(PROJECT_ID)).length,
+      batchesBeforeAmbiguousLegacy.length,
+      "ambiguous legacy ownership is rejected before creating a ReviewBatch",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

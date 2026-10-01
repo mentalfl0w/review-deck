@@ -42,6 +42,13 @@ import {
   type ReviewBatch,
   type ReviewCommentOutcome,
 } from "../shared/review-batch";
+import {
+  reviewAiTimelineKind,
+  reviewAiTimelineSchema,
+  reviewAiTimelineVersion,
+  type ReviewWorkspaceIndicators,
+  type WorkspaceReviewSummary,
+} from "../shared/review-activity";
 import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
 import {
   buildLineRangeAnchor,
@@ -116,6 +123,36 @@ function isActiveReviewBatch(status: ReviewBatch["status"]): boolean {
 function isOrphanedReviewBatch(batch: ReviewBatch): boolean {
   return batch.status === "failed" &&
     batch.commentIds.every((commentId) => batch.outcomes[commentId] === "unresolved");
+}
+
+/** Finding tally of one AI review result, as the run record and the timeline
+ * row report it. */
+type AiReviewFindingCounts = {
+  findingCount: number;
+  highRiskFindingCount: number;
+};
+
+/**
+ * Count the findings of a terminal AI review from the source-neutral UI
+ * sections: one section entry is one finding, which is exactly what the panel
+ * lists for the same result. A structured result carries one entry per
+ * validated finding, and its entries start with the normalized
+ * `**SEVERITY · category**` marker, so critical/high findings are counted
+ * exactly; a Markdown fallback has no machine-readable severity and therefore
+ * reports zero high-risk findings instead of guessing from prose.
+ */
+function countSectionFindings(sections: ReviewSections): AiReviewFindingCounts {
+  const entries = [
+    ...sections.verifiedFacts,
+    ...sections.aiInference,
+    ...sections.humanVerificationRecommended,
+  ];
+  return {
+    findingCount: entries.length,
+    // The normalized structured finding marker is `**SEVERITY · category**`,
+    // so this only matches a severity the structured result actually assigned.
+    highRiskFindingCount: entries.filter((entry) => /^\*\*(?:CRITICAL|HIGH) · /.test(entry.trimStart())).length,
+  };
 }
 
 function emptyReviewSections(): ReviewSections {
@@ -1412,6 +1449,312 @@ export class ReviewService {
   }
 
   /**
+   * The workspace binding every v1.7 activity RPC starts from: the project the
+   * workspace belongs to and the directory its reviews run in, both resolved
+   * from Paseo instead of trusted from the caller. Fails closed when the
+   * workspace cannot be resolved, answers for a different id, or declares no
+   * project/directory of its own, so a stale, archived, or forged workspace id
+   * can never report or mark another workspace's activity.
+   */
+  private async resolveWorkspaceIdentity(
+    workspaceId: string,
+    context: PluginHandlerContext,
+  ): Promise<{ workspaceId: string; projectId: string; directory: string }> {
+    const handle = context.paseo.workspaces.ref(workspaceId);
+    let workspace: {
+      id?: string;
+      projectId?: string | null;
+      workspaceDirectory?: string | null;
+      archivingAt?: string | null;
+    } | null | undefined;
+    try {
+      workspace = (await handle.refresh()) ?? handle.current();
+    } catch {
+      workspace = handle.current();
+    }
+    if (!workspace) {
+      throw new Error(
+        `Workspace ${workspaceId} does not exist; refusing to report Review Deck activity for an unknown workspace.`,
+      );
+    }
+    if (workspace.id !== undefined && workspace.id !== workspaceId) {
+      throw new Error(
+        `Workspace ${workspaceId} resolved to workspace ${workspace.id}; refusing to report mismatched Review Deck activity.`,
+      );
+    }
+    if (typeof workspace.archivingAt === "string" && workspace.archivingAt.length > 0) {
+      throw new Error(
+        `Workspace ${workspaceId} is being archived; refusing to report Review Deck activity for it.`,
+      );
+    }
+    const projectId = typeof workspace.projectId === "string" && workspace.projectId.length > 0
+      ? workspace.projectId
+      : null;
+    const directory = typeof workspace.workspaceDirectory === "string" && workspace.workspaceDirectory.length > 0
+      ? workspace.workspaceDirectory
+      : null;
+    if (!projectId || !directory) {
+      throw new Error(
+        `Workspace ${workspaceId} declares no project and directory; refusing to report Review Deck activity for it.`,
+      );
+    }
+    return { workspaceId, projectId, directory };
+  }
+
+  /**
+   * Count one workspace's queued review comments without ever building a
+   * comment row: the queue predicate is the same one the project list uses
+   * (projectId + commented + non-blank body), and the workspace binding is the
+   * comment's recorded workspaceId. The pending counter and the stale counter
+   * are disjoint action categories — a comment whose stored anchor is stale or
+   * ambiguous counts as stale, every other comment counts as pending — so
+   * pending + stale is the raw queued total and the header can show both
+   * without double counting. A legacy comment saved before v1.4 recorded a
+   * workspaceId belongs to this workspace only when its recorded cwd is the
+   * workspace directory and this workspace is the project's sole owner of that
+   * directory — never when the directory is shared, so one comment can never be
+   * counted into two workspaces. The counters carry bodies nowhere: the strings
+   * are inspected inside this method and discarded with it.
+   */
+  private async countWorkspaceReviewComments(
+    file: StateFile,
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<{
+    projectPendingCommentCount: number;
+    projectStaleCommentCount: number;
+    workspacePendingCommentCount: number;
+    workspaceStaleCommentCount: number;
+  }> {
+    let projectPendingCommentCount = 0;
+    let projectStaleCommentCount = 0;
+    let workspacePendingCommentCount = 0;
+    let workspaceStaleCommentCount = 0;
+    // Resolved at most once per call, and only when a legacy row is actually
+    // considered, so a store without legacy rows pays no workspace-list read.
+    let legacyAssignable: boolean | null = null;
+    for (const entries of Object.values(file)) {
+      for (const entry of entries) {
+        if (this.projectCommentBody(entry, identity.projectId) === null) continue;
+        // Pending and stale are disjoint: a comment whose stored resolution
+        // could not attach to a hunk (stale or ambiguous) is a stale item, and
+        // every other queued comment is a pending item.
+        const stale = entry.anchorState === "stale" || entry.anchorState === "ambiguous";
+        if (stale) projectStaleCommentCount += 1;
+        else projectPendingCommentCount += 1;
+        let inWorkspace: boolean;
+        if (entry.workspaceId !== undefined) {
+          inWorkspace = entry.workspaceId === identity.workspaceId;
+        } else if (entry.cwd === undefined) {
+          inWorkspace = false;
+        } else {
+          if (legacyAssignable === null) {
+            legacyAssignable = await this.legacyCommentsBelongToWorkspace(identity, context);
+          }
+          inWorkspace = legacyAssignable && await this.directoriesMatch(entry.cwd, identity.directory);
+        }
+        if (!inWorkspace) continue;
+        if (stale) workspaceStaleCommentCount += 1;
+        else workspacePendingCommentCount += 1;
+      }
+    }
+    return {
+      projectPendingCommentCount,
+      projectStaleCommentCount,
+      workspacePendingCommentCount,
+      workspaceStaleCommentCount,
+    };
+  }
+
+  /**
+   * Whether this workspace is the project's sole owner of its directory — the
+   * only case in which a legacy comment (saved before v1.4 recorded a
+   * workspaceId) may be counted as this workspace's. Resolved from Paseo in one
+   * unpaged list: a failed list, a truncated page, or a second listed
+   * workspace resolving to the same directory all keep legacy comments
+   * project-scoped instead of guessing a workspace.
+   */
+  private async legacyCommentsBelongToWorkspace(
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<boolean> {
+    let listed: {
+      entries: ReadonlyArray<{ id: string; workspaceDirectory?: string }>;
+      pageInfo: { hasMore: boolean };
+    };
+    try {
+      listed = await context.paseo.workspaces.list({ filter: { projectId: identity.projectId } });
+    } catch {
+      return false;
+    }
+    if (listed.pageInfo.hasMore) return false;
+    const owners: string[] = [];
+    for (const workspace of listed.entries) {
+      if (!workspace.workspaceDirectory) continue;
+      if (!(await this.directoriesMatch(workspace.workspaceDirectory, identity.directory))) continue;
+      owners.push(workspace.id);
+    }
+    return owners.length === 1 && owners[0] === identity.workspaceId;
+  }
+
+  /**
+   * Metadata-only activity of one workspace: queued comment counts (project
+   * and workspace scoped), stored stale/ambiguous anchor counts, in-flight
+   * batches, running AI review runs, and the findings of completed runs the
+   * user has not opened Review Deck for yet. Pending and stale are disjoint
+   * action categories — pending + stale is the raw queued total — and the
+   * header can therefore show both without double counting. Reads no Git state
+   * — the detailed summary owns that — so the header badge stays cheap, and
+   * stale counts come from the states the last resolution stored.
+   */
+  async getWorkspaceReviewIndicators(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewWorkspaceIndicators> {
+    return this.workspaceReviewIndicators(await this.resolveWorkspaceIdentity(input.workspaceId, context), context);
+  }
+
+  private async workspaceReviewIndicators(
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewWorkspaceIndicators> {
+    const [file, batches, runs] = await Promise.all([
+      this.store.load(),
+      this.reviewBatchStore.list(),
+      this.reviewRunStore.list(),
+    ]);
+    const commentCounts = await this.countWorkspaceReviewComments(file, identity, context);
+    return {
+      workspaceId: identity.workspaceId,
+      projectId: identity.projectId,
+      ...commentCounts,
+      activeBatchCount: batches.filter(
+        (batch) => batch.workspaceId === identity.workspaceId && isActiveReviewBatch(batch.status),
+      ).length,
+      runningAiReviewCount: runs.filter(
+        (run) => run.workspaceId === identity.workspaceId && run.status === "running",
+      ).length,
+      unreadAiFindingCount: runs.reduce(
+        (total, run) => run.workspaceId === identity.workspaceId &&
+          run.mode !== "hunk" &&
+          run.status === "completed" &&
+          run.readAt === undefined
+          ? total + (run.findingCount ?? 0)
+          : total,
+        0,
+      ),
+    };
+  }
+
+  /**
+   * The detailed popover summary: the indicators plus the reviewed/total block
+   * counts of the workspace's default working-tree snapshot. The anchors of
+   * that snapshot are refreshed first — resolving entries against the current
+   * working tree exactly like the panel does, migrating and re-stating what
+   * resolves — so the stale/ambiguous counts describe the current target
+   * instead of the last stored resolution, and a block counts as reviewed when
+   * it carries a saved decision, the same mark the panel shows. A workspace
+   * whose working tree cannot be resolved fails closed rather than reporting
+   * fabricated progress.
+   */
+  async getWorkspaceReviewSummary(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<WorkspaceReviewSummary> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    const snapshot = await this.createSnapshot({ cwd: identity.directory, scope: "working" });
+    const currentHunks: ReviewStateCurrentHunk[] = snapshot.files.flatMap((file) =>
+      file.hunks.map((hunk) => ({
+        hunkId: hunk.id,
+        filePath: hunk.filePath,
+        ...(file.oldPath !== undefined ? { oldPath: file.oldPath } : {}),
+        hunkHeader: hunk.header,
+        hunkPatch: hunk.patch,
+      })),
+    );
+    const resolved = await this.reviewState({
+      targetFingerprint: snapshot.targetFingerprint,
+      currentHunks,
+      request: { cwd: identity.directory, scope: "working" },
+      projectId: identity.projectId,
+      workspaceId: identity.workspaceId,
+    });
+    const indicators = await this.workspaceReviewIndicators(identity, context);
+    const currentHunkIds = new Set(currentHunks.map((hunk) => hunk.hunkId));
+    const constraints: OwnershipConstraints = {
+      projectId: identity.projectId,
+      workspaceId: identity.workspaceId,
+      cwd: identity.directory,
+      scope: "working",
+    };
+    const targetEntries = (await this.store.load())[snapshot.targetFingerprint] ?? [];
+    let legacyDirectoryOwner: boolean | null = null;
+    const ownedCurrentHunkIds = new Set<string>();
+    for (const entry of targetEntries) {
+      if (ownershipMismatch(entry, constraints) !== null) continue;
+      if (entry.workspaceId === undefined) {
+        if (!entry.cwd) continue;
+        if (legacyDirectoryOwner === null) {
+          legacyDirectoryOwner = await this.legacyCommentsBelongToWorkspace(identity, context);
+        }
+        if (!legacyDirectoryOwner || !(await this.directoriesMatch(entry.cwd, identity.directory))) continue;
+      }
+      if (currentHunkIds.has(entry.hunkId)) ownedCurrentHunkIds.add(entry.hunkId);
+    }
+    const reviewedHunkIds = new Set(
+      resolved.decisions
+        .map((decision) => decision.hunkId)
+        .filter((hunkId) => currentHunkIds.has(hunkId) && ownedCurrentHunkIds.has(hunkId)),
+    );
+    return {
+      ...indicators,
+      reviewedBlockCount: reviewedHunkIds.size,
+      totalBlockCount: snapshot.totalHunks,
+    };
+  }
+
+  /**
+   * Opening the deck: every completed file or target run of the workspace that
+   * reported at least one finding and has not been read yet is stamped with one
+   * readAt, and the answer counts the runs this call actually transitioned.
+   * Hunk explanations carry no tally and runs with nothing to read are left
+   * alone, so the mark only ever covers what the unread counter reported. Each
+   * run goes through its own ReviewRunStore update, so the check and the write
+   * are a single atomic read-modify-write — a concurrent opening that loses the
+   * race observes the stored readAt and leaves it alone instead of counting the
+   * run twice.
+   */
+  async markWorkspaceReviewResultsRead(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<{ markedRunCount: number }> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    const runs = await this.reviewRunStore.list();
+    const readAt = new Date().toISOString();
+    let markedRunCount = 0;
+    for (const run of runs) {
+      if (
+        run.workspaceId !== identity.workspaceId ||
+        run.mode === "hunk" ||
+        run.status !== "completed" ||
+        run.readAt !== undefined ||
+        (run.findingCount ?? 0) <= 0
+      ) continue;
+      const updated = await this.reviewRunStore.update(run.requestId, (current) =>
+        current.workspaceId === identity.workspaceId &&
+          current.mode !== "hunk" &&
+          current.status === "completed" &&
+          (current.findingCount ?? 0) > 0 &&
+          current.readAt === undefined
+          ? { ...current, readAt }
+          : current,
+      );
+      if (updated?.readAt === readAt) markedRunCount += 1;
+    }
+    return { markedRunCount };
+  }
+
+  /**
    * Submit exactly one workspace's selected comments. Their records remain in
    * the queue until the matching Agent turn explicitly reports COMPLETED.
    */
@@ -1428,6 +1771,13 @@ export class ReviewService {
     const requestedIds = new Set(input.commentIds);
     if (requestedIds.size !== input.commentIds.length) {
       throw new Error("A ReviewBatch cannot contain duplicate comment ids.");
+    }
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    if (identity.projectId !== input.projectId) {
+      throw new Error(`Project ${input.projectId} does not belong to workspace ${input.workspaceId}.`);
+    }
+    if (!(await this.directoriesMatch(identity.directory, input.workspaceCwd))) {
+      throw new Error(`Workspace ${input.workspaceId} does not own directory ${input.workspaceCwd}.`);
     }
 
     // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
@@ -1459,6 +1809,10 @@ export class ReviewService {
       .filter((comment) => requestedIds.has(comment.id));
     if (comments.length !== requestedIds.size) {
       throw new Error("One or more selected project comments are no longer in the queue. Refresh the queue and retry.");
+    }
+    const hasLegacyComments = comments.some((comment) => comment.workspaceId === undefined);
+    if (hasLegacyComments && !(await this.legacyCommentsBelongToWorkspace(identity, context))) {
+      throw new Error("Legacy comment workspace ownership is ambiguous; refusing to submit this batch.");
     }
     for (const comment of comments) {
       if (comment.workspaceId !== undefined && comment.workspaceId !== input.workspaceId) {
@@ -2370,6 +2724,93 @@ export class ReviewService {
   }
 
   /**
+   * Stamp a terminal AI review result onto its stored run in one
+   * ReviewRunStore update: the terminal status, the completion time, and — for
+   * a completed file or target review — the finding tally. A hunk explanation
+   * is an inline answer rather than a review result, so it keeps the status and
+   * completion time but never a tally; that is what keeps it out of unread
+   * findings. A cached run is already completed and is stamped once on its
+   * first poll; a run that already carries its completion time is returned
+   * unchanged, so repeated polls can never move the timestamp. Returns null
+   * when the store cannot be written — the polled result is returned either
+   * way, so a damaged store never hides a finished review.
+   */
+  private async recordReviewRunCompletion(
+    requestId: string,
+    completion: { status: "completed" | "failed" } & AiReviewFindingCounts & { completedAt: string },
+  ): Promise<ReviewRun | null> {
+    try {
+      return await this.reviewRunStore.update(requestId, (current) => {
+        const tally: Partial<AiReviewFindingCounts> =
+          completion.status === "completed" && current.mode !== "hunk"
+            ? { findingCount: completion.findingCount, highRiskFindingCount: completion.highRiskFindingCount }
+            : {};
+        if (current.status === "running") {
+          return { ...current, status: completion.status, completedAt: completion.completedAt, ...tally };
+        }
+        if (current.status === completion.status && current.completedAt === undefined) {
+          return { ...current, completedAt: completion.completedAt, ...tally };
+        }
+        return current;
+      });
+    } catch (error) {
+      console.error(`[Review Deck] Could not persist terminal ReviewRun ${requestId}; returning its result.`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Append or update the stable v1.7 AI review row on the parent Agent's
+   * timeline. The payload is counts, status, usage, mode/depth, the workspace
+   * id, and the completion time — never the review text, findings, file paths,
+   * patches, or comment ids. The row id is keyed by request id, so a repeated
+   * poll (or a recovered run) re-appends the same row in place, and hunk
+   * explanations are skipped because the row's contract covers whole file and
+   * target reviews. An append failure is logged and swallowed: the AI result
+   * itself is already persisted and is about to be returned.
+   */
+  private async appendAiReviewTimeline(
+    input: {
+      requestId: string;
+      workspaceId: string;
+      parentAgentId: string;
+      mode: AiReviewMode;
+      status: "completed" | "failed";
+      resultSource: AiReviewResultSource;
+      depth?: AiReviewDepth;
+      usage?: AiReviewUsage;
+      completedAt: string;
+    } & AiReviewFindingCounts,
+    context: PluginHandlerContext,
+  ): Promise<void> {
+    const mode = input.mode;
+    if (mode === "hunk") return;
+    const data = reviewAiTimelineSchema.safeParse({
+      workspaceId: input.workspaceId,
+      mode,
+      status: input.status,
+      findingCount: input.findingCount,
+      highRiskFindingCount: input.highRiskFindingCount,
+      resultSource: input.resultSource,
+      ...(input.depth !== undefined ? { depth: input.depth } : {}),
+      ...(input.usage !== undefined ? { usage: input.usage } : {}),
+      completedAt: input.completedAt,
+    });
+    if (!data.success) return;
+    try {
+      await context.paseo.agents.ref(input.parentAgentId).timeline.append({
+        type: "plugin",
+        id: `${reviewAiTimelineKind}:${input.requestId}`,
+        kind: reviewAiTimelineKind,
+        version: reviewAiTimelineVersion,
+        data: data.data,
+      });
+    } catch (error) {
+      console.error(`review-deck: could not update the timeline row for AI review ${input.requestId}`, error);
+    }
+  }
+
+  /**
    * Polls a one-shot reviewer. Cache hits use the same request capability and
    * result contract as fresh runs; fresh runs preserve status and token usage.
    */
@@ -2438,6 +2879,25 @@ export class ReviewService {
       };
     }
     if (entry.cachedResult) {
+      const findingCounts = countSectionFindings(entry.cachedResult.sections);
+      const completedAt = new Date().toISOString();
+      const stored = await this.recordReviewRunCompletion(input.requestId, {
+        status: "completed",
+        completedAt,
+        ...findingCounts,
+      });
+      await this.appendAiReviewTimeline({
+        requestId: input.requestId,
+        workspaceId: entry.workspaceId,
+        parentAgentId: entry.agentId,
+        mode: entry.mode,
+        status: "completed",
+        resultSource: entry.resultSource,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.cachedResult.usage ? { usage: entry.cachedResult.usage } : {}),
+        completedAt: stored?.completedAt ?? completedAt,
+        ...findingCounts,
+      }, context);
       return {
         status: "idle",
         review: entry.cachedResult.review,
@@ -2554,14 +3014,28 @@ export class ReviewService {
         // A successful review remains usable even when the optional cache is unavailable.
       }
     }
-    const nextStatus: ReviewRun["status"] = result.status === "idle" ? "completed" : "failed";
-    try {
-      await this.reviewRunStore.update(input.requestId, (current) =>
-        current.status === "running" ? { ...current, status: nextStatus } : current,
-      );
-    } catch (error) {
-      console.error(`[Review Deck] Could not persist terminal ReviewRun ${input.requestId}; returning its result.`, error);
-    }
+    const nextStatus: "completed" | "failed" = result.status === "idle" ? "completed" : "failed";
+    const findingCounts = nextStatus === "completed"
+      ? countSectionFindings(sections)
+      : { findingCount: 0, highRiskFindingCount: 0 };
+    const completedAt = new Date().toISOString();
+    const stored = await this.recordReviewRunCompletion(input.requestId, {
+      status: nextStatus,
+      completedAt,
+      ...findingCounts,
+    });
+    await this.appendAiReviewTimeline({
+      requestId: input.requestId,
+      workspaceId: entry.workspaceId,
+      parentAgentId: entry.agentId,
+      mode: entry.mode,
+      status: nextStatus,
+      resultSource: entry.resultSource,
+      ...(entry.depth ? { depth: entry.depth } : {}),
+      ...(usage ? { usage } : {}),
+      completedAt: stored?.completedAt ?? completedAt,
+      ...findingCounts,
+    }, context);
     if (result.status === "idle") {
       entry.cachedResult = {
         review,

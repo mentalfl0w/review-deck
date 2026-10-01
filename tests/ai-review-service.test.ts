@@ -8,6 +8,8 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { ReviewService } from "../server/ReviewService";
 import { ReviewRunStore, type ReviewRun } from "../server/persistence/ReviewRunStore";
 import { AiReviewCacheStore } from "../server/persistence/AiReviewCacheStore";
+import { ReviewBatchStore } from "../server/persistence/ReviewBatchStore";
+import { StateStore } from "../server/persistence/StateStore";
 import type { ReviewRequest } from "../shared/review";
 import type { ReviewDeckSettingsHandle } from "../shared/review-settings";
 
@@ -51,6 +53,7 @@ async function run(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "review-deck-ai-review-"));
   let cachePath: string | undefined;
   let runStorePath: string | undefined;
+  const activityPaths: string[] = [];
   try {
     git(root, "init", "-q");
     git(root, "config", "user.name", "Review Deck Test");
@@ -104,6 +107,23 @@ async function run(): Promise<void> {
       autoArchive?: boolean;
     }> = [];
     const responseQueue: string[] = [];
+    const waitStatusQueue: Array<"idle" | "error" | "permission" | "timeout"> = [];
+    const timelineAppends: Array<{
+      agentId: string;
+      item: { id?: string; kind: string; version: number; data: Record<string, unknown> };
+    }> = [];
+    let failNextTimelineAppend = false;
+    let workspaceRecord: {
+      id: string;
+      projectId: string;
+      workspaceDirectory: string;
+      archivingAt?: string | null;
+    } | null = { id: "workspace-1", projectId: "project-1", workspaceDirectory: root };
+    let workspaceListEntries: Array<{ id: string; workspaceDirectory?: string }> = [
+      { id: "workspace-1", workspaceDirectory: root },
+    ];
+    let failWorkspaceList = false;
+    let workspaceListPageHasMore = false;
     const parentAgent = () => ({
       id: "parent-agent",
       workspaceId: parentWorkspaceId,
@@ -141,7 +161,21 @@ async function run(): Promise<void> {
         agents: {
           ref: (agentId: string) => {
             if (agentId === "parent-agent") {
-              return { id: agentId, current: parentAgent, refresh: async () => ({ agent: parentAgent() }) };
+              return {
+                id: agentId,
+                current: parentAgent,
+                refresh: async () => ({ agent: parentAgent() }),
+                timeline: {
+                  append: async (item: { id?: string; kind: string; version: number; data: Record<string, unknown> }) => {
+                    if (failNextTimelineAppend) {
+                      failNextTimelineAppend = false;
+                      throw new Error("simulated timeline append failure");
+                    }
+                    timelineAppends.push({ agentId, item });
+                    return { seq: timelineAppends.length, epoch: "epoch-1" };
+                  },
+                },
+              };
             }
             return children.get(agentId)?.handle;
           },
@@ -180,7 +214,7 @@ async function run(): Promise<void> {
               current: () => agent,
               refresh: async () => ({ agent, project: null }),
               waitForFinish: async () => ({
-                status: "idle" as const,
+                status: waitStatusQueue.shift() ?? ("idle" as const),
                 error: null,
                 lastMessage: responseQueue.shift() ?? RESPONSE,
                 final: { lastUsage: USAGE },
@@ -197,7 +231,18 @@ async function run(): Promise<void> {
           },
         },
         workspaces: {
-          ref: () => ({ current: () => ({ workspaceDirectory: root }), refresh: async () => ({ workspaceDirectory: root }) }),
+          ref: (workspaceId: string) => ({
+            current: () => workspaceRecord,
+            refresh: async () => workspaceRecord,
+          }),
+          list: async () => {
+            if (failWorkspaceList) throw new Error("simulated workspace list failure");
+            return {
+              requestId: "workspace-list-request",
+              entries: workspaceListEntries,
+              pageInfo: { nextCursor: null, prevCursor: null, hasMore: workspaceListPageHasMore },
+            };
+          },
         },
         providers: {
           snapshot: async () => ({ entries: providerEntries }),
@@ -604,10 +649,424 @@ async function run(): Promise<void> {
     } finally {
       console.error = previousReadError;
     }
+    // -----------------------------------------------------------------------
+    // v1.7 workspace activity: Paseo-derived binding, count-only metadata,
+    // refreshed anchor states in the detailed summary, and the read transition
+    // -----------------------------------------------------------------------
+    const activityStatePath = join(tmpdir(), `review-deck-activity-state-${randomUUID()}.json`);
+    const activityBatchPath = join(tmpdir(), `review-deck-activity-batches-${randomUUID()}.json`);
+    const activityRunPath = join(tmpdir(), `review-deck-activity-runs-${randomUUID()}.json`);
+    activityPaths.push(activityStatePath, activityBatchPath, activityRunPath);
+    const activityStateStore = new StateStore(activityStatePath);
+    const activityBatchStore = new ReviewBatchStore(activityBatchPath);
+    const activityRunStore = new ReviewRunStore(activityRunPath);
+    const activityService = new ReviewService({
+      settings: settings as unknown as ReviewDeckSettingsHandle,
+      store: activityStateStore,
+      aiReviewCacheStore: cacheStore,
+      reviewBatchStore: activityBatchStore,
+      reviewRunStore: activityRunStore,
+    });
+
+    // A third changed file keeps three distinct current hunks available.
+    await writeFile(join(root, "c.ts"), "export const c = 1;\nexport const ACTIVITY_SENTINEL = 2;\n");
+    const activitySnapshot = await activityService.createSnapshot({ cwd: root, scope: "working" });
+    const activityHunks = activitySnapshot.files.flatMap((file) => file.hunks);
+    assert.equal(activityHunks.length, activitySnapshot.totalHunks);
+    assert.ok(activityHunks.length >= 3, "the activity fixtures need three current hunks");
+    const [hunkA, hunkB, hunkC] = activityHunks;
+
+    const seedComment = async (input: {
+      hunkId: string;
+      hunkFingerprint: string;
+      filePath: string;
+      hunkHeader: string;
+      hunkPatch: string;
+      targetFingerprint: string;
+      comment?: string;
+      workspaceId?: string;
+      decision?: "reviewed" | "commented";
+    }): Promise<void> => {
+      await activityService.recordDecision({
+        projectId: "project-1",
+        cwd: root,
+        targetFingerprint: input.targetFingerprint,
+        hunkId: input.hunkId,
+        hunkFingerprint: input.hunkFingerprint,
+        filePath: input.filePath,
+        hunkHeader: input.hunkHeader,
+        hunkPatch: input.hunkPatch,
+        decision: input.decision ?? "commented",
+        scope: "working",
+        ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
+        ...(input.comment !== undefined ? { comment: input.comment } : {}),
+      });
+    };
+    const seedHunkComment = (hunk: typeof hunkA, input: {
+      targetFingerprint: string;
+      comment?: string;
+      workspaceId?: string;
+      decision?: "reviewed" | "commented";
+    }): Promise<void> => seedComment({
+      hunkId: hunk.id,
+      hunkFingerprint: hunk.fingerprint,
+      filePath: hunk.filePath,
+      hunkHeader: hunk.header,
+      hunkPatch: hunk.patch,
+      ...input,
+    });
+    // A/B/E belong to the workspace's current working target; C is another
+    // workspace's comment in a different target; D is a legacy row without a
+    // workspaceId whose stored anchor no longer exists anywhere.
+    await seedHunkComment(hunkA, { targetFingerprint: activitySnapshot.targetFingerprint, comment: "A WORKSPACE COMMENT", workspaceId: "workspace-1" });
+    await seedHunkComment(hunkB, { targetFingerprint: activitySnapshot.targetFingerprint, comment: "B WORKSPACE COMMENT", workspaceId: "workspace-1" });
+    await seedHunkComment(hunkC, { targetFingerprint: activitySnapshot.targetFingerprint, workspaceId: "workspace-1", decision: "reviewed" });
+    await seedHunkComment(hunkC, { targetFingerprint: "c-foreign-target", comment: "C FOREIGN COMMENT", workspaceId: "workspace-2" });
+    await seedComment({
+      hunkId: "legacy-hunk",
+      hunkFingerprint: "legacy-hunk-fingerprint",
+      filePath: "legacy.ts",
+      hunkHeader: "@@ -1 +1 @@",
+      hunkPatch: "@@ -1 +1 @@\n-old legacy line\n+new legacy line\n",
+      targetFingerprint: "d-legacy-target",
+      comment: "D LEGACY COMMENT",
+    });
+    const seededState = await activityStateStore.load();
+    for (const entries of Object.values(seededState)) {
+      for (const entry of entries) {
+        if (entry.comment === "A WORKSPACE COMMENT") entry.anchorState = "stale";
+        if (entry.comment === "C FOREIGN COMMENT") entry.anchorState = "ambiguous";
+        if (entry.comment === "D LEGACY COMMENT") entry.anchorState = "stale";
+      }
+    }
+    await activityStateStore.save(seededState);
+
+    await activityBatchStore.create({
+      id: "activity-batch-active",
+      createdAt: new Date().toISOString(),
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      agentId: "parent-agent",
+      commentIds: ["activity-comment-active"],
+      status: "draft",
+      outcomes: {},
+    });
+    await activityBatchStore.create({
+      id: "activity-batch-other",
+      createdAt: new Date().toISOString(),
+      projectId: "project-1",
+      workspaceId: "workspace-2",
+      agentId: "other-agent",
+      commentIds: ["activity-comment-other"],
+      status: "submitted",
+      submittedAt: new Date().toISOString(),
+      outcomes: {},
+    });
+    await activityBatchStore.create({
+      id: "activity-batch-done",
+      createdAt: new Date().toISOString(),
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      agentId: "parent-agent",
+      commentIds: ["activity-comment-done"],
+      status: "completed",
+      submittedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      outcomes: { "activity-comment-done": "completed" },
+    });
+
+    const seedRun = (input: {
+      requestId: string;
+      status: "running" | "completed" | "failed";
+      workspaceId?: string;
+      findingCount?: number;
+      highRiskFindingCount?: number;
+      readAt?: string;
+    }): Promise<ReviewRun> => activityRunStore.create({
+      requestId: input.requestId,
+      childAgentId: input.status === "completed" ? "activity-review-child" : null,
+      parentAgentId: "parent-agent",
+      workspaceId: input.workspaceId ?? "workspace-1",
+      cacheKey: `activity-cache-${input.requestId}`,
+      mode: "file",
+      status: input.status,
+      resultSource: "fresh",
+      startedAt: new Date().toISOString(),
+      provider: "review-provider",
+      model: "review-model",
+      thinkingOptionId: null,
+      reviewerPermissionMode: "read-only",
+      cacheEnabled: false,
+      inputFingerprint: `activity-fingerprint-${input.requestId}`,
+      promptVersion: 4,
+      schemaVersion: 2,
+      ...(input.findingCount !== undefined ? { findingCount: input.findingCount } : {}),
+      ...(input.highRiskFindingCount !== undefined ? { highRiskFindingCount: input.highRiskFindingCount } : {}),
+      ...(input.readAt !== undefined ? { readAt: input.readAt } : {}),
+    });
+    await seedRun({ requestId: "activity-run-unread", status: "completed", findingCount: 3, highRiskFindingCount: 2 });
+    await seedRun({ requestId: "activity-run-clean", status: "completed", findingCount: 0, highRiskFindingCount: 0 });
+    await seedRun({ requestId: "activity-run-read", status: "completed", findingCount: 5, highRiskFindingCount: 1, readAt: new Date().toISOString() });
+    await seedRun({ requestId: "activity-run-other", status: "completed", workspaceId: "workspace-2", findingCount: 9, highRiskFindingCount: 4 });
+    await seedRun({ requestId: "activity-run-failed", status: "failed", findingCount: 0, highRiskFindingCount: 0 });
+    await seedRun({ requestId: "activity-run-running", status: "running" });
+
+    const expectedIndicators = {
+      workspaceId: "workspace-1",
+      projectId: "project-1",
+      // Pending and stale are disjoint action categories: pending + stale is
+      // the raw queued total (4 project-wide, 3 in this workspace).
+      projectPendingCommentCount: 1,
+      projectStaleCommentCount: 3,
+      workspacePendingCommentCount: 1,
+      workspaceStaleCommentCount: 2,
+      activeBatchCount: 1,
+      runningAiReviewCount: 1,
+      unreadAiFindingCount: 3,
+    };
+    const indicators = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.deepStrictEqual(indicators, expectedIndicators);
+    assert.ok(
+      !JSON.stringify(indicators).includes("COMMENT"),
+      "no comment body may leave the server through an indicator read",
+    );
+
+    // A workspace that cannot be resolved, has moved, or is being archived
+    // fails closed instead of reporting another workspace's activity.
+    workspaceRecord = { id: "workspace-1", projectId: "project-1", workspaceDirectory: root, archivingAt: "2026-10-01T00:00:00.000Z" };
+    await assert.rejects(
+      () => activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context),
+      /being archived/,
+    );
+    workspaceRecord = { id: "workspace-other", projectId: "project-1", workspaceDirectory: root };
+    await assert.rejects(
+      () => activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context),
+      /resolved to workspace workspace-other/,
+    );
+    workspaceRecord = null;
+    await assert.rejects(
+      () => activityService.getWorkspaceReviewSummary({ workspaceId: "workspace-1" }, context),
+      /does not exist/,
+    );
+    await assert.rejects(
+      () => activityService.markWorkspaceReviewResultsRead({ workspaceId: "workspace-1" }, context),
+      /does not exist/,
+    );
+    workspaceRecord = { id: "workspace-1", projectId: "project-1", workspaceDirectory: root };
+
+    // The detailed summary refreshes the anchors of the working tree first: the
+    // stale-but-resolvable comment becomes exact while the legacy comment
+    // without a current hunk stays stale, and the legacy row keeps its
+    // workspace binding because this workspace is the directory's sole owner.
+    const summary = await activityService.getWorkspaceReviewSummary({ workspaceId: "workspace-1" }, context);
+    assert.deepStrictEqual(summary, {
+      ...expectedIndicators,
+      projectPendingCommentCount: 2,
+      projectStaleCommentCount: 2,
+      workspacePendingCommentCount: 2,
+      workspaceStaleCommentCount: 1,
+      reviewedBlockCount: 3,
+      totalBlockCount: activitySnapshot.totalHunks,
+    });
+    const refreshedState = await activityStateStore.load();
+    const refreshedAnchorStates = Object.values(refreshedState)
+      .flat()
+      .filter((entry) => entry.comment === "A WORKSPACE COMMENT")
+      .map((entry) => entry.anchorState);
+    assert.deepStrictEqual(refreshedAnchorStates, ["exact"], "the summary refreshed the resolvable anchor");
+
+    // A legacy comment is only assigned while this workspace is the project's
+    // sole owner of its directory: a shared directory, a failed list, or a
+    // truncated page keeps it project-scoped.
+    workspaceListEntries = [
+      { id: "workspace-1", workspaceDirectory: root },
+      { id: "workspace-2", workspaceDirectory: root },
+    ];
+    const sharedDirectory = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.equal(sharedDirectory.projectPendingCommentCount, 2);
+    assert.equal(sharedDirectory.projectStaleCommentCount, 2, "project pending + stale stays the raw queued total of 4");
+    assert.equal(sharedDirectory.workspacePendingCommentCount, 2, "a shared directory forfeits the legacy assignment");
+    assert.equal(sharedDirectory.workspaceStaleCommentCount, 0);
+    failWorkspaceList = true;
+    const listFailure = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.equal(listFailure.workspacePendingCommentCount, 2, "a failed ownership list keeps legacy comments project-scoped");
+    assert.equal(listFailure.workspaceStaleCommentCount, 0);
+    failWorkspaceList = false;
+    workspaceListPageHasMore = true;
+    const truncatedList = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.equal(truncatedList.workspacePendingCommentCount, 2, "a truncated ownership list cannot prove uniqueness");
+    assert.equal(truncatedList.workspaceStaleCommentCount, 0);
+    workspaceListPageHasMore = false;
+    workspaceListEntries = [{ id: "workspace-1", workspaceDirectory: root }];
+    const soleOwner = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.equal(soleOwner.workspacePendingCommentCount, 2, "the sole owner counts the legacy comment's pending and stale buckets");
+    assert.equal(soleOwner.workspaceStaleCommentCount, 1, "the stale legacy comment stays in the stale bucket, not in pending");
+
+    // Opening the deck marks every completed file/target run that reported
+    // findings, in this workspace only.
+    assert.deepStrictEqual(
+      await activityService.markWorkspaceReviewResultsRead({ workspaceId: "workspace-1" }, context),
+      { markedRunCount: 1 },
+    );
+    assert.deepStrictEqual(
+      await activityService.markWorkspaceReviewResultsRead({ workspaceId: "workspace-1" }, context),
+      { markedRunCount: 0 },
+      "a second opening marks nothing new",
+    );
+    assert.ok((await activityRunStore.get("activity-run-unread"))?.readAt, "the unread run is stamped");
+    assert.strictEqual(
+      (await activityRunStore.get("activity-run-clean"))?.readAt,
+      undefined,
+      "a completed run with nothing to read is left unmarked",
+    );
+    assert.ok((await activityRunStore.get("activity-run-read"))?.readAt);
+    assert.strictEqual((await activityRunStore.get("activity-run-running"))?.readAt, undefined);
+    assert.strictEqual((await activityRunStore.get("activity-run-failed"))?.readAt, undefined);
+    assert.strictEqual(
+      (await activityRunStore.get("activity-run-other"))?.readAt,
+      undefined,
+      "another workspace's run is never marked by this workspace's opening",
+    );
+    const afterRead = await activityService.getWorkspaceReviewIndicators({ workspaceId: "workspace-1" }, context);
+    assert.equal(afterRead.unreadAiFindingCount, 0);
+
+    // -----------------------------------------------------------------------
+    // v1.7 AI review timeline row: one stable, minimal row on the parent Agent
+    // -----------------------------------------------------------------------
+    currentSettings = { ...currentSettings, aiReviewCacheEnabled: false };
+    responseQueue.push(JSON.stringify({
+      summary: "Activity review summary",
+      findings: [
+        {
+          filePath: "a.ts",
+          severity: "high",
+          evidenceKind: "ai_inference",
+          category: "activity",
+          summary: "High-risk activity finding",
+          detail: "High-risk activity detail",
+        },
+        {
+          filePath: "b.ts",
+          severity: "low",
+          evidenceKind: "verified_fact",
+          category: "activity",
+          summary: "Low-risk activity finding",
+          detail: "Low-risk activity detail",
+        },
+      ],
+    }));
+    const timelineStart = await service.startRunReview(reviewInput(root, "file", "a.ts"), context);
+    const timelineBefore = timelineAppends.length;
+    const timelineResult = await poll(timelineStart.requestId);
+    assert.equal(timelineResult.status, "idle");
+    assert.equal(timelineResult.resultSource, "fresh");
+    const appendedRows = timelineAppends
+      .slice(timelineBefore)
+      .filter((entry) => entry.item.kind === "review-deck-ai-review");
+    assert.equal(appendedRows.length, 1, "a terminal file review appends exactly one AI review row");
+    const appendedRow = appendedRows[0];
+    assert.equal(appendedRow.agentId, "parent-agent", "the row lands on the parent Agent whose stream shows the result");
+    assert.equal(appendedRow.item.id, `review-deck-ai-review:${timelineStart.requestId}`);
+    assert.equal(appendedRow.item.version, 1);
+    assert.deepStrictEqual(
+      Object.keys(appendedRow.item.data).sort(),
+      ["completedAt", "depth", "findingCount", "highRiskFindingCount", "mode", "resultSource", "status", "usage", "workspaceId"],
+    );
+    assert.equal(appendedRow.item.data.workspaceId, "workspace-1");
+    assert.equal(appendedRow.item.data.mode, "file");
+    assert.equal(appendedRow.item.data.status, "completed");
+    assert.equal(appendedRow.item.data.resultSource, "fresh");
+    assert.equal(appendedRow.item.data.depth, "targeted");
+    assert.equal(appendedRow.item.data.findingCount, 2);
+    assert.equal(appendedRow.item.data.highRiskFindingCount, 1);
+    assert.ok(typeof appendedRow.item.data.completedAt === "string" && appendedRow.item.data.completedAt.length > 0);
+    const timelinePayload = JSON.stringify(appendedRow.item.data);
+    for (const secret of ["a.ts", "b.ts", "High-risk activity", "Low-risk activity", "Activity review summary", timelineStart.requestId]) {
+      assert.ok(!timelinePayload.includes(secret), `the timeline row must not leak ${secret}`);
+    }
+    // The terminal poll stamped the run itself: completion time and tally are
+    // durable metadata, and nothing is marked read yet.
+    const stampedRun = await runStore.get(timelineStart.requestId);
+    assert.equal(stampedRun?.status, "completed");
+    assert.equal(stampedRun?.completedAt, appendedRow.item.data.completedAt);
+    assert.equal(stampedRun?.findingCount, 2);
+    assert.equal(stampedRun?.highRiskFindingCount, 1);
+    assert.strictEqual(stampedRun?.readAt, undefined);
+    // A repeated poll (now a cache-capability read of the same result) replaces
+    // the same row with byte-identical data instead of appending a second one.
+    const appendsBeforeRepeat = timelineAppends.length;
+    await poll(timelineStart.requestId);
+    const repeatedRows = timelineAppends
+      .slice(appendsBeforeRepeat)
+      .filter((entry) => entry.item.kind === "review-deck-ai-review");
+    assert.equal(repeatedRows.length, 1);
+    assert.deepStrictEqual(repeatedRows[0].item, appendedRow.item);
+    // An append failure is swallowed: the review result itself still returns.
+    failNextTimelineAppend = true;
+    const previousAppendError = console.error;
+    console.error = () => {};
+    try {
+      const resilientPoll = await poll(timelineStart.requestId);
+      assert.equal(resilientPoll.status, "idle");
+      assert.ok(resilientPoll.review.length > 0, "the result survives a failed timeline append");
+    } finally {
+      console.error = previousAppendError;
+    }
+    // A hunk explanation is not a whole AI review and never appends the row.
+    const hunkView = await service.createSnapshot({ cwd: root, scope: "working", filePath: "a.ts", locale: "en" });
+    const explainHunkId = hunkView.files.find((file) => file.path === "a.ts")?.hunks[0]?.id;
+    assert.ok(explainHunkId);
+    const hunkExplainStart = await service.startExplainHunkAi({
+      cwd: root,
+      scope: "working",
+      locale: "en",
+      filePath: "a.ts",
+      hunkId: explainHunkId,
+      workspaceId: "workspace-1",
+      agentId: "parent-agent",
+    }, context);
+    const appendsBeforeHunk = timelineAppends.length;
+    const hunkExplain = await poll(hunkExplainStart.requestId);
+    assert.equal(hunkExplain.status, "idle");
+    assert.equal(hunkExplain.mode, "hunk");
+    assert.equal(timelineAppends.length, appendsBeforeHunk, "hunk explanations never append an AI review row");
+    const hunkRun = await runStore.get(hunkExplainStart.requestId);
+    assert.equal(hunkRun?.status, "completed");
+    assert.ok(hunkRun?.completedAt, "a hunk explanation still records its completion time");
+    assert.strictEqual(hunkRun?.findingCount, undefined, "a hunk explanation never records a finding tally");
+    assert.strictEqual(hunkRun?.highRiskFindingCount, undefined, "a hunk explanation never records a high-risk tally");
+    // A failed review still reports its terminal state, with zero findings.
+    responseQueue.push("### Verified Facts\n- Failed review body.");
+    waitStatusQueue.push("error");
+    const failedStart = await service.startRunReview(reviewInput(root, "target"), context);
+    const appendsBeforeFailure = timelineAppends.length;
+    const failedPoll = await poll(failedStart.requestId);
+    assert.equal(failedPoll.status, "error");
+    assert.ok(failedPoll.review.includes("Failed review body."));
+    const failedRows = timelineAppends
+      .slice(appendsBeforeFailure)
+      .filter((entry) => entry.item.kind === "review-deck-ai-review");
+    assert.equal(failedRows.length, 1);
+    assert.equal(failedRows[0].item.data.status, "failed");
+    assert.equal(failedRows[0].item.data.mode, "target");
+    assert.equal(failedRows[0].item.data.findingCount, 0);
+    assert.equal(failedRows[0].item.data.highRiskFindingCount, 0);
+    const failedRun = await runStore.get(failedStart.requestId);
+    assert.equal(failedRun?.status, "failed");
+    assert.strictEqual(failedRun?.findingCount, undefined, "a failed review records no finding tally");
+    assert.strictEqual(failedRun?.highRiskFindingCount, undefined);
+    // A cache hit is stamped on its first poll with the tally of the cached
+    // sections (a Markdown fallback has no machine-readable severity).
+    const cachedStamp = await runStore.get(cachedTargetStart.requestId);
+    assert.equal(cachedStamp?.status, "completed");
+    assert.ok(cachedStamp?.completedAt, "a cache hit gets its completion time on the first poll");
+    assert.equal(cachedStamp?.findingCount, 3);
+    assert.equal(cachedStamp?.highRiskFindingCount, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
     if (cachePath) await rm(cachePath, { force: true });
     if (runStorePath) await rm(runStorePath, { force: true });
+    for (const path of activityPaths) await rm(path, { force: true });
   }
 }
 

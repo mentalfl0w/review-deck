@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRpc } from "@getpaseo/plugin/client";
+import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import {
   listProjectReviewComments,
   processProjectReview,
@@ -9,8 +9,9 @@ import {
   type ReviewScope,
 } from "../../shared/review";
 import type { AgentEntry } from "../tools";
-import { groupProjectReviewComments } from "../project-review-workspaces";
+import { groupProjectReviewComments, type WorkspaceDirectoryOwner } from "../project-review-workspaces";
 import { getReviewCountStore } from "../review-count-store";
+import { getReviewEntryStatusStore } from "../review-entry-status-store";
 import type { TFunc } from "../i18n";
 
 
@@ -28,11 +29,13 @@ export function useProjectComments(params: {
   t: TFunc;
 }) {
   const { effectiveProjectId, selectedWorkspaceId, projectAgents, preferredAgentId, t } = params;
+  const paseo = usePaseo();
   const listProjectCommentsRpc = useRpc(listProjectReviewComments);
   const processProjectCommentsRpc = useRpc(processProjectReview);
   const [selectedProcessAgentsByWorkspace, setSelectedProcessAgentsByWorkspace] = useState<Record<string, string>>({});
   const [projectComments, setProjectComments] = useState<ProjectReviewSummary | null>(null);
   const [projectCommentsLoading, setProjectCommentsLoading] = useState(false);
+  const [workspaceDirectoryOwners, setWorkspaceDirectoryOwners] = useState<WorkspaceDirectoryOwner[]>([]);
   const [projectCommentsError, setProjectCommentsError] = useState<string | null>(null);
   const [processingProject, setProcessingProject] = useState(false);
   const [processResult, setProcessResult] = useState<ProcessProjectReviewResult[] | null>(null);
@@ -52,6 +55,7 @@ export function useProjectComments(params: {
     const requestId = ++projectCommentsRequestRef.current;
     if (!projectId) {
       setProjectComments(null);
+      setWorkspaceDirectoryOwners([]);
       setProjectCommentsLoading(false);
       setProjectCommentsError(null);
       return;
@@ -60,21 +64,35 @@ export function useProjectComments(params: {
     setProjectCommentsError(null);
     try {
       const result = await listProjectCommentsRpc({ projectId });
-      // The entry badges read the same project-scoped count the queue shows;
-      // publishing it here keeps review/header pills in sync with every local
-      // comment change without another round trip. A superseded response is
-      // still this project's own count, so it lands before the staleness guard
-      // drops it from the panel.
+      // The entry badge keeps the same project count as the queue.
       getReviewCountStore().setCount(projectId, result.project?.commentCount ?? 0);
       if (requestId !== projectCommentsRequestRef.current) return;
+
+      let directoryOwners: WorkspaceDirectoryOwner[] = [];
+      if (result.project?.comments.some((comment) => comment.workspaceId === undefined)) {
+        try {
+          const workspaceList = await paseo.workspaces.list({ filter: { projectId } });
+          if (!workspaceList.pageInfo.hasMore) {
+            directoryOwners = workspaceList.entries.flatMap((workspace) =>
+              workspace.workspaceDirectory
+                ? [{ workspaceId: workspace.id, directory: workspace.workspaceDirectory }]
+                : []);
+          }
+        } catch {
+          // Ambiguous legacy comments remain unassigned if ownership cannot be proven.
+        }
+      }
+      if (requestId !== projectCommentsRequestRef.current) return;
       setProjectComments(result.project);
+      setWorkspaceDirectoryOwners(directoryOwners);
+      void getReviewEntryStatusStore().refresh(selectedWorkspaceId);
     } catch (error) {
       if (requestId !== projectCommentsRequestRef.current) return;
       setProjectCommentsError(error instanceof Error ? error.message : String(error));
     } finally {
       if (requestId === projectCommentsRequestRef.current) setProjectCommentsLoading(false);
     }
-  }, [effectiveProjectId, listProjectCommentsRpc]);
+  }, [effectiveProjectId, listProjectCommentsRpc, paseo.workspaces, selectedWorkspaceId]);
 
   useEffect(() => {
     // Processing results, notices and loaded comments belong to one project:
@@ -94,6 +112,7 @@ export function useProjectComments(params: {
     setProjectNotice(null);
     setProcessingProject(false);
     setProjectComments(null);
+    setWorkspaceDirectoryOwners([]);
     setProjectCommentsError(null);
     setProjectCommentsLoading(false);
     void refreshProjectComments();
@@ -117,10 +136,11 @@ export function useProjectComments(params: {
       comments: projectComments?.comments ?? [],
       batches: projectComments?.batches ?? [],
       agents: projectAgents,
+      workspaceDirectoryOwners,
       selectedAgentByWorkspace: selectedProcessAgentsByWorkspace,
       preferredAgentId,
     }),
-    [preferredAgentId, projectAgents, projectComments, selectedProcessAgentsByWorkspace],
+    [preferredAgentId, projectAgents, projectComments, selectedProcessAgentsByWorkspace, workspaceDirectoryOwners],
   );
 
   const processProject = useCallback(async () => {

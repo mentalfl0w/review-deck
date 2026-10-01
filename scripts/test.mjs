@@ -23,6 +23,7 @@ function run(command, args) {
 
 await run(process.execPath, ["--experimental-strip-types", "tests/agent-message-stream.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-settings-timeline.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/i18n-locale.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/agent-registry.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-entry-status-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/state-store.test.ts"]);

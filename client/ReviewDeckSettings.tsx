@@ -7,6 +7,7 @@ import {
   SettingsSelect,
   SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
+import { resolveConfiguredLocale } from "./locale";
 import { detectLocale, makeT } from "./i18n";
 import { clearAiReviewCache } from "../shared/review";
 import {
@@ -66,7 +67,10 @@ export function ReviewDeckSettings(): ReactNode {
   const settings = useSettings(reviewDeckSettings);
   const paseo = usePaseo();
   const clearCacheRpc = useRpc(clearAiReviewCache);
-  const t = useMemo(() => makeT(detectLocale()), []);
+  const automaticLocale = useMemo(() => detectLocale(), []);
+  const configuredLocale = settings.status === "ready" ? settings.values.locale : "auto";
+  const locale = resolveConfiguredLocale(configuredLocale, automaticLocale);
+  const t = useMemo(() => makeT(locale), [locale]);
 
   const [providers, setProviders] = useState<ProvidersState>({ status: "loading" });
   const [clearState, setClearState] = useState<ClearCacheState>({ status: "idle" });

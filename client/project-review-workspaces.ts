@@ -8,13 +8,16 @@ function normalizeWorkspaceCwd(value: string | null | undefined): string | null 
   if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) return normalized;
   return normalized.replace(/\/+$/, "");
 }
+export type WorkspaceDirectoryOwner = { workspaceId: string; directory: string };
 
-/** Group project comments by their recorded workspace, resolving legacy rows
- * without workspaceId only when exactly one project Agent owns the same cwd. */
+/** Group project comments by recorded workspace. Legacy rows without a
+ * workspaceId are assigned only when the full project workspace list proves
+ * their cwd has exactly one owner; eligible Agents are not ownership proof. */
 export function groupProjectReviewComments(input: {
   comments: readonly ProjectReviewComment[];
   batches: readonly ActiveReviewBatch[];
   agents: readonly AgentEntry[];
+  workspaceDirectoryOwners: readonly WorkspaceDirectoryOwner[];
   selectedAgentByWorkspace: Readonly<Record<string, string>>;
   preferredAgentId?: string | null;
 }): ProjectReviewWorkspaceGroup[] {
@@ -23,10 +26,9 @@ export function groupProjectReviewComments(input: {
   for (const comment of input.comments) {
     let workspaceId = comment.workspaceId ?? null;
     if (!workspaceId) {
-      const matchingWorkspaceIds = new Set(input.agents
-        .filter((agent) => normalizeWorkspaceCwd(agent.cwd) === normalizeWorkspaceCwd(comment.cwd))
-        .map((agent) => agent.workspaceId)
-        .filter((id): id is string => id !== null));
+      const matchingWorkspaceIds = new Set(input.workspaceDirectoryOwners
+        .filter((workspace) => normalizeWorkspaceCwd(workspace.directory) === normalizeWorkspaceCwd(comment.cwd))
+        .map((workspace) => workspace.workspaceId));
       if (matchingWorkspaceIds.size === 1) workspaceId = [...matchingWorkspaceIds][0] ?? null;
     }
 

@@ -1772,6 +1772,13 @@ export class ReviewService {
     if (requestedIds.size !== input.commentIds.length) {
       throw new Error("A ReviewBatch cannot contain duplicate comment ids.");
     }
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    if (identity.projectId !== input.projectId) {
+      throw new Error(`Project ${input.projectId} does not belong to workspace ${input.workspaceId}.`);
+    }
+    if (!(await this.directoriesMatch(identity.directory, input.workspaceCwd))) {
+      throw new Error(`Workspace ${input.workspaceId} does not own directory ${input.workspaceCwd}.`);
+    }
 
     // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
     // can never process comments under a stale workspace selection.
@@ -1802,6 +1809,10 @@ export class ReviewService {
       .filter((comment) => requestedIds.has(comment.id));
     if (comments.length !== requestedIds.size) {
       throw new Error("One or more selected project comments are no longer in the queue. Refresh the queue and retry.");
+    }
+    const hasLegacyComments = comments.some((comment) => comment.workspaceId === undefined);
+    if (hasLegacyComments && !(await this.legacyCommentsBelongToWorkspace(identity, context))) {
+      throw new Error("Legacy comment workspace ownership is ambiguous; refusing to submit this batch.");
     }
     for (const comment of comments) {
       if (comment.workspaceId !== undefined && comment.workspaceId !== input.workspaceId) {

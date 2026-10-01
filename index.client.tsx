@@ -13,7 +13,7 @@ import { ReviewAiReviewTimelineItem, type ReviewAiReviewTimelineItemProps } from
 import { ReviewBatchTimelineItem, type ReviewBatchTimelineItemProps } from "./client/components/ReviewBatchTimelineItem";
 import { ReviewHeaderPopover } from "./client/components/ReviewHeaderPopover";
 import { ReviewHandoffTimelineItem } from "./client/components/ReviewHandoffTimelineItem";
-import { groupProjectReviewComments } from "./client/project-review-workspaces";
+import { groupProjectReviewComments, type WorkspaceDirectoryOwner } from "./client/project-review-workspaces";
 import { getAgentRegistry, USABLE_AGENT_STATUSES } from "./client/agent-registry";
 import { getReviewCountStore } from "./client/review-count-store";
 import { getReviewEntryStatusStore } from "./client/review-entry-status-store";
@@ -227,11 +227,22 @@ export default function contribute(client: PluginClientContext) {
     }
     const result = await client.rpc(listProjectReviewComments, { projectId: indicators.projectId });
     if (!result.project) return;
+    if (indicators.workspacePendingCommentCount + indicators.workspaceStaleCommentCount === 0) return;
+    let workspaceDirectoryOwners: WorkspaceDirectoryOwner[] = [];
+    if (result.project.comments.some((comment) => comment.workspaceId === undefined)) {
+      const workspaceList = await client.paseo.workspaces.list({ filter: { projectId: indicators.projectId } });
+      if (workspaceList.pageInfo.hasMore) {
+        throw new Error("Cannot prove unique workspace ownership for legacy comments in this project.");
+      }
+      workspaceDirectoryOwners = workspaceList.entries.flatMap((entry) =>
+        entry.workspaceDirectory ? [{ workspaceId: entry.id, directory: entry.workspaceDirectory }] : []);
+    }
     const agentEntries = registry.getSnapshot().agents;
     const groups = groupProjectReviewComments({
       comments: result.project.comments,
       batches: result.project.batches,
       agents: agentEntries,
+      workspaceDirectoryOwners,
       selectedAgentByWorkspace: {},
       preferredAgentId: agentId,
     });

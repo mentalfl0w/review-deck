@@ -51,6 +51,10 @@ const agents = [
   agent("agent-a2", "workspace-a", "/repo/worktree-a"),
   agent("agent-b", "workspace-b", "/repo/worktree-b"),
 ];
+const workspaceDirectoryOwners = [
+  { workspaceId: "workspace-a", directory: "/repo/worktree-a" },
+  { workspaceId: "workspace-b", directory: "/repo/worktree-b" },
+];
 
 const comments = [
   comment("a-1", "/repo/worktree-a", "workspace-a"),
@@ -62,6 +66,7 @@ const grouped = groupProjectReviewComments({
   comments,
   batches: [],
   agents,
+  workspaceDirectoryOwners,
   selectedAgentByWorkspace: {},
 });
 assert.equal(grouped.length, 2);
@@ -76,6 +81,7 @@ const preferred = groupProjectReviewComments({
   comments,
   batches: [],
   agents,
+  workspaceDirectoryOwners,
   selectedAgentByWorkspace: {},
   preferredAgentId: "agent-a2",
 });
@@ -85,6 +91,7 @@ const explicit = groupProjectReviewComments({
   comments,
   batches: [],
   agents,
+  workspaceDirectoryOwners,
   selectedAgentByWorkspace: { "workspace:workspace-a": "agent-a1" },
   preferredAgentId: "agent-a2",
 });
@@ -95,6 +102,7 @@ const legacyGroup = groupProjectReviewComments({
   comments: [legacyCwdComment],
   batches: [],
   agents,
+  workspaceDirectoryOwners,
   selectedAgentByWorkspace: {},
 });
 assert.equal(legacyGroup[0]?.workspaceId, "workspace-b", "a legacy comment binds only when cwd identifies one workspace");
@@ -103,10 +111,23 @@ assert.equal(legacyGroup[0]?.selectedAgentId, "agent-b");
 const ambiguousLegacy = groupProjectReviewComments({
   comments: [comment("legacy-shared", "/repo/shared")],
   batches: [],
-  agents: [agent("shared-a", "workspace-a", "/repo/shared"), agent("shared-b", "workspace-b", "/repo/shared")],
+  // Only one eligible Agent exists, but two workspace records own the cwd.
+  agents: [agent("shared-a", "workspace-a", "/repo/shared")],
+  workspaceDirectoryOwners: [
+    { workspaceId: "workspace-a", directory: "/repo/shared" },
+    { workspaceId: "workspace-b", directory: "/repo/shared" },
+  ],
   selectedAgentByWorkspace: {},
 });
 assert.equal(ambiguousLegacy[0]?.workspaceId, null);
+const unverifiedLegacy = groupProjectReviewComments({
+  comments: [legacyCwdComment],
+  batches: [],
+  agents,
+  workspaceDirectoryOwners: [],
+  selectedAgentByWorkspace: {},
+});
+assert.equal(unverifiedLegacy[0]?.workspaceId, null, "legacy rows remain unassigned when the workspace list is unavailable");
 assert.deepEqual(ambiguousLegacy[0]?.eligibleAgents, [], "ambiguous legacy workspace ownership fails closed");
 
 const activeBatch: ActiveReviewBatch = {
@@ -120,6 +141,7 @@ const activeGroup = groupProjectReviewComments({
   comments: [comment("new-comment", "/repo/worktree-a", "workspace-a")],
   batches: [activeBatch],
   agents,
+  workspaceDirectoryOwners,
   selectedAgentByWorkspace: {},
 });
 assert.equal(activeGroup[0]?.activeBatch?.id, "batch-a");
@@ -130,6 +152,7 @@ const activeOnlyGroup = groupProjectReviewComments({
   batches: [activeBatch],
   agents,
   selectedAgentByWorkspace: {},
+  workspaceDirectoryOwners,
 });
 assert.equal(activeOnlyGroup.length, 1);
 assert.equal(activeOnlyGroup[0]?.cwd, "/repo/worktree-a");
@@ -140,6 +163,7 @@ const noAgent = groupProjectReviewComments({
   batches: [],
   agents,
   selectedAgentByWorkspace: {},
+  workspaceDirectoryOwners,
 });
 assert.equal(noAgent[0]?.workspaceId, "workspace-orphan");
 assert.deepEqual(noAgent[0]?.eligibleAgents, []);

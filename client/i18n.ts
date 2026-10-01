@@ -1,24 +1,31 @@
+import { detectLocaleFromSignals, type Locale } from "./locale";
 import { getBrowserLanguage } from "./web";
 
-export type Locale = "zh" | "en";
+export type { Locale } from "./locale";
+
 export function detectLocale(): Locale {
+  let intlLocale: unknown = "";
   try {
-    // Strategy 1: works in browser/webview and Hermes/Node/Bun.
-    const intl = typeof Intl !== "undefined" && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOptions().locale : "";
-    if (intl.startsWith("zh")) return "zh";
-    // Strategy 2: browser language on the web platform (web.ts no-ops
-    // elsewhere, so the native path falls through to strategy 3).
-    const nav = getBrowserLanguage();
-    if (nav.startsWith("zh")) return "zh";
-    // Strategy 3: native modules on iOS/Android.
-    try {
-      const nm = require("react-native");
-      const loc = nm?.NativeModules?.SettingsManager?.settings?.AppleLocale
-        ?? nm?.NativeModules?.I18nManager?.localeIdentifier ?? "";
-      if (loc.startsWith("zh")) return "zh";
-    } catch { /* native bridge unavailable */ }
+    intlLocale = typeof Intl !== "undefined" && Intl.DateTimeFormat
+      ? Intl.DateTimeFormat().resolvedOptions().locale
+      : "";
   } catch { /* Intl unavailable */ }
-  return "en";
+
+  const browserLanguage = getBrowserLanguage();
+  let nativeSettings: unknown;
+  let nativeLocaleIdentifier: unknown;
+  try {
+    const nm = require("react-native");
+    nativeLocaleIdentifier = nm?.NativeModules?.I18nManager;
+    if (nm?.Platform?.OS === "ios") {
+      try {
+        nativeSettings = nm.Settings;
+      } catch { /* use the compatibility module below */ }
+      nativeSettings ??= nm?.NativeModules?.SettingsManager?.settings;
+    }
+  } catch { /* native bridge unavailable */ }
+
+  return detectLocaleFromSignals(intlLocale, browserLanguage, nativeSettings, nativeLocaleIdentifier);
 }
 const STRINGS = {
   zh: {
@@ -257,6 +264,7 @@ const STRINGS = {
     reviewEntryOpenQueue: "打开队列",
     reviewEntryRunTargeted: "用 AI 评审当前变更",
     reviewEntrySubmitComments: "提交待处理批注",
+    reviewEntryActionFailed: "操作失败",
     reviewEntryBlocksReviewed: "已评审 {reviewed} / {total} 个变更块",
     reviewEntryPendingComments: "{count} 条待处理批注",
     reviewEntryStaleComments: "{count} 条过期或未解决批注",
@@ -665,6 +673,7 @@ const STRINGS = {
     reviewEntryOpenQueue: "Open Queue",
     reviewEntryRunTargeted: "Review Current Changes with AI",
     reviewEntrySubmitComments: "Submit pending comments",
+    reviewEntryActionFailed: "Action failed",
     reviewEntryBlocksReviewed: "{reviewed} / {total} blocks reviewed",
     reviewEntryPendingComments: "{count} pending comments",
     reviewEntryStaleComments: "{count} stale or unresolved comments",

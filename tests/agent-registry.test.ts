@@ -798,6 +798,57 @@ async function main() {
     registry.stop();
     assert.equal(agentsSubscription.state.released, true, "stopping releases the agent owned observation");
   });
+  await test("a moved Agent rebinds its Review Pill to the new workspace", async () => {
+    const fake = createFakePaseo();
+    const registry = createAgentRegistry({ retryDelaysMs: [] });
+    registry.bind(fake.paseo);
+    const agentsSubscription = fake.agents.boot(0, agentsPayload([
+      agentEntry("agent-move", { workspaceId: "ws-1", projectKey: "proj-1" }),
+    ]));
+    await flush();
+
+    const host = createFakeHost();
+    const counts = createFakeCounts();
+    const entries = registerReviewEntries({
+      client: host.host,
+      paseo: fake.paseo,
+      registry,
+      counts: counts.store,
+      retryDelaysMs: [],
+    });
+    const workspacesSubscription = fake.workspaces.boot(0, workspacesPayload([
+      workspaceEntry("ws-1", { projectId: "proj-1" }),
+      workspaceEntry("ws-2", { projectId: "proj-2" }),
+    ]));
+    await flush();
+
+    const original = host.live.get("review-pill-agent-move");
+    assert.ok(original);
+    assert.equal(original.contribution.workspaceId, "ws-1");
+    agentsSubscription.emitUpdate({
+      type: "agent_update",
+      payload: {
+        subscriptionId: "fake-sub",
+        kind: "upsert",
+        agent: agentEntry("agent-move", { workspaceId: "ws-2", projectKey: "proj-2" }).agent,
+      },
+    });
+    await flush();
+
+    const moved = host.live.get("review-pill-agent-move");
+    assert.ok(moved);
+    host.press("review-pill-agent-move");
+    assert.deepEqual(host.opened, [{
+      id: "review-deck-agent",
+      options: { workspaceId: "ws-2", agentId: "agent-move" },
+    }], "pressing the moved Agent's pill must keep the new workspace binding");
+    assert.equal(moved.contribution.workspaceId, "ws-2");
+
+    entries.stop();
+    registry.stop();
+    assert.equal(workspacesSubscription.state.released, true);
+    assert.equal(agentsSubscription.state.released, true);
+  });
 
   await test("registry events drive pill lifecycle and reconnect count refreshes", async () => {
     const fake = createFakePaseo();

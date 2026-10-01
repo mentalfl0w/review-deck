@@ -128,8 +128,8 @@ const input = (overrides: Partial<PromptModule.AiReviewPromptInput> = {}): Promp
 // ---------------------------------------------------------------------------
 // 0. Contract constants.
 // ---------------------------------------------------------------------------
-assert.strictEqual(AI_REVIEW_PROMPT_VERSION, 2);
-assert.strictEqual(AI_REVIEW_SCHEMA_VERSION, 1);
+assert.strictEqual(AI_REVIEW_PROMPT_VERSION, 4);
+assert.strictEqual(AI_REVIEW_SCHEMA_VERSION, 2);
 assert.strictEqual(AI_REVIEW_PATCH_CHAR_LIMIT, 160_000);
 
 // ---------------------------------------------------------------------------
@@ -222,6 +222,9 @@ assert.strictEqual(targeted.patchCharacters, 0);
 assert.ok(targeted.prompt.includes("HUNK INDEX"));
 assert.ok(targeted.prompt.includes("Changed files: 2"));
 assert.ok(targeted.prompt.includes(`- ${hunkAlpha.stableId} · server/Foo.ts · @@ -1,4 +1,5 @@ export function foo() { · HIGH · concurrency · MUST REVIEW`));
+assert.ok(targeted.prompt.includes("StructuredReviewResult"));
+assert.ok(targeted.prompt.includes("Markdown headings"));
+assert.ok(targeted.prompt.includes("only when the host supplies that schema"));
 assert.ok(targeted.prompt.includes("INFORMATIONAL · docs · AS NEEDED") && targeted.prompt.includes("MEDIUM · api · WITHIN BUDGET"));
 for (const forbidden of [patchAlpha, patchBeta, patchBar, "+const b = 2;", "diff --git", "HUNK PATCHES"]) {
   assert.ok(!targeted.prompt.includes(forbidden), `targeted review must not send patch text: ${forbidden}`);

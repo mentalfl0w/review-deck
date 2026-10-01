@@ -28,10 +28,10 @@ import type { AiReviewBudgetPreset, AiReviewDepth, AiReviewMode, ReviewLocale, R
 import { canonicalJson, hunkContentId, sha256 } from "./util/crypto";
 
 /** Version of the prompt layout/instructions; bump on any wording change. */
-export const AI_REVIEW_PROMPT_VERSION = 2;
+export const AI_REVIEW_PROMPT_VERSION = 4;
 
 /** Version of the structured review output contract the prompt requests. */
-export const AI_REVIEW_SCHEMA_VERSION = 1;
+export const AI_REVIEW_SCHEMA_VERSION = 2;
 
 /** Maximum patch text (in characters) a full review prompt may carry. */
 export const AI_REVIEW_PATCH_CHAR_LIMIT = 160_000;
@@ -302,9 +302,11 @@ const PROMPT_COPY: Record<ReviewLocale, PromptCopy> = {
     patchOmitted: "(patch omitted: over budget — read this hunk from the workspace with read-only tools)",
     outputTitle: "OUTPUT REQUIREMENTS",
     outputLines: [
+      "Return structured JSON matching the supplied `StructuredReviewResult` schema only when the host supplies that schema; otherwise use the Markdown fallback headings below.",
+      "Use the exact file path from the index; include `hunkId` only when the finding is tied to a listed stable hunk id.",
+      "Never invent a hunk id or substitute a hunk header or line number.",
+      "If a supplied structured schema is rejected or the returned JSON is invalid, use these Markdown headings: `### Verified Facts`, `### AI Inference`, and `### Human Verification Recommended`.",
       "Report only findings you can ground in the change or in what you inspected.",
-      "Cite the stable hunk id from the index above (the `H-…` ids) as `hunkId` on every finding.",
-      "Never use a hunk header, a line number, or any other identifier as a hunk id.",
       "Answer in English.",
     ],
     targetedIntro: "Targeted review: hunk patches are NOT included. Inspect the workspace with read-only tools before judging.",
@@ -345,9 +347,11 @@ const PROMPT_COPY: Record<ReviewLocale, PromptCopy> = {
     patchOmitted: "（补丁已省略：超出预算——如需该变更块，请用只读工具从工作区读取）",
     outputTitle: "输出要求",
     outputLines: [
+      "只有 host 确实提供了 `StructuredReviewResult` schema 时才返回匹配的结构化 JSON；否则使用下方 Markdown fallback 标题。",
+      "使用索引中的准确文件路径；只有结论对应某个已列出的稳定变更块时，才填写对应的 `hunkId`。",
+      "不要编造 hunk ID，也不要用 hunk header 或行号替代。",
+      "如果 host 拒绝结构化 schema 或返回的 JSON 无效，请使用以下 Markdown 标题：`### Verified Facts`、`### AI Inference`、`### Human Verification Recommended`。",
       "只报告能在变更本身或你检查过的内容中证实的结论。",
-      "每条结论都必须以上方索引中的稳定变更块 ID（`H-…`）作为 `hunkId`。",
-      "不要用变更块 header、行号或其他任何标识充当变更块 ID。",
       "用中文回答。",
     ],
     targetedIntro: "定向评审：不发送变更块补丁。请先用只读工具检查工作区再下结论。",

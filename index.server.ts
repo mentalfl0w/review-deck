@@ -41,7 +41,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(revertFile, async (input) => reviewService.revertFile(input));
   server.handle(startExplainHunkAi, async (input, context) => reviewService.startExplainHunkAi(input, context));
   server.handle(startRunReview, async (input, context) => reviewService.startRunReview(input, context));
-  server.handle(pollAiReview, async ({ requestId, workspaceId, agentId }) => reviewService.pollAiReview({ requestId, workspaceId, agentId }));
+  server.handle(pollAiReview, async (input, context) => reviewService.pollAiReview(input, context));
   server.handle(clearAiReviewCache, async () => ({
     cleared: await reviewService.clearAiReviewCache(),
   }));

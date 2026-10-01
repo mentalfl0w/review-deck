@@ -125,6 +125,23 @@ export const reviewFindingSchema = z.object({
   detail: z.string(),
   suggestedCheck: z.string().optional(),
 });
+export const structuredReviewFindingSchema = z.object({
+  hunkId: z.string().min(1).optional(),
+  filePath: z.string().min(1),
+  severity: severitySchema,
+  evidenceKind: evidenceKindSchema,
+  category: z.string().min(1),
+  summary: z.string().min(1),
+  detail: z.string().min(1),
+  suggestedCheck: z.string().min(1).optional(),
+}).strict();
+export type StructuredReviewFinding = z.infer<typeof structuredReviewFindingSchema>;
+
+export const structuredReviewResultSchema = z.object({
+  findings: z.array(structuredReviewFindingSchema),
+  summary: z.string().optional(),
+}).strict();
+export type StructuredReviewResult = z.infer<typeof structuredReviewResultSchema>;
 
 export const reviewHunkSchema = z.object({
   id: z.string(),
@@ -182,6 +199,7 @@ export const getTargetFingerprint = defineRpc({
   output: z.object({ targetFingerprint: z.string() }),
 });
 export const reviewSectionsSchema = z.object({
+  summary: z.string().optional(),
   verifiedFacts: z.array(z.string()),
   aiInference: z.array(z.string()),
   humanVerificationRecommended: z.array(z.string()),
@@ -203,6 +221,7 @@ export const explainHunk = defineRpc({
 });
 export const explainHunkAiResultSchema = explainHunkResultSchema.extend({
   status: z.enum(["idle", "error", "permission", "timeout"]),
+  summary: z.string().optional(),
   provider: z.string(),
   model: z.string(),
   thinkingOptionId: z.string().nullable().optional(),

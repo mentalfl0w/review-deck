@@ -62,6 +62,7 @@ import {
   type AiReviewCacheEntry,
 } from "./persistence/AiReviewCacheStore";
 import { ReviewBatchStore } from "./persistence/ReviewBatchStore";
+import { ReviewRunStore, type ReviewRun } from "./persistence/ReviewRunStore";
 import {
   AI_REVIEW_PROMPT_VERSION,
   AI_REVIEW_SCHEMA_VERSION,
@@ -75,6 +76,11 @@ import {
   parseReviewCommentOutcomes,
   reviewBatchTimelineData,
 } from "./review-batch";
+import {
+  AI_REVIEW_OUTPUT_SCHEMA,
+  normalizeStructuredReviewResult,
+  parseStructuredReviewResult,
+} from "./structured-review";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
@@ -83,6 +89,7 @@ export interface ReviewServiceDependencies {
   store?: StateStore;
   aiReviewCacheStore?: AiReviewCacheStore;
   reviewBatchStore?: ReviewBatchStore;
+  reviewRunStore?: ReviewRunStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -91,10 +98,16 @@ export interface ReviewServiceDependencies {
 /** Short wait window per poll; the daemon reports "timeout" while the turn is
  * still running, so a poll never blocks the plugin RPC layer. */
 const READONLY_REVIEW_POLL_WAIT_MS = 2_000;
-/** Abandoned review entries (client gave up polling) are evicted after this. */
-const READONLY_REVIEW_ENTRY_TTL_MS = 10 * 60_000;
+/** Persistent run records remain recoverable for one hour. */
+const READONLY_REVIEW_ENTRY_TTL_MS = 60 * 60_000;
 /** Give the Agent a bounded startup window before releasing a lost submission. */
 const REVIEW_BATCH_START_TIMEOUT_MS = 2 * 60_000;
+
+/** Conservative allowlist: Paseo currently forwards outputSchema only for these provider adapters. */
+const STRUCTURED_REVIEW_PROVIDER_IDS = new Set(["codex", "opencode"]);
+function supportsStructuredReviewOutput(provider: string): boolean {
+  return STRUCTURED_REVIEW_PROVIDER_IDS.has(provider.split("/")[0]?.toLowerCase() ?? "");
+}
 
 function isActiveReviewBatch(status: ReviewBatch["status"]): boolean {
   return status === "draft" || status === "submitted" || status === "running";
@@ -141,10 +154,14 @@ type TransientReviewEntry = {
   reviewerPermissionMode: AiReviewPermissionMode;
   resultSource: AiReviewResultSource;
   cacheEnabled: boolean;
-  cacheKey?: string;
-  inputFingerprint?: string;
+  cacheKey: string;
+  inputFingerprint: string;
   thinkingOptionId: string | null;
 };
+type ReviewRunRecoveryResult =
+  | { kind: "restored"; entry: TransientReviewEntry }
+  | { kind: "retry"; run: ReviewRun }
+  | { kind: "unavailable"; run: ReviewRun | null };
 function toAiReviewUsage(usage: TransientAgentUsage | null | undefined): AiReviewUsage | undefined {
   if (!usage) return undefined;
   const result: AiReviewUsage = {};
@@ -281,6 +298,7 @@ export class ReviewService {
   private readonly store: StateStore;
   private readonly aiReviewCacheStore: AiReviewCacheStore;
   private readonly reviewBatchStore: ReviewBatchStore;
+  private readonly reviewRunStore: ReviewRunStore;
   private readonly reviewBatchTimelineMutex = createMutex();
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
@@ -290,11 +308,265 @@ export class ReviewService {
   // stays bound to the workspace/agent selected when this one-shot review began.
   private readonly transientReviewAgents = new Map<string, TransientReviewEntry>();
 
-  private sweepTransientReviewAgents(): void {
+  private async sweepTransientReviewAgents(): Promise<void> {
     const now = Date.now();
     for (const [id, entry] of this.transientReviewAgents) {
       if (now - entry.startedAt > READONLY_REVIEW_ENTRY_TTL_MS) this.transientReviewAgents.delete(id);
     }
+    let runs: ReviewRun[];
+    try {
+      runs = await this.reviewRunStore.list();
+    } catch (error) {
+      console.error("[Review Deck] Could not read ReviewRun metadata during cleanup.", error);
+      return;
+    }
+    for (const run of runs) {
+      if (now - Date.parse(run.startedAt) <= READONLY_REVIEW_ENTRY_TTL_MS) continue;
+      if (run.status === "running") {
+        try {
+          await this.reviewRunStore.update(run.requestId, (current) =>
+            current.status === "running" ? { ...current, status: "abandoned" } : current,
+          );
+        } catch (error) {
+          console.error(`[Review Deck] Could not abandon expired ReviewRun ${run.requestId}.`, error);
+        }
+      } else {
+        try {
+          await this.reviewRunStore.remove(run.requestId);
+        } catch (error) {
+          console.error(`[Review Deck] Could not remove expired ReviewRun ${run.requestId}.`, error);
+        }
+      }
+    }
+  }
+  private toReviewRun(
+    requestId: string,
+    entry: TransientReviewEntry,
+    childAgentId: string | null,
+    status: ReviewRun["status"],
+  ): ReviewRun {
+    return {
+      requestId,
+      childAgentId,
+      parentAgentId: entry.agentId,
+      workspaceId: entry.workspaceId,
+      cacheKey: entry.cacheKey,
+      mode: entry.mode,
+      status,
+      resultSource: entry.resultSource,
+      startedAt: new Date(entry.startedAt).toISOString(),
+      ...(entry.locale !== undefined ? { locale: entry.locale } : {}),
+      provider: entry.provider,
+      model: entry.model,
+      thinkingOptionId: entry.thinkingOptionId,
+      reviewerPermissionMode: entry.reviewerPermissionMode,
+      ...(entry.depth ? { depth: entry.depth } : {}),
+      ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      cacheEnabled: entry.cacheEnabled,
+      inputFingerprint: entry.inputFingerprint,
+      promptVersion: AI_REVIEW_PROMPT_VERSION,
+      schemaVersion: AI_REVIEW_SCHEMA_VERSION,
+    };
+  }
+  private transientEntryFromRun(
+    run: ReviewRun,
+    handle: TransientReviewChildHandle | null,
+    cachedResult?: TransientReviewEntry["cachedResult"],
+  ): TransientReviewEntry {
+    if (!run.inputFingerprint) throw new Error(`ReviewRun ${run.requestId} is missing its input fingerprint.`);
+    return {
+      handle,
+      ...(cachedResult ? { cachedResult } : {}),
+      locale: run.locale,
+      provider: run.provider,
+      model: run.model,
+      workspaceId: run.workspaceId,
+      agentId: run.parentAgentId,
+      startedAt: Date.parse(run.startedAt),
+      mode: run.mode,
+      reviewerPermissionMode: run.reviewerPermissionMode,
+      ...(run.depth ? { depth: run.depth } : {}),
+      ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+      resultSource: run.resultSource,
+      cacheEnabled: run.cacheEnabled,
+      cacheKey: run.cacheKey,
+      inputFingerprint: run.inputFingerprint,
+      thinkingOptionId: run.thinkingOptionId,
+    };
+  }
+
+  private matchesReviewRunCache(run: ReviewRun, cached: AiReviewCacheEntry): boolean {
+    return cached.key === run.cacheKey &&
+      cached.mode === run.mode &&
+      cached.provider === run.provider &&
+      cached.model === run.model &&
+      cached.thinking === run.thinkingOptionId &&
+      cached.promptVersion === run.promptVersion &&
+      cached.schemaVersion === run.schemaVersion &&
+      cached.inputFingerprint === run.inputFingerprint &&
+      cached.depth === run.depth;
+  }
+
+  private async abandonReviewRun(requestId: string): Promise<ReviewRun | null> {
+    return this.reviewRunStore.update(requestId, (current) =>
+      current.resultSource !== "cached" &&
+      (current.status === "running" || current.status === "completed")
+        ? { ...current, status: "abandoned" }
+        : current,
+    );
+  }
+
+  private async restoreTransientReviewEntry(
+    input: { requestId: string; workspaceId: string; agentId: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewRunRecoveryResult> {
+    let run: ReviewRun | null;
+    try {
+      run = await this.reviewRunStore.get(input.requestId);
+    } catch (error) {
+      console.error("[Review Deck] Could not read ReviewRun metadata while recovering a poll.", error);
+      return { kind: "unavailable", run: null };
+    }
+    if (!run || run.workspaceId !== input.workspaceId || run.parentAgentId !== input.agentId) {
+      return { kind: "unavailable", run };
+    }
+    if (run.status === "failed" || run.status === "abandoned") return { kind: "unavailable", run };
+    if (
+      Date.now() - Date.parse(run.startedAt) >= READONLY_REVIEW_ENTRY_TTL_MS ||
+      run.promptVersion !== AI_REVIEW_PROMPT_VERSION ||
+      run.schemaVersion !== AI_REVIEW_SCHEMA_VERSION ||
+      !run.inputFingerprint
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    if (run.resultSource === "cached") {
+      let cached: AiReviewCacheEntry | null;
+      try {
+        cached = await this.aiReviewCacheStore.get(run.cacheKey);
+      } catch {
+        return { kind: "retry", run };
+      }
+      if (!cached || !this.matchesReviewRunCache(run, cached)) {
+        const abandoned = await this.abandonReviewRun(run.requestId);
+        return { kind: "unavailable", run: abandoned ?? run };
+      }
+      const entry = this.transientEntryFromRun(run, null, {
+        review: cached.review,
+        sections: cached.sections,
+        usage: cached.usage,
+      });
+      this.transientReviewAgents.set(run.requestId, entry);
+      return { kind: "restored", entry };
+    }
+
+    if (run.cacheEnabled) {
+      try {
+        const cached = await this.aiReviewCacheStore.get(run.cacheKey);
+        if (cached && this.matchesReviewRunCache(run, cached)) {
+          let availableRun = run;
+          if (run.status === "running") {
+            try {
+              availableRun = await this.reviewRunStore.update(run.requestId, (current) =>
+                current.status === "running" ? { ...current, status: "completed" } : current,
+              ) ?? run;
+            } catch (error) {
+              console.error(`[Review Deck] Could not mark recovered ReviewRun ${run.requestId} completed.`, error);
+            }
+          }
+          if (availableRun.status === "failed" || availableRun.status === "abandoned") {
+            return { kind: "unavailable", run: availableRun };
+          }
+          const entry = this.transientEntryFromRun(availableRun, null, {
+            review: cached.review,
+            sections: cached.sections,
+            usage: cached.usage,
+          });
+          this.transientReviewAgents.set(run.requestId, entry);
+          return { kind: "restored", entry };
+        }
+      } catch {
+        // A cache miss or damaged optional cache does not prevent Agent recovery.
+      }
+    }
+
+    let listed: Awaited<ReturnType<PluginHandlerContext["paseo"]["agents"]["list"]>>;
+    try {
+      listed = await context.paseo.agents.list({
+        filter: {
+          labels: {
+            "review-deck.kind": "ai-review",
+            "review-deck.request": run.requestId,
+          },
+          includeArchived: true,
+        },
+      });
+    } catch {
+      return { kind: "retry", run };
+    }
+    const matches = listed.entries
+      .map((entry) => entry.agent)
+      .filter((agent) =>
+        agent.labels["review-deck.kind"] === "ai-review" &&
+        agent.labels["review-deck.request"] === run.requestId &&
+        agent.labels["review-deck.mode"] === run.mode,
+      );
+    if (matches.length !== 1) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+    const listedAgent = matches[0]!;
+    const parentLabel = listedAgent.labels["paseo.parent-agent-id"];
+    if (
+      listedAgent.archivedAt !== null ||
+      listedAgent.workspaceId !== run.workspaceId ||
+      parentLabel !== run.parentAgentId ||
+      (run.childAgentId !== null && listedAgent.id !== run.childAgentId)
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    const handle = context.paseo.agents.ref(listedAgent.id);
+    let refreshed;
+    try {
+      refreshed = await handle.refresh();
+    } catch {
+      return { kind: "retry", run };
+    }
+    const agent = refreshed?.agent;
+    if (
+      !agent ||
+      agent.archivedAt !== null ||
+      agent.workspaceId !== run.workspaceId ||
+      agent.labels["review-deck.kind"] !== "ai-review" ||
+      agent.labels["review-deck.request"] !== run.requestId ||
+      agent.labels["review-deck.mode"] !== run.mode ||
+      agent.labels["paseo.parent-agent-id"] !== run.parentAgentId ||
+      (run.childAgentId !== null && agent.id !== run.childAgentId)
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    const recorded = run.childAgentId === null
+      ? await this.reviewRunStore.update(run.requestId, (current) =>
+        current.status === "running" && current.childAgentId === null
+          ? { ...current, childAgentId: agent.id }
+          : current,
+      )
+      : run;
+    if (
+      !recorded ||
+      recorded.childAgentId !== agent.id ||
+      (recorded.status !== "running" && recorded.status !== "completed")
+    ) {
+      return { kind: "unavailable", run: recorded ?? run };
+    }
+    const entry = this.transientEntryFromRun(recorded, handle);
+    this.transientReviewAgents.set(run.requestId, entry);
+    return { kind: "restored", entry };
   }
 
   constructor(dependencies: ReviewServiceDependencies = {}) {
@@ -302,6 +574,7 @@ export class ReviewService {
     this.store = dependencies.store ?? new StateStore();
     this.aiReviewCacheStore = dependencies.aiReviewCacheStore ?? new AiReviewCacheStore();
     this.reviewBatchStore = dependencies.reviewBatchStore ?? new ReviewBatchStore();
+    this.reviewRunStore = dependencies.reviewRunStore ?? new ReviewRunStore();
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
     this.gitFactory = dependencies.gitFactory ?? ((cwd) => new GitRunner(cwd));
@@ -539,12 +812,14 @@ export class ReviewService {
    * when something was actually pruned. Returns the number of buckets removed.
    */
   async maintain(): Promise<number> {
-    return this.store.runExclusive(async () => {
+    const removed = await this.store.runExclusive(async () => {
       const file = await this.store.load();
       const removed = this.pruneStaleBuckets(file, "");
       if (removed > 0) await this.store.save(file);
       return removed;
     });
+    await this.sweepTransientReviewAgents();
+    return removed;
   }
 
   /**
@@ -1270,6 +1545,15 @@ export class ReviewService {
   ): Promise<void> {
     const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
     if (batch) await this.failActiveBatchAsUnresolved(batch.id, context);
+
+    const runs = await this.reviewRunStore.list();
+    for (const run of runs) {
+      if (run.parentAgentId !== event.agent.id || run.status !== "running") continue;
+      await this.reviewRunStore.update(run.requestId, (current) =>
+        current.status === "running" ? { ...current, status: "abandoned" } : current,
+      );
+      this.transientReviewAgents.delete(run.requestId);
+    }
   }
 
   async handleAgentTurnEnded(
@@ -1553,7 +1837,7 @@ export class ReviewService {
       aiInference: [],
       humanVerificationRecommended: [],
     };
-    let active: keyof ReviewSections | null = null;
+    let active: "verifiedFacts" | "aiInference" | "humanVerificationRecommended" | null = null;
     for (const line of text.split("\n")) {
       const heading = line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/[:：]$/, "");
       if (heading === "VERIFIED FACTS" || heading === "已确认事实" || heading === "已验证事实") active = "verifiedFacts";
@@ -1705,7 +1989,7 @@ export class ReviewService {
       schemaVersion: prompt.schemaVersion,
     }));
 
-    this.sweepTransientReviewAgents();
+    await this.sweepTransientReviewAgents();
     if (settings.aiReviewCacheEnabled) {
       let cached: AiReviewCacheEntry | null = null;
       try {
@@ -1726,7 +2010,7 @@ export class ReviewService {
         && cached.depth === depth
       ) {
         const requestId = randomUUID();
-        this.transientReviewAgents.set(requestId, {
+        const entry: TransientReviewEntry = {
           handle: null,
           cachedResult: { review: cached.review, sections: cached.sections, usage: cached.usage },
           locale: input.locale,
@@ -1744,7 +2028,9 @@ export class ReviewService {
           cacheKey,
           inputFingerprint: prompt.inputFingerprint,
           thinkingOptionId: reviewer.thinkingOptionId,
-        });
+        };
+        await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "completed"));
+        this.transientReviewAgents.set(requestId, entry);
         return requestId;
       }
     }
@@ -1966,37 +2252,16 @@ export class ReviewService {
     },
     context: PluginHandlerContext,
   ): Promise<string> {
-    const agentConfig = {
-      provider: input.reviewer.configProvider,
-      modeId: input.reviewer.modeId,
-      ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
-    };
-    let child: TransientReviewChildHandle;
-    try {
-      child = await context.paseo.agents.create({
-        config: agentConfig,
-        cwd: input.worktreePath,
-        parent: input.agentId,
-        title: input.locale === "zh" ? "Review Deck AI 评审" : "Review Deck AI review",
-        autoArchive: true,
-        prompt: input.prompt,
-      });
-    } catch (error) {
-      throw new Error(
-        input.locale === "zh"
-          ? `评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未在所选工作区 Agent 的会话流中运行。`
-          : `Failed to create the review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
-      );
-    }
     const requestId = randomUUID();
-    this.transientReviewAgents.set(requestId, {
-      handle: child,
+    const startedAt = Date.now();
+    const entry: TransientReviewEntry = {
+      handle: null,
       locale: input.locale,
       provider: input.reviewer.provider,
       model: input.reviewer.model,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
-      startedAt: Date.now(),
+      startedAt,
       mode: input.mode,
       reviewerPermissionMode: input.reviewer.reviewerPermissionMode,
       depth: input.depth,
@@ -2006,7 +2271,60 @@ export class ReviewService {
       cacheKey: input.cacheKey,
       inputFingerprint: input.inputFingerprint,
       thinkingOptionId: input.reviewer.thinkingOptionId,
-    });
+    };
+    await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "running"));
+
+    const agentConfig = {
+      provider: input.reviewer.configProvider,
+      modeId: input.reviewer.modeId,
+      ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
+    };
+    let child: TransientReviewChildHandle;
+    try {
+      child = await context.paseo.agents.create({
+        idempotencyKey: requestId,
+        config: agentConfig,
+        cwd: input.worktreePath,
+        parent: input.agentId,
+        title: input.locale === "zh" ? "Review Deck AI 评审" : "Review Deck AI review",
+        autoArchive: true,
+        ...(supportsStructuredReviewOutput(input.reviewer.provider)
+          ? { outputSchema: AI_REVIEW_OUTPUT_SCHEMA }
+          : {}),
+        labels: {
+          "review-deck.kind": "ai-review",
+          "review-deck.request": requestId,
+          "review-deck.mode": input.mode,
+        },
+        prompt: input.prompt,
+      });
+    } catch (error) {
+      await this.reviewRunStore.update(requestId, (current) =>
+        current.status === "running" ? { ...current, status: "failed" } : current,
+      ).catch(() => null);
+      throw new Error(
+        input.locale === "zh"
+          ? `评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未在所选工作区 Agent 的会话流中运行。`
+          : `Failed to create the review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
+      );
+    }
+
+    let stored: ReviewRun | null;
+    try {
+      stored = await this.reviewRunStore.update(requestId, (current) =>
+        current.status === "running" ? { ...current, childAgentId: child.id } : current,
+      );
+    } catch (error) {
+      await context.paseo.agents.ref(child.id).archive().catch(() => undefined);
+      throw new Error("The review Agent was created, but its recovery record could not be saved.", { cause: error });
+    }
+    if (!stored || stored.status !== "running" || stored.childAgentId !== child.id) {
+      await context.paseo.agents.ref(child.id).archive().catch(() => undefined);
+      throw new Error(`ReviewRun ${requestId} stopped before its child Agent was recorded.`);
+    }
+
+    entry.handle = child;
+    this.transientReviewAgents.set(requestId, entry);
     return requestId;
   }
 
@@ -2055,10 +2373,62 @@ export class ReviewService {
    * Polls a one-shot reviewer. Cache hits use the same request capability and
    * result contract as fresh runs; fresh runs preserve status and token usage.
    */
-  async pollAiReview(input: { requestId: string; workspaceId: string; agentId: string }): Promise<PollAiReviewResult> {
-    this.sweepTransientReviewAgents();
-    const entry = this.transientReviewAgents.get(input.requestId);
-    if (!entry || entry.workspaceId !== input.workspaceId || entry.agentId !== input.agentId) {
+  async pollAiReview(
+    input: { requestId: string; workspaceId: string; agentId: string },
+    context: PluginHandlerContext,
+  ): Promise<PollAiReviewResult> {
+    await this.sweepTransientReviewAgents();
+    let entry = this.transientReviewAgents.get(input.requestId);
+    if (!entry) {
+      const recovery = await this.restoreTransientReviewEntry(input, context);
+      if (recovery.kind === "retry") {
+        const run = recovery.run;
+        return {
+          status: "running",
+          review: "",
+          sections: emptyReviewSections(),
+          provider: run.provider,
+          model: run.model ?? "unknown",
+          thinkingOptionId: run.thinkingOptionId,
+          reviewerPermissionMode: run.reviewerPermissionMode,
+          resultSource: run.resultSource,
+          mode: run.mode,
+          ...(run.depth ? { depth: run.depth } : {}),
+          ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+        };
+      }
+      if (recovery.kind === "unavailable") {
+        const run = recovery.run;
+        const bindingMatches = run &&
+          run.workspaceId === input.workspaceId &&
+          run.parentAgentId === input.agentId;
+        const locale = bindingMatches ? run.locale ?? "en" : "en";
+        const statusMessage = bindingMatches && run.status === "abandoned"
+          ? locale === "zh" ? "AI 评审运行已放弃，请重新开始。" : "The AI review run was abandoned; start it again."
+          : bindingMatches && run.status === "failed"
+            ? locale === "zh" ? "AI 评审运行失败，请重新开始。" : "The AI review run failed; start it again."
+            : locale === "zh"
+              ? "AI 评审请求已不可用。"
+              : "The AI review request is no longer available.";
+        return {
+          status: "error",
+          review: statusMessage,
+          sections: emptyReviewSections(),
+          provider: bindingMatches ? run.provider : "",
+          model: bindingMatches ? run.model ?? "unknown" : "",
+          ...(bindingMatches ? {
+            thinkingOptionId: run.thinkingOptionId,
+            reviewerPermissionMode: run.reviewerPermissionMode,
+            resultSource: run.resultSource,
+            mode: run.mode,
+            ...(run.depth ? { depth: run.depth } : {}),
+            ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+          } : {}),
+        };
+      }
+      entry = recovery.entry;
+    }
+    if (entry.workspaceId !== input.workspaceId || entry.agentId !== input.agentId) {
       return {
         status: "error",
         review: "The AI review request is no longer available.",
@@ -2068,7 +2438,6 @@ export class ReviewService {
       };
     }
     if (entry.cachedResult) {
-      this.transientReviewAgents.delete(input.requestId);
       return {
         status: "idle",
         review: entry.cachedResult.review,
@@ -2077,7 +2446,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "cached",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -2085,7 +2454,6 @@ export class ReviewService {
       };
     }
     if (!entry.handle) {
-      this.transientReviewAgents.delete(input.requestId);
       return {
         status: "error",
         review: "The AI review request has no active reviewer.",
@@ -2094,7 +2462,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -2112,7 +2480,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -2128,7 +2496,23 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+        ...(usage ? { usage } : {}),
+      };
+    }
+    if (result.status === "permission") {
+      return {
+        status: "permission",
+        review: result.error ?? "",
+        sections: emptyReviewSections(),
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -2136,14 +2520,20 @@ export class ReviewService {
       };
     }
 
-    this.transientReviewAgents.delete(input.requestId);
     const locale = entry.locale ?? "en";
     const assistantText =
       result.lastMessage?.trim()
         ? result.lastMessage
         : await this.extractLastAssistantText(entry.handle);
-    const review = assistantText ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
-    const sections = this.parseReviewSections(review);
+    const structured = result.status === "idle" && assistantText
+      ? parseStructuredReviewResult(assistantText)
+      : null;
+    const normalizedStructured = structured ? normalizeStructuredReviewResult(structured) : null;
+    const review = normalizedStructured?.review ??
+      assistantText ??
+      result.error ??
+      (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
+    const sections = normalizedStructured?.sections ?? this.parseReviewSections(review);
     if (result.status === "idle" && assistantText && entry.cacheEnabled && entry.cacheKey && entry.inputFingerprint) {
       try {
         await this.aiReviewCacheStore.put({
@@ -2155,7 +2545,7 @@ export class ReviewService {
           promptVersion: AI_REVIEW_PROMPT_VERSION,
           schemaVersion: AI_REVIEW_SCHEMA_VERSION,
           inputFingerprint: entry.inputFingerprint,
-          review: assistantText,
+          review,
           sections,
           ...(entry.depth ? { depth: entry.depth } : {}),
           ...(usage ? { usage } : {}),
@@ -2163,6 +2553,23 @@ export class ReviewService {
       } catch {
         // A successful review remains usable even when the optional cache is unavailable.
       }
+    }
+    const nextStatus: ReviewRun["status"] = result.status === "idle" ? "completed" : "failed";
+    try {
+      await this.reviewRunStore.update(input.requestId, (current) =>
+        current.status === "running" ? { ...current, status: nextStatus } : current,
+      );
+    } catch (error) {
+      console.error(`[Review Deck] Could not persist terminal ReviewRun ${input.requestId}; returning its result.`, error);
+    }
+    if (result.status === "idle") {
+      entry.cachedResult = {
+        review,
+        sections,
+        ...(usage ? { usage } : {}),
+      };
+    } else {
+      this.transientReviewAgents.delete(input.requestId);
     }
     return {
       status: result.status,
@@ -2172,7 +2579,7 @@ export class ReviewService {
       model: entry.model ?? "unknown",
       thinkingOptionId: entry.thinkingOptionId,
       reviewerPermissionMode: entry.reviewerPermissionMode,
-      resultSource: "fresh",
+      resultSource: entry.resultSource,
       mode: entry.mode,
       ...(entry.depth ? { depth: entry.depth } : {}),
       ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),

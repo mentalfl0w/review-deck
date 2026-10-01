@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { ReviewService } from "../server/ReviewService";
+import { ReviewRunStore, type ReviewRun } from "../server/persistence/ReviewRunStore";
 import { AiReviewCacheStore } from "../server/persistence/AiReviewCacheStore";
 import type { ReviewRequest } from "../shared/review";
 import type { ReviewDeckSettingsHandle } from "../shared/review-settings";
@@ -49,6 +50,7 @@ function git(cwd: string, ...args: string[]): string {
 async function run(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "review-deck-ai-review-"));
   let cachePath: string | undefined;
+  let runStorePath: string | undefined;
   try {
     git(root, "init", "-q");
     git(root, "config", "user.name", "Review Deck Test");
@@ -91,7 +93,17 @@ async function run(): Promise<void> {
     let parentWorkspaceId = "workspace-1";
     let parentAvailableModes: Array<{ id: string; label: string; description?: string }> = [];
     let parentProvider = "parent-provider";
-    const created: Array<{ config: Record<string, unknown>; prompt: string; cwd: string; parent: string }> = [];
+    const created: Array<{
+      config: Record<string, unknown>;
+      prompt: string;
+      cwd: string;
+      parent: string;
+      outputSchema?: Record<string, unknown>;
+      labels?: Record<string, string>;
+      idempotencyKey?: string;
+      autoArchive?: boolean;
+    }> = [];
+    const responseQueue: string[] = [];
     const parentAgent = () => ({
       id: "parent-agent",
       workspaceId: parentWorkspaceId,
@@ -101,21 +113,87 @@ async function run(): Promise<void> {
       thinkingOptionId: "parent-thinking",
       availableModes: parentAvailableModes,
     });
+    type FakeAgentSnapshot = {
+      id: string;
+      workspaceId: string;
+      cwd: string;
+      archivedAt: string | null;
+      labels: Record<string, string>;
+    };
+    const children = new Map<string, {
+      agent: FakeAgentSnapshot;
+      handle: {
+        id: string;
+        current: () => FakeAgentSnapshot;
+        refresh: () => Promise<{ agent: FakeAgentSnapshot; project: null }>;
+        waitForFinish: () => Promise<{
+          status: "idle" | "error" | "permission" | "timeout";
+          error: string | null;
+          lastMessage: string | null;
+          final: { lastUsage: typeof USAGE };
+        }>;
+        timeline: { refetch: () => Promise<{ entries: never[] }> };
+        archive: () => Promise<{ archivedAt: string }>;
+      };
+    }>();
     const context = {
       paseo: {
         agents: {
-          ref: () => ({ current: parentAgent, refresh: async () => ({ agent: parentAgent() }) }),
-          create: async (options: { config: Record<string, unknown>; prompt: string; cwd: string; parent: string }) => {
-            created.push(options);
+          ref: (agentId: string) => {
+            if (agentId === "parent-agent") {
+              return { id: agentId, current: parentAgent, refresh: async () => ({ agent: parentAgent() }) };
+            }
+            return children.get(agentId)?.handle;
+          },
+          list: async (options: { filter?: { labels?: Record<string, string>; includeArchived?: boolean } }) => {
+            const expectedLabels = options.filter?.labels ?? {};
             return {
-              id: `review-child-${created.length}`,
+              entries: [...children.values()]
+                .filter(({ agent }) =>
+                  Object.entries(expectedLabels).every(([key, value]) => agent.labels[key] === value),
+                )
+                .filter(({ agent }) => options.filter?.includeArchived === true || agent.archivedAt === null)
+                .map(({ agent }) => ({ agent })),
+            };
+          },
+          create: async (options: {
+            config: Record<string, unknown>;
+            prompt: string;
+            cwd: string;
+            parent: string;
+            outputSchema?: Record<string, unknown>;
+            labels?: Record<string, string>;
+            idempotencyKey?: string;
+            autoArchive?: boolean;
+          }) => {
+            const id = `review-child-${created.length + 1}`;
+            created.push(options);
+            const agent: FakeAgentSnapshot = {
+              id,
+              workspaceId: "workspace-1",
+              cwd: options.cwd,
+              archivedAt: null,
+              labels: { ...options.labels, "paseo.parent-agent-id": options.parent },
+            };
+            const handle = {
+              id,
+              current: () => agent,
+              refresh: async () => ({ agent, project: null }),
               waitForFinish: async () => ({
-                status: "idle",
+                status: "idle" as const,
                 error: null,
-                lastMessage: RESPONSE,
+                lastMessage: responseQueue.shift() ?? RESPONSE,
                 final: { lastUsage: USAGE },
               }),
+              timeline: { refetch: async () => ({ entries: [] as never[] }) },
+              archive: async () => {
+                const archivedAt = new Date().toISOString();
+                agent.archivedAt = archivedAt;
+                return { archivedAt };
+              },
             };
+            children.set(id, { agent, handle });
+            return handle;
           },
         },
         workspaces: {
@@ -129,15 +207,21 @@ async function run(): Promise<void> {
     const cacheFilePath = join(tmpdir(), `review-deck-ai-cache-${randomUUID()}.json`);
     cachePath = cacheFilePath;
     const cacheStore = new AiReviewCacheStore({ storagePath: cacheFilePath, now: () => new Date("2026-09-30T12:00:00.000Z") });
-    const service = new ReviewService({
+    const runsFilePath = join(tmpdir(), `review-deck-ai-runs-${randomUUID()}.json`);
+    runStorePath = runsFilePath;
+    const runStore = new ReviewRunStore(runsFilePath);
+    const createService = () => new ReviewService({
       settings: settings as unknown as ReviewDeckSettingsHandle,
       aiReviewCacheStore: cacheStore,
+      reviewRunStore: runStore,
     });
-    const poll = (requestId: string) => service.pollAiReview({
+    const service = createService();
+    const pollWith = (targetService: ReviewService, requestId: string) => targetService.pollAiReview({
       requestId,
       workspaceId: "workspace-1",
       agentId: "parent-agent",
-    });
+    }, context);
+    const poll = (requestId: string) => pollWith(service, requestId);
 
     const before = await service.createSnapshot({ cwd: root, scope: "working", filePath: "a.ts", locale: "en" });
     const oldHunkId = before.files.find((file) => file.path === "a.ts")?.hunks[0]?.id;
@@ -158,6 +242,10 @@ async function run(): Promise<void> {
     assert.equal(freshHunk.resultSource, "fresh");
     assert.equal(freshHunk.usage?.cachedTokens, 6_200);
     assert.ok(created[0].prompt.includes("AI_REVIEW_PATCH_SENTINEL"), "hunk review includes the exact selected patch");
+    assert.equal(created[0]?.outputSchema, undefined, "unknown providers use the Markdown-only fallback");
+    assert.ok(created[0].prompt.includes("only when the host supplies that schema"));
+    assert.equal(freshHunk.sections.verifiedFacts[0], "The reviewed snapshot contains the selected change.");
+
 
     const fileInput = reviewInput(root, "file", "a.ts");
     const fileStart = await service.startRunReview(fileInput, context);
@@ -188,7 +276,11 @@ async function run(): Promise<void> {
     assert.equal(created[2].config.thinkingOptionId, "deep");
     assert.equal(created[2].config.modeId, "plan");
     const cachedTargetStart = await service.startRunReview(targetInput, context);
-    const cachedTarget = await poll(cachedTargetStart.requestId);
+    const cachedRunRecord = await runStore.get(cachedTargetStart.requestId);
+    assert.equal(cachedRunRecord?.resultSource, "cached");
+    assert.equal(cachedRunRecord?.childAgentId, null);
+    assert.equal(cachedRunRecord?.status, "completed");
+    const cachedTarget = await pollWith(createService(), cachedTargetStart.requestId);
     assert.equal(cachedTarget.resultSource, "cached", "an unchanged target reuses its successful review");
     assert.equal(created.length, 3);
 
@@ -231,10 +323,26 @@ async function run(): Promise<void> {
     assert.ok(created[4].prompt.includes("AI_REVIEW_PATCH_SENTINEL"), "explicit Full depth includes patch bodies");
 
     assert.equal(await service.clearAiReviewCache(), true);
+    responseQueue.push(JSON.stringify({
+      summary: "Structured summary",
+      findings: [{
+        hunkId: newHunkId,
+        filePath: "a.ts",
+        severity: "high",
+        evidenceKind: "verified_fact",
+        category: "structured-output",
+        summary: "Structured finding",
+        detail: "The structured result was validated and normalized.",
+        suggestedCheck: "Run the focused integration test.",
+      }],
+    }));
     const afterClearStart = await service.startRunReview(fileInput, context);
     const afterClear = await poll(afterClearStart.requestId);
     assert.equal(afterClear.resultSource, "fresh", "clearing the cache forces a new reviewer run");
     assert.equal(created.length, 6);
+    assert.equal(afterClear.sections.summary, "Structured summary");
+    assert.equal(afterClear.sections.verifiedFacts.length, 1);
+    assert.ok(afterClear.review.includes("Structured finding"));
     currentSettings = { ...currentSettings, aiReviewCacheEnabled: false };
     const uncachedFirstStart = await service.startRunReview(fileInput, context);
     assert.equal((await poll(uncachedFirstStart.requestId)).resultSource, "fresh");
@@ -340,9 +448,166 @@ async function run(): Promise<void> {
     assert.ok(!created[presetRunsBefore + 3].prompt.includes("AI_REVIEW_PATCH_SENTINEL"));
     assert.ok(created[presetRunsBefore + 3].prompt.includes("inspect every hunk"));
     assert.equal(created.length, presetRunsBefore + 4);
+    currentSettings = { ...currentSettings, aiReviewCacheEnabled: false };
+    const recoverableStart = await service.startRunReview(fileInput, context);
+    const persistedBeforeReload = await runStore.get(recoverableStart.requestId);
+    assert.equal(persistedBeforeReload?.status, "running");
+    assert.ok(persistedBeforeReload?.childAgentId);
+    const recoverableChild = children.get(persistedBeforeReload.childAgentId);
+    assert.ok(recoverableChild);
+    assert.equal(created[created.length - 1]?.labels?.["review-deck.request"], recoverableStart.requestId);
+    assert.equal(created[created.length - 1]?.labels?.["review-deck.kind"], "ai-review");
+
+    const restartedService = createService();
+    const wrongWorkspacePoll = await restartedService.pollAiReview({
+      requestId: recoverableStart.requestId,
+      workspaceId: "another-workspace",
+      agentId: "parent-agent",
+    }, context);
+    assert.equal(wrongWorkspacePoll.status, "error", "a request cannot be recovered from another workspace");
+    assert.equal((await runStore.get(recoverableStart.requestId))?.status, "running");
+    const recoveredAfterReload = await pollWith(restartedService, recoverableStart.requestId);
+    assert.equal(recoveredAfterReload.status, "idle");
+    assert.equal(recoveredAfterReload.resultSource, "fresh");
+    assert.equal(recoveredAfterReload.mode, "file");
+    assert.equal((await runStore.get(recoverableStart.requestId))?.status, "completed");
+
+    const archivedStart = await service.startRunReview(fileInput, context);
+    const archivedRun = await runStore.get(archivedStart.requestId);
+    assert.ok(archivedRun?.childAgentId);
+    const archivedChild = children.get(archivedRun.childAgentId);
+    assert.ok(archivedChild);
+    archivedChild.agent.archivedAt = new Date().toISOString();
+    const archivedPoll = await pollWith(createService(), archivedStart.requestId);
+    assert.equal(archivedPoll.status, "error", "an archived reviewer child is never restored");
+    assert.equal((await runStore.get(archivedStart.requestId))?.status, "abandoned");
+
+    const expiredStart = await service.startRunReview(fileInput, context);
+    await runStore.update(expiredStart.requestId, (current) => ({
+      ...current,
+      startedAt: new Date(Date.now() - 61 * 60_000).toISOString(),
+    }));
+    const expiredPoll = await pollWith(createService(), expiredStart.requestId);
+    assert.equal(expiredPoll.status, "error", "runs past the TTL are abandoned rather than resumed");
+    assert.equal((await runStore.get(expiredStart.requestId))?.status, "abandoned");
+    const failingRunStore = {
+      list: async () => { throw new Error("simulated run store read failure"); },
+      get: (requestId: string) => runStore.get(requestId),
+      create: (run: ReviewRun) => runStore.create(run),
+      update: (requestId: string, transform: (run: ReviewRun) => ReviewRun | Promise<ReviewRun>) =>
+        runStore.update(requestId, async (run) => {
+          const updated = await transform(run);
+          if (updated.status === "completed" || updated.status === "failed") {
+            throw new Error("simulated terminal run store write failure");
+          }
+          return updated;
+        }),
+      remove: (requestId: string) => runStore.remove(requestId),
+    } as unknown as ReviewRunStore;
+    const serviceWithStoreFailure = new ReviewService({
+      settings: settings as unknown as ReviewDeckSettingsHandle,
+      aiReviewCacheStore: cacheStore,
+      reviewRunStore: failingRunStore,
+    });
+    const previousConsoleError = console.error;
+    console.error = () => {};
+    try {
+      const started = await serviceWithStoreFailure.startRunReview(fileInput, context);
+      const result = await serviceWithStoreFailure.pollAiReview({
+        requestId: started.requestId,
+        workspaceId: "workspace-1",
+        agentId: "parent-agent",
+      }, context);
+      assert.equal(result.status, "idle");
+      assert.ok(result.review.includes("The reviewed snapshot contains the selected change."));
+      assert.equal((await runStore.get(started.requestId))?.status, "running");
+    } finally {
+      console.error = previousConsoleError;
+    }
+    currentSettings = {
+      ...currentSettings,
+      reviewerStrategy: "inherit",
+      aiReviewCacheEnabled: false,
+    };
+    parentProvider = "codex";
+    parentAvailableModes = [{ id: "read-only", label: "Read-only", description: "Read-only review mode" }];
+    responseQueue.push(JSON.stringify({
+      summary: "Codex structured summary",
+      findings: [{
+        filePath: "a.ts",
+        severity: "medium",
+        evidenceKind: "ai_inference",
+        category: "structured-output",
+        summary: "The supported provider received the schema.",
+        detail: "The structured response passed Zod validation.",
+      }],
+    }));
+    const supportedOutputStart = await service.startRunReview(targetInput, context);
+    const supportedCreate = created[created.length - 1];
+    assert.equal(supportedCreate?.config.provider, "codex/parent-model");
+    assert.ok(supportedCreate?.outputSchema, "known schema-capable providers receive outputSchema");
+    const supportedOutput = await poll(supportedOutputStart.requestId);
+    assert.equal(supportedOutput.sections.summary, "Codex structured summary");
+    assert.equal(supportedOutput.resultSource, "fresh");
+    responseQueue.push([
+      "```json",
+      "{\"findings\":[{\"severity\":\"urgent\"}]}",
+      "```",
+      "### Verified Facts",
+      "- Markdown fallback survived invalid structured JSON.",
+    ].join("\n"));
+    const invalidStructuredStart = await service.startRunReview(targetInput, context);
+    const invalidStructured = await poll(invalidStructuredStart.requestId);
+    assert.equal(invalidStructured.status, "idle");
+    assert.equal(
+      invalidStructured.sections.verifiedFacts[0],
+      "Markdown fallback survived invalid structured JSON.",
+    );
+    currentSettings = {
+      ...currentSettings,
+      aiReviewCacheEnabled: true,
+      defaultReviewPreset: "balanced",
+    };
+    const cacheFillStart = await service.startRunReview(targetInput, context);
+    assert.equal((await poll(cacheFillStart.requestId)).status, "idle");
+    const missingCacheStart = await service.startRunReview(targetInput, context);
+    assert.equal((await runStore.get(missingCacheStart.requestId))?.resultSource, "cached");
+    await service.clearAiReviewCache();
+    const missingCachePoll = await pollWith(createService(), missingCacheStart.requestId);
+    assert.equal(missingCachePoll.status, "error");
+    assert.equal((await runStore.get(missingCacheStart.requestId))?.status, "completed");
+
+    currentSettings = { ...currentSettings, aiReviewCacheEnabled: false };
+    const unreadableStoreStart = await service.startRunReview(fileInput, context);
+    const unreadableRunStore = {
+      list: () => runStore.list(),
+      get: async (_requestId: string): Promise<ReviewRun | null> => {
+        throw new Error("simulated damaged runs.json");
+      },
+      create: (run: ReviewRun) => runStore.create(run),
+      update: (requestId: string, transform: (run: ReviewRun) => ReviewRun | Promise<ReviewRun>) =>
+        runStore.update(requestId, transform),
+      remove: (requestId: string) => runStore.remove(requestId),
+    } as unknown as ReviewRunStore;
+    const unreadableService = new ReviewService({
+      settings: settings as unknown as ReviewDeckSettingsHandle,
+      aiReviewCacheStore: cacheStore,
+      reviewRunStore: unreadableRunStore,
+    });
+    const previousReadError = console.error;
+    console.error = () => {};
+    try {
+      const unreadablePoll = await pollWith(unreadableService, unreadableStoreStart.requestId);
+      assert.equal(unreadablePoll.status, "error");
+      assert.equal(unreadablePoll.review, "The AI review request is no longer available.");
+      assert.ok(!unreadablePoll.review.includes("damaged runs.json"));
+    } finally {
+      console.error = previousReadError;
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
     if (cachePath) await rm(cachePath, { force: true });
+    if (runStorePath) await rm(runStorePath, { force: true });
   }
 }
 

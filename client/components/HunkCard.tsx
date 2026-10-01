@@ -278,10 +278,14 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
               <View style={styles.analysisBlock}>
                 <Text style={styles.label}>{t("aiReviewLabel", { provider: aiExplanation.provider, model: aiExplanation.model })}</Text>
                 <AiReviewMeta details={aiExplanation} showUsage={showAiReviewUsage} t={t} styles={styles} />
+                {aiExplanation.summary ? <Text selectable style={styles.scopeDesc}>{aiExplanation.summary}</Text> : null}
                 <StringGroup label={t("findingsVerified")} items={aiExplanation.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsInference")} items={aiExplanation.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={aiExplanation.humanVerificationRecommended} t={t} styles={styles} />
-                {aiExplanation.verifiedFacts.length === 0 && aiExplanation.aiInference.length === 0 && aiExplanation.humanVerificationRecommended.length === 0 ? (
+                {!aiExplanation.summary &&
+                aiExplanation.verifiedFacts.length === 0 &&
+                aiExplanation.aiInference.length === 0 &&
+                aiExplanation.humanVerificationRecommended.length === 0 ? (
                   <Text style={styles.muted}>{t("noAdditionalAnalysis")}</Text>
                 ) : null}
               </View>

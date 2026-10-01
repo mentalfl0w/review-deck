@@ -321,11 +321,13 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             </Text>
             {agentReviewMeta ? <AiReviewMeta details={agentReviewMeta} showUsage={showAiReviewUsage} t={t} styles={styles} /> : null}
             {agentSections && (
+              agentSections.summary ||
               agentSections.verifiedFacts.length > 0 ||
               agentSections.aiInference.length > 0 ||
               agentSections.humanVerificationRecommended.length > 0
             ) ? (
               <>
+                {agentSections.summary ? <Text selectable style={styles.scopeDesc}>{agentSections.summary}</Text> : null}
                 <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />

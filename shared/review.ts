@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { activeReviewBatchSchema, reviewBatchSchema } from "./review-batch";
 
 export const reviewScopeSchema = z.enum(["working", "staged", "branch", "commits"]);
 export type ReviewScope = z.infer<typeof reviewScopeSchema>;
@@ -124,6 +125,23 @@ export const reviewFindingSchema = z.object({
   detail: z.string(),
   suggestedCheck: z.string().optional(),
 });
+export const structuredReviewFindingSchema = z.object({
+  hunkId: z.string().min(1).optional(),
+  filePath: z.string().min(1),
+  severity: severitySchema,
+  evidenceKind: evidenceKindSchema,
+  category: z.string().min(1),
+  summary: z.string().min(1),
+  detail: z.string().min(1),
+  suggestedCheck: z.string().min(1).optional(),
+}).strict();
+export type StructuredReviewFinding = z.infer<typeof structuredReviewFindingSchema>;
+
+export const structuredReviewResultSchema = z.object({
+  findings: z.array(structuredReviewFindingSchema),
+  summary: z.string().optional(),
+}).strict();
+export type StructuredReviewResult = z.infer<typeof structuredReviewResultSchema>;
 
 export const reviewHunkSchema = z.object({
   id: z.string(),
@@ -181,6 +199,7 @@ export const getTargetFingerprint = defineRpc({
   output: z.object({ targetFingerprint: z.string() }),
 });
 export const reviewSectionsSchema = z.object({
+  summary: z.string().optional(),
   verifiedFacts: z.array(z.string()),
   aiInference: z.array(z.string()),
   humanVerificationRecommended: z.array(z.string()),
@@ -202,6 +221,7 @@ export const explainHunk = defineRpc({
 });
 export const explainHunkAiResultSchema = explainHunkResultSchema.extend({
   status: z.enum(["idle", "error", "permission", "timeout"]),
+  summary: z.string().optional(),
   provider: z.string(),
   model: z.string(),
   thinkingOptionId: z.string().nullable().optional(),
@@ -450,6 +470,7 @@ export const projectReviewSummarySchema = z.object({
   fileCount: z.number().int().nonnegative(),
   targetCount: z.number().int().nonnegative(),
   comments: z.array(projectReviewCommentSchema),
+  batches: z.array(activeReviewBatchSchema),
 });
 export type ProjectReviewSummary = z.infer<typeof projectReviewSummarySchema>;
 
@@ -468,17 +489,9 @@ export const getProjectReviewCommentCount = defineRpc({
   output: z.object({ commentCount: z.number().int().nonnegative() }),
 });
 
-// processProjectReview hands every comment to the selected agent's workflow
-// (fire-and-forget; results appear in the agent's conversation) and removes the
-// comments from Review Deck — the result is a submission confirmation only.
-export const processProjectReviewResultSchema = z.object({
-  projectId: z.string(),
-  workspaceId: z.string(),
-  workspaceCwd: z.string(),
-  processedCommentIds: z.array(z.string()),
-  commentCount: z.number().int().nonnegative(),
-  submittedAt: z.string(),
-});
+// Submit one workspace's selected comments as a persisted ReviewBatch. Comments
+// remain queued until the Agent's turn reports explicit COMPLETED outcomes.
+export const processProjectReviewResultSchema = reviewBatchSchema;
 export type ProcessProjectReviewResult = z.infer<typeof processProjectReviewResultSchema>;
 
 export const processProjectReview = defineRpc({
@@ -488,6 +501,7 @@ export const processProjectReview = defineRpc({
     agentId: z.string().min(1),
     workspaceId: z.string().min(1),
     workspaceCwd: z.string().min(1),
+    commentIds: z.array(z.string().min(1)).min(1),
   }),
   output: processProjectReviewResultSchema,
 });

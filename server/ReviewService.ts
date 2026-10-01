@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext, PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type {
   AiReviewDepth,
   AiReviewBudgetPreset,
@@ -35,10 +35,20 @@ import {
   type ReviewDeckSettingsValues,
 } from "../shared/review-settings";
 import {
-  reviewHandoffTimelineKind,
-  reviewHandoffTimelineSchema,
-  reviewHandoffTimelineVersion,
-} from "../shared/review-handoff";
+  reviewBatchTimelineKind,
+  reviewBatchTimelineSchema,
+  reviewBatchTimelineVersion,
+  type ActiveReviewBatch,
+  type ReviewBatch,
+  type ReviewCommentOutcome,
+} from "../shared/review-batch";
+import {
+  reviewAiTimelineKind,
+  reviewAiTimelineSchema,
+  reviewAiTimelineVersion,
+  type ReviewWorkspaceIndicators,
+  type WorkspaceReviewSummary,
+} from "../shared/review-activity";
 import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
 import {
   buildLineRangeAnchor,
@@ -48,7 +58,7 @@ import {
   type AnchorResolution,
   type OwnershipConstraints,
 } from "./AnchorEngine";
-import { RepoMutexRegistry } from "./util/mutex";
+import { createMutex, RepoMutexRegistry } from "./util/mutex";
 import { displayLanguage } from "./lang/languages";
 import { severityRank } from "./diff/FindingDetector";
 import { DiffParser, hunkBodyLines, parseRange, type Hunk } from "./diff/DiffParser";
@@ -58,6 +68,8 @@ import {
   AiReviewCacheStore,
   type AiReviewCacheEntry,
 } from "./persistence/AiReviewCacheStore";
+import { ReviewBatchStore } from "./persistence/ReviewBatchStore";
+import { ReviewRunStore, type ReviewRun } from "./persistence/ReviewRunStore";
 import {
   AI_REVIEW_PROMPT_VERSION,
   AI_REVIEW_SCHEMA_VERSION,
@@ -65,6 +77,17 @@ import {
   promptHunk,
   type AiReviewPromptFile,
 } from "./ai-review-prompt";
+import {
+  buildReviewBatchPrompt,
+  extractReviewBatchAssistantResponse,
+  parseReviewCommentOutcomes,
+  reviewBatchTimelineData,
+} from "./review-batch";
+import {
+  AI_REVIEW_OUTPUT_SCHEMA,
+  normalizeStructuredReviewResult,
+  parseStructuredReviewResult,
+} from "./structured-review";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
@@ -72,6 +95,8 @@ export interface ReviewServiceDependencies {
   settings?: ReviewDeckSettingsHandle;
   store?: StateStore;
   aiReviewCacheStore?: AiReviewCacheStore;
+  reviewBatchStore?: ReviewBatchStore;
+  reviewRunStore?: ReviewRunStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -80,8 +105,55 @@ export interface ReviewServiceDependencies {
 /** Short wait window per poll; the daemon reports "timeout" while the turn is
  * still running, so a poll never blocks the plugin RPC layer. */
 const READONLY_REVIEW_POLL_WAIT_MS = 2_000;
-/** Abandoned review entries (client gave up polling) are evicted after this. */
-const READONLY_REVIEW_ENTRY_TTL_MS = 10 * 60_000;
+/** Persistent run records remain recoverable for one hour. */
+const READONLY_REVIEW_ENTRY_TTL_MS = 60 * 60_000;
+/** Give the Agent a bounded startup window before releasing a lost submission. */
+const REVIEW_BATCH_START_TIMEOUT_MS = 2 * 60_000;
+
+/** Conservative allowlist: Paseo currently forwards outputSchema only for these provider adapters. */
+const STRUCTURED_REVIEW_PROVIDER_IDS = new Set(["codex", "opencode"]);
+function supportsStructuredReviewOutput(provider: string): boolean {
+  return STRUCTURED_REVIEW_PROVIDER_IDS.has(provider.split("/")[0]?.toLowerCase() ?? "");
+}
+
+function isActiveReviewBatch(status: ReviewBatch["status"]): boolean {
+  return status === "draft" || status === "submitted" || status === "running";
+}
+
+function isOrphanedReviewBatch(batch: ReviewBatch): boolean {
+  return batch.status === "failed" &&
+    batch.commentIds.every((commentId) => batch.outcomes[commentId] === "unresolved");
+}
+
+/** Finding tally of one AI review result, as the run record and the timeline
+ * row report it. */
+type AiReviewFindingCounts = {
+  findingCount: number;
+  highRiskFindingCount: number;
+};
+
+/**
+ * Count the findings of a terminal AI review from the source-neutral UI
+ * sections: one section entry is one finding, which is exactly what the panel
+ * lists for the same result. A structured result carries one entry per
+ * validated finding, and its entries start with the normalized
+ * `**SEVERITY · category**` marker, so critical/high findings are counted
+ * exactly; a Markdown fallback has no machine-readable severity and therefore
+ * reports zero high-risk findings instead of guessing from prose.
+ */
+function countSectionFindings(sections: ReviewSections): AiReviewFindingCounts {
+  const entries = [
+    ...sections.verifiedFacts,
+    ...sections.aiInference,
+    ...sections.humanVerificationRecommended,
+  ];
+  return {
+    findingCount: entries.length,
+    // The normalized structured finding marker is `**SEVERITY · category**`,
+    // so this only matches a severity the structured result actually assigned.
+    highRiskFindingCount: entries.filter((entry) => /^\*\*(?:CRITICAL|HIGH) · /.test(entry.trimStart())).length,
+  };
+}
 
 function emptyReviewSections(): ReviewSections {
   return { verifiedFacts: [], aiInference: [], humanVerificationRecommended: [] };
@@ -119,10 +191,14 @@ type TransientReviewEntry = {
   reviewerPermissionMode: AiReviewPermissionMode;
   resultSource: AiReviewResultSource;
   cacheEnabled: boolean;
-  cacheKey?: string;
-  inputFingerprint?: string;
+  cacheKey: string;
+  inputFingerprint: string;
   thinkingOptionId: string | null;
 };
+type ReviewRunRecoveryResult =
+  | { kind: "restored"; entry: TransientReviewEntry }
+  | { kind: "retry"; run: ReviewRun }
+  | { kind: "unavailable"; run: ReviewRun | null };
 function toAiReviewUsage(usage: TransientAgentUsage | null | undefined): AiReviewUsage | undefined {
   if (!usage) return undefined;
   const result: AiReviewUsage = {};
@@ -258,6 +334,9 @@ export class ReviewService {
   private readonly settings: ReviewDeckSettingsHandle | undefined;
   private readonly store: StateStore;
   private readonly aiReviewCacheStore: AiReviewCacheStore;
+  private readonly reviewBatchStore: ReviewBatchStore;
+  private readonly reviewRunStore: ReviewRunStore;
+  private readonly reviewBatchTimelineMutex = createMutex();
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
   private readonly gitFactory: (cwd: string) => GitRunner;
@@ -266,17 +345,273 @@ export class ReviewService {
   // stays bound to the workspace/agent selected when this one-shot review began.
   private readonly transientReviewAgents = new Map<string, TransientReviewEntry>();
 
-  private sweepTransientReviewAgents(): void {
+  private async sweepTransientReviewAgents(): Promise<void> {
     const now = Date.now();
     for (const [id, entry] of this.transientReviewAgents) {
       if (now - entry.startedAt > READONLY_REVIEW_ENTRY_TTL_MS) this.transientReviewAgents.delete(id);
     }
+    let runs: ReviewRun[];
+    try {
+      runs = await this.reviewRunStore.list();
+    } catch (error) {
+      console.error("[Review Deck] Could not read ReviewRun metadata during cleanup.", error);
+      return;
+    }
+    for (const run of runs) {
+      if (now - Date.parse(run.startedAt) <= READONLY_REVIEW_ENTRY_TTL_MS) continue;
+      if (run.status === "running") {
+        try {
+          await this.reviewRunStore.update(run.requestId, (current) =>
+            current.status === "running" ? { ...current, status: "abandoned" } : current,
+          );
+        } catch (error) {
+          console.error(`[Review Deck] Could not abandon expired ReviewRun ${run.requestId}.`, error);
+        }
+      } else {
+        try {
+          await this.reviewRunStore.remove(run.requestId);
+        } catch (error) {
+          console.error(`[Review Deck] Could not remove expired ReviewRun ${run.requestId}.`, error);
+        }
+      }
+    }
+  }
+  private toReviewRun(
+    requestId: string,
+    entry: TransientReviewEntry,
+    childAgentId: string | null,
+    status: ReviewRun["status"],
+  ): ReviewRun {
+    return {
+      requestId,
+      childAgentId,
+      parentAgentId: entry.agentId,
+      workspaceId: entry.workspaceId,
+      cacheKey: entry.cacheKey,
+      mode: entry.mode,
+      status,
+      resultSource: entry.resultSource,
+      startedAt: new Date(entry.startedAt).toISOString(),
+      ...(entry.locale !== undefined ? { locale: entry.locale } : {}),
+      provider: entry.provider,
+      model: entry.model,
+      thinkingOptionId: entry.thinkingOptionId,
+      reviewerPermissionMode: entry.reviewerPermissionMode,
+      ...(entry.depth ? { depth: entry.depth } : {}),
+      ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      cacheEnabled: entry.cacheEnabled,
+      inputFingerprint: entry.inputFingerprint,
+      promptVersion: AI_REVIEW_PROMPT_VERSION,
+      schemaVersion: AI_REVIEW_SCHEMA_VERSION,
+    };
+  }
+  private transientEntryFromRun(
+    run: ReviewRun,
+    handle: TransientReviewChildHandle | null,
+    cachedResult?: TransientReviewEntry["cachedResult"],
+  ): TransientReviewEntry {
+    if (!run.inputFingerprint) throw new Error(`ReviewRun ${run.requestId} is missing its input fingerprint.`);
+    return {
+      handle,
+      ...(cachedResult ? { cachedResult } : {}),
+      locale: run.locale,
+      provider: run.provider,
+      model: run.model,
+      workspaceId: run.workspaceId,
+      agentId: run.parentAgentId,
+      startedAt: Date.parse(run.startedAt),
+      mode: run.mode,
+      reviewerPermissionMode: run.reviewerPermissionMode,
+      ...(run.depth ? { depth: run.depth } : {}),
+      ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+      resultSource: run.resultSource,
+      cacheEnabled: run.cacheEnabled,
+      cacheKey: run.cacheKey,
+      inputFingerprint: run.inputFingerprint,
+      thinkingOptionId: run.thinkingOptionId,
+    };
+  }
+
+  private matchesReviewRunCache(run: ReviewRun, cached: AiReviewCacheEntry): boolean {
+    return cached.key === run.cacheKey &&
+      cached.mode === run.mode &&
+      cached.provider === run.provider &&
+      cached.model === run.model &&
+      cached.thinking === run.thinkingOptionId &&
+      cached.promptVersion === run.promptVersion &&
+      cached.schemaVersion === run.schemaVersion &&
+      cached.inputFingerprint === run.inputFingerprint &&
+      cached.depth === run.depth;
+  }
+
+  private async abandonReviewRun(requestId: string): Promise<ReviewRun | null> {
+    return this.reviewRunStore.update(requestId, (current) =>
+      current.resultSource !== "cached" &&
+      (current.status === "running" || current.status === "completed")
+        ? { ...current, status: "abandoned" }
+        : current,
+    );
+  }
+
+  private async restoreTransientReviewEntry(
+    input: { requestId: string; workspaceId: string; agentId: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewRunRecoveryResult> {
+    let run: ReviewRun | null;
+    try {
+      run = await this.reviewRunStore.get(input.requestId);
+    } catch (error) {
+      console.error("[Review Deck] Could not read ReviewRun metadata while recovering a poll.", error);
+      return { kind: "unavailable", run: null };
+    }
+    if (!run || run.workspaceId !== input.workspaceId || run.parentAgentId !== input.agentId) {
+      return { kind: "unavailable", run };
+    }
+    if (run.status === "failed" || run.status === "abandoned") return { kind: "unavailable", run };
+    if (
+      Date.now() - Date.parse(run.startedAt) >= READONLY_REVIEW_ENTRY_TTL_MS ||
+      run.promptVersion !== AI_REVIEW_PROMPT_VERSION ||
+      run.schemaVersion !== AI_REVIEW_SCHEMA_VERSION ||
+      !run.inputFingerprint
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    if (run.resultSource === "cached") {
+      let cached: AiReviewCacheEntry | null;
+      try {
+        cached = await this.aiReviewCacheStore.get(run.cacheKey);
+      } catch {
+        return { kind: "retry", run };
+      }
+      if (!cached || !this.matchesReviewRunCache(run, cached)) {
+        const abandoned = await this.abandonReviewRun(run.requestId);
+        return { kind: "unavailable", run: abandoned ?? run };
+      }
+      const entry = this.transientEntryFromRun(run, null, {
+        review: cached.review,
+        sections: cached.sections,
+        usage: cached.usage,
+      });
+      this.transientReviewAgents.set(run.requestId, entry);
+      return { kind: "restored", entry };
+    }
+
+    if (run.cacheEnabled) {
+      try {
+        const cached = await this.aiReviewCacheStore.get(run.cacheKey);
+        if (cached && this.matchesReviewRunCache(run, cached)) {
+          let availableRun = run;
+          if (run.status === "running") {
+            try {
+              availableRun = await this.reviewRunStore.update(run.requestId, (current) =>
+                current.status === "running" ? { ...current, status: "completed" } : current,
+              ) ?? run;
+            } catch (error) {
+              console.error(`[Review Deck] Could not mark recovered ReviewRun ${run.requestId} completed.`, error);
+            }
+          }
+          if (availableRun.status === "failed" || availableRun.status === "abandoned") {
+            return { kind: "unavailable", run: availableRun };
+          }
+          const entry = this.transientEntryFromRun(availableRun, null, {
+            review: cached.review,
+            sections: cached.sections,
+            usage: cached.usage,
+          });
+          this.transientReviewAgents.set(run.requestId, entry);
+          return { kind: "restored", entry };
+        }
+      } catch {
+        // A cache miss or damaged optional cache does not prevent Agent recovery.
+      }
+    }
+
+    let listed: Awaited<ReturnType<PluginHandlerContext["paseo"]["agents"]["list"]>>;
+    try {
+      listed = await context.paseo.agents.list({
+        filter: {
+          labels: {
+            "review-deck.kind": "ai-review",
+            "review-deck.request": run.requestId,
+          },
+          includeArchived: true,
+        },
+      });
+    } catch {
+      return { kind: "retry", run };
+    }
+    const matches = listed.entries
+      .map((entry) => entry.agent)
+      .filter((agent) =>
+        agent.labels["review-deck.kind"] === "ai-review" &&
+        agent.labels["review-deck.request"] === run.requestId &&
+        agent.labels["review-deck.mode"] === run.mode,
+      );
+    if (matches.length !== 1) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+    const listedAgent = matches[0]!;
+    const parentLabel = listedAgent.labels["paseo.parent-agent-id"];
+    if (
+      listedAgent.archivedAt !== null ||
+      listedAgent.workspaceId !== run.workspaceId ||
+      parentLabel !== run.parentAgentId ||
+      (run.childAgentId !== null && listedAgent.id !== run.childAgentId)
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    const handle = context.paseo.agents.ref(listedAgent.id);
+    let refreshed;
+    try {
+      refreshed = await handle.refresh();
+    } catch {
+      return { kind: "retry", run };
+    }
+    const agent = refreshed?.agent;
+    if (
+      !agent ||
+      agent.archivedAt !== null ||
+      agent.workspaceId !== run.workspaceId ||
+      agent.labels["review-deck.kind"] !== "ai-review" ||
+      agent.labels["review-deck.request"] !== run.requestId ||
+      agent.labels["review-deck.mode"] !== run.mode ||
+      agent.labels["paseo.parent-agent-id"] !== run.parentAgentId ||
+      (run.childAgentId !== null && agent.id !== run.childAgentId)
+    ) {
+      const abandoned = await this.abandonReviewRun(run.requestId);
+      return { kind: "unavailable", run: abandoned ?? run };
+    }
+
+    const recorded = run.childAgentId === null
+      ? await this.reviewRunStore.update(run.requestId, (current) =>
+        current.status === "running" && current.childAgentId === null
+          ? { ...current, childAgentId: agent.id }
+          : current,
+      )
+      : run;
+    if (
+      !recorded ||
+      recorded.childAgentId !== agent.id ||
+      (recorded.status !== "running" && recorded.status !== "completed")
+    ) {
+      return { kind: "unavailable", run: recorded ?? run };
+    }
+    const entry = this.transientEntryFromRun(recorded, handle);
+    this.transientReviewAgents.set(run.requestId, entry);
+    return { kind: "restored", entry };
   }
 
   constructor(dependencies: ReviewServiceDependencies = {}) {
     this.settings = dependencies.settings;
     this.store = dependencies.store ?? new StateStore();
     this.aiReviewCacheStore = dependencies.aiReviewCacheStore ?? new AiReviewCacheStore();
+    this.reviewBatchStore = dependencies.reviewBatchStore ?? new ReviewBatchStore();
+    this.reviewRunStore = dependencies.reviewRunStore ?? new ReviewRunStore();
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
     this.gitFactory = dependencies.gitFactory ?? ((cwd) => new GitRunner(cwd));
@@ -514,12 +849,14 @@ export class ReviewService {
    * when something was actually pruned. Returns the number of buckets removed.
    */
   async maintain(): Promise<number> {
-    return this.store.runExclusive(async () => {
+    const removed = await this.store.runExclusive(async () => {
       const file = await this.store.load();
       const removed = this.pruneStaleBuckets(file, "");
       if (removed > 0) await this.store.save(file);
       return removed;
     });
+    await this.sweepTransientReviewAgents();
+    return removed;
   }
 
   /**
@@ -1011,24 +1348,83 @@ export class ReviewService {
   }
 
   /**
-   * List the saved review comments of one project, ordered by filePath then savedAt.
-   * Returns null when the project has no comment records, so listings never expose
-   * an empty project. fileCount/targetCount are computed from the comment records.
+   * List a project's queued comments and in-flight batches. Completed outcomes
+   * are reconciled against the queue before the summary is returned.
    */
-  async listProjectReviewComments(projectId: string): Promise<ProjectReviewSummary | null> {
-    const file = await this.store.load();
+  async listProjectReviewComments(
+    projectId: string,
+    context?: PluginHandlerContext,
+  ): Promise<ProjectReviewSummary | null> {
+    if (context) await this.reconcileStalledReviewBatches(projectId, context);
+    const storedBatches = await this.reviewBatchStore.listByProject(projectId);
+    const completedCommentIds = [...new Set(storedBatches
+      .filter((batch) => !isActiveReviewBatch(batch.status))
+      .flatMap((batch) => batch.commentIds.filter((commentId) => batch.outcomes[commentId] === "completed")))];
+    if (completedCommentIds.length > 0) {
+      await this.clearProjectReviewComments(projectId, completedCommentIds);
+    }
+    const [file, activeBatches] = await Promise.all([
+      this.store.load(),
+      this.reviewBatchStore.listActiveByProject(projectId),
+    ]);
     const comments = sortProjectComments(this.projectComments(file, projectId));
-    if (comments.length === 0) return null;
-    const { projectName, projectRootPath } = this.projectCommentIdentity(comments);
+    if (comments.length === 0 && activeBatches.length === 0) return null;
+    const identity = comments.length > 0 ? this.projectCommentIdentity(comments) : null;
     return {
       projectId,
-      ...(projectName !== undefined ? { projectName } : {}),
-      ...(projectRootPath !== undefined ? { projectRootPath } : {}),
+      ...(identity?.projectName !== undefined ? { projectName: identity.projectName } : {}),
+      ...(identity?.projectRootPath !== undefined ? { projectRootPath: identity.projectRootPath } : {}),
       commentCount: comments.length,
       fileCount: new Set(comments.map((comment) => comment.filePath)).size,
       targetCount: new Set(comments.map((comment) => comment.targetFingerprint)).size,
       comments,
+      batches: activeBatches.map((batch): ActiveReviewBatch => ({
+        id: batch.id,
+        workspaceId: batch.workspaceId,
+        agentId: batch.agentId,
+        commentIds: batch.commentIds,
+        status: batch.status as ActiveReviewBatch["status"],
+      })),
     };
+  }
+
+  private async reconcileStalledReviewBatches(projectId: string, context: PluginHandlerContext): Promise<void> {
+    const batches = await this.reviewBatchStore.listActiveByProject(projectId);
+    for (const batch of batches) {
+      const turnWasObserved = batch.status === "running" ||
+        (batch.status === "submitted" && batch.turnId !== undefined);
+      const startExpired = (batch.status === "draft" || batch.status === "submitted") &&
+        Date.now() - Date.parse(batch.createdAt) >= REVIEW_BATCH_START_TIMEOUT_MS;
+      const handle = context.paseo.agents.ref(batch.agentId);
+      let refreshed;
+      try {
+        refreshed = await handle.refresh();
+      } catch {
+        // An RPC/transport failure is not evidence that the Agent is gone.
+        continue;
+      }
+      const agent = refreshed?.agent ?? handle.current();
+      if (agent && !agent.archivedAt && (agent.status === "running" || agent.status === "initializing")) continue;
+      if (!turnWasObserved && !startExpired) continue;
+      await this.failActiveBatchAsUnresolved(batch.id, context);
+    }
+  }
+
+  private async failActiveBatchAsUnresolved(
+    batchId: string,
+    context: PluginHandlerContext | PluginHookContext,
+  ): Promise<void> {
+    const completedAt = new Date().toISOString();
+    let finalized = false;
+    const updated = await this.reviewBatchStore.update(batchId, (current) => {
+      if (!isActiveReviewBatch(current.status)) return current;
+      finalized = true;
+      const outcomes = Object.fromEntries(
+        current.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "unresolved"]),
+      );
+      return { ...current, status: "failed", outcomes, completedAt };
+    });
+    if (finalized && updated) await this.appendReviewBatchTimeline(updated, context);
   }
 
   /**
@@ -1053,33 +1449,341 @@ export class ReviewService {
   }
 
   /**
-   * Process every saved review comment of one project in a single agent run,
-   * strictly bound to the workspace selected in the client UI.
-   * The executing agent is refreshed and validated BEFORE anything runs: it must
-   * exist, must belong to input.workspaceId, and its cwd must be the selected
-   * workspace directory (real-path/normalization differences allowed, a foreign
-   * workspace never accepted). Any mismatch throws a clear error — the server
-   * never silently substitutes another agent.
-   * The prompt embeds the executing agent's workspace id/cwd plus each comment's
-   * file path, target/hunk fingerprints, hunk header, exact patch, human comment,
-   * and its own worktree context (cwd, scope, refs, workspace id). Project
-   * comments may span multiple worktrees; the agent must only touch the listed
-   * files/hunks inside the comment's own cwd/worktree, verify fingerprints item by
-   * item, and stop (reporting stale) any item whose target drifted.
-   * Submit-and-cleanup semantics: the whole prompt is handed to the agent's
-   * workflow fire-and-forget (never waited on — processing time is unbounded),
-   * then every submitted comment is removed from Review Deck. The returned
-   * processedCommentIds/commentCount/submittedAt are the submission
-   * confirmation; results appear in the agent's conversation, not here.
+   * The workspace binding every v1.7 activity RPC starts from: the project the
+   * workspace belongs to and the directory its reviews run in, both resolved
+   * from Paseo instead of trusted from the caller. Fails closed when the
+   * workspace cannot be resolved, answers for a different id, or declares no
+   * project/directory of its own, so a stale, archived, or forged workspace id
+   * can never report or mark another workspace's activity.
+   */
+  private async resolveWorkspaceIdentity(
+    workspaceId: string,
+    context: PluginHandlerContext,
+  ): Promise<{ workspaceId: string; projectId: string; directory: string }> {
+    const handle = context.paseo.workspaces.ref(workspaceId);
+    let workspace: {
+      id?: string;
+      projectId?: string | null;
+      workspaceDirectory?: string | null;
+      archivingAt?: string | null;
+    } | null | undefined;
+    try {
+      workspace = (await handle.refresh()) ?? handle.current();
+    } catch {
+      workspace = handle.current();
+    }
+    if (!workspace) {
+      throw new Error(
+        `Workspace ${workspaceId} does not exist; refusing to report Review Deck activity for an unknown workspace.`,
+      );
+    }
+    if (workspace.id !== undefined && workspace.id !== workspaceId) {
+      throw new Error(
+        `Workspace ${workspaceId} resolved to workspace ${workspace.id}; refusing to report mismatched Review Deck activity.`,
+      );
+    }
+    if (typeof workspace.archivingAt === "string" && workspace.archivingAt.length > 0) {
+      throw new Error(
+        `Workspace ${workspaceId} is being archived; refusing to report Review Deck activity for it.`,
+      );
+    }
+    const projectId = typeof workspace.projectId === "string" && workspace.projectId.length > 0
+      ? workspace.projectId
+      : null;
+    const directory = typeof workspace.workspaceDirectory === "string" && workspace.workspaceDirectory.length > 0
+      ? workspace.workspaceDirectory
+      : null;
+    if (!projectId || !directory) {
+      throw new Error(
+        `Workspace ${workspaceId} declares no project and directory; refusing to report Review Deck activity for it.`,
+      );
+    }
+    return { workspaceId, projectId, directory };
+  }
+
+  /**
+   * Count one workspace's queued review comments without ever building a
+   * comment row: the queue predicate is the same one the project list uses
+   * (projectId + commented + non-blank body), and the workspace binding is the
+   * comment's recorded workspaceId. The pending counter and the stale counter
+   * are disjoint action categories — a comment whose stored anchor is stale or
+   * ambiguous counts as stale, every other comment counts as pending — so
+   * pending + stale is the raw queued total and the header can show both
+   * without double counting. A legacy comment saved before v1.4 recorded a
+   * workspaceId belongs to this workspace only when its recorded cwd is the
+   * workspace directory and this workspace is the project's sole owner of that
+   * directory — never when the directory is shared, so one comment can never be
+   * counted into two workspaces. The counters carry bodies nowhere: the strings
+   * are inspected inside this method and discarded with it.
+   */
+  private async countWorkspaceReviewComments(
+    file: StateFile,
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<{
+    projectPendingCommentCount: number;
+    projectStaleCommentCount: number;
+    workspacePendingCommentCount: number;
+    workspaceStaleCommentCount: number;
+  }> {
+    let projectPendingCommentCount = 0;
+    let projectStaleCommentCount = 0;
+    let workspacePendingCommentCount = 0;
+    let workspaceStaleCommentCount = 0;
+    // Resolved at most once per call, and only when a legacy row is actually
+    // considered, so a store without legacy rows pays no workspace-list read.
+    let legacyAssignable: boolean | null = null;
+    for (const entries of Object.values(file)) {
+      for (const entry of entries) {
+        if (this.projectCommentBody(entry, identity.projectId) === null) continue;
+        // Pending and stale are disjoint: a comment whose stored resolution
+        // could not attach to a hunk (stale or ambiguous) is a stale item, and
+        // every other queued comment is a pending item.
+        const stale = entry.anchorState === "stale" || entry.anchorState === "ambiguous";
+        if (stale) projectStaleCommentCount += 1;
+        else projectPendingCommentCount += 1;
+        let inWorkspace: boolean;
+        if (entry.workspaceId !== undefined) {
+          inWorkspace = entry.workspaceId === identity.workspaceId;
+        } else if (entry.cwd === undefined) {
+          inWorkspace = false;
+        } else {
+          if (legacyAssignable === null) {
+            legacyAssignable = await this.legacyCommentsBelongToWorkspace(identity, context);
+          }
+          inWorkspace = legacyAssignable && await this.directoriesMatch(entry.cwd, identity.directory);
+        }
+        if (!inWorkspace) continue;
+        if (stale) workspaceStaleCommentCount += 1;
+        else workspacePendingCommentCount += 1;
+      }
+    }
+    return {
+      projectPendingCommentCount,
+      projectStaleCommentCount,
+      workspacePendingCommentCount,
+      workspaceStaleCommentCount,
+    };
+  }
+
+  /**
+   * Whether this workspace is the project's sole owner of its directory — the
+   * only case in which a legacy comment (saved before v1.4 recorded a
+   * workspaceId) may be counted as this workspace's. Resolved from Paseo in one
+   * unpaged list: a failed list, a truncated page, or a second listed
+   * workspace resolving to the same directory all keep legacy comments
+   * project-scoped instead of guessing a workspace.
+   */
+  private async legacyCommentsBelongToWorkspace(
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<boolean> {
+    let listed: {
+      entries: ReadonlyArray<{ id: string; workspaceDirectory?: string }>;
+      pageInfo: { hasMore: boolean };
+    };
+    try {
+      listed = await context.paseo.workspaces.list({ filter: { projectId: identity.projectId } });
+    } catch {
+      return false;
+    }
+    if (listed.pageInfo.hasMore) return false;
+    const owners: string[] = [];
+    for (const workspace of listed.entries) {
+      if (!workspace.workspaceDirectory) continue;
+      if (!(await this.directoriesMatch(workspace.workspaceDirectory, identity.directory))) continue;
+      owners.push(workspace.id);
+    }
+    return owners.length === 1 && owners[0] === identity.workspaceId;
+  }
+
+  /**
+   * Metadata-only activity of one workspace: queued comment counts (project
+   * and workspace scoped), stored stale/ambiguous anchor counts, in-flight
+   * batches, running AI review runs, and the findings of completed runs the
+   * user has not opened Review Deck for yet. Pending and stale are disjoint
+   * action categories — pending + stale is the raw queued total — and the
+   * header can therefore show both without double counting. Reads no Git state
+   * — the detailed summary owns that — so the header badge stays cheap, and
+   * stale counts come from the states the last resolution stored.
+   */
+  async getWorkspaceReviewIndicators(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewWorkspaceIndicators> {
+    return this.workspaceReviewIndicators(await this.resolveWorkspaceIdentity(input.workspaceId, context), context);
+  }
+
+  private async workspaceReviewIndicators(
+    identity: { workspaceId: string; projectId: string; directory: string },
+    context: PluginHandlerContext,
+  ): Promise<ReviewWorkspaceIndicators> {
+    const [file, batches, runs] = await Promise.all([
+      this.store.load(),
+      this.reviewBatchStore.list(),
+      this.reviewRunStore.list(),
+    ]);
+    const commentCounts = await this.countWorkspaceReviewComments(file, identity, context);
+    return {
+      workspaceId: identity.workspaceId,
+      projectId: identity.projectId,
+      ...commentCounts,
+      activeBatchCount: batches.filter(
+        (batch) => batch.workspaceId === identity.workspaceId && isActiveReviewBatch(batch.status),
+      ).length,
+      runningAiReviewCount: runs.filter(
+        (run) => run.workspaceId === identity.workspaceId && run.status === "running",
+      ).length,
+      unreadAiFindingCount: runs.reduce(
+        (total, run) => run.workspaceId === identity.workspaceId &&
+          run.mode !== "hunk" &&
+          run.status === "completed" &&
+          run.readAt === undefined
+          ? total + (run.findingCount ?? 0)
+          : total,
+        0,
+      ),
+    };
+  }
+
+  /**
+   * The detailed popover summary: the indicators plus the reviewed/total block
+   * counts of the workspace's default working-tree snapshot. The anchors of
+   * that snapshot are refreshed first — resolving entries against the current
+   * working tree exactly like the panel does, migrating and re-stating what
+   * resolves — so the stale/ambiguous counts describe the current target
+   * instead of the last stored resolution, and a block counts as reviewed when
+   * it carries a saved decision, the same mark the panel shows. A workspace
+   * whose working tree cannot be resolved fails closed rather than reporting
+   * fabricated progress.
+   */
+  async getWorkspaceReviewSummary(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<WorkspaceReviewSummary> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    const snapshot = await this.createSnapshot({ cwd: identity.directory, scope: "working" });
+    const currentHunks: ReviewStateCurrentHunk[] = snapshot.files.flatMap((file) =>
+      file.hunks.map((hunk) => ({
+        hunkId: hunk.id,
+        filePath: hunk.filePath,
+        ...(file.oldPath !== undefined ? { oldPath: file.oldPath } : {}),
+        hunkHeader: hunk.header,
+        hunkPatch: hunk.patch,
+      })),
+    );
+    const resolved = await this.reviewState({
+      targetFingerprint: snapshot.targetFingerprint,
+      currentHunks,
+      request: { cwd: identity.directory, scope: "working" },
+      projectId: identity.projectId,
+      workspaceId: identity.workspaceId,
+    });
+    const indicators = await this.workspaceReviewIndicators(identity, context);
+    const currentHunkIds = new Set(currentHunks.map((hunk) => hunk.hunkId));
+    const constraints: OwnershipConstraints = {
+      projectId: identity.projectId,
+      workspaceId: identity.workspaceId,
+      cwd: identity.directory,
+      scope: "working",
+    };
+    const targetEntries = (await this.store.load())[snapshot.targetFingerprint] ?? [];
+    let legacyDirectoryOwner: boolean | null = null;
+    const ownedCurrentHunkIds = new Set<string>();
+    for (const entry of targetEntries) {
+      if (ownershipMismatch(entry, constraints) !== null) continue;
+      if (entry.workspaceId === undefined) {
+        if (!entry.cwd) continue;
+        if (legacyDirectoryOwner === null) {
+          legacyDirectoryOwner = await this.legacyCommentsBelongToWorkspace(identity, context);
+        }
+        if (!legacyDirectoryOwner || !(await this.directoriesMatch(entry.cwd, identity.directory))) continue;
+      }
+      if (currentHunkIds.has(entry.hunkId)) ownedCurrentHunkIds.add(entry.hunkId);
+    }
+    const reviewedHunkIds = new Set(
+      resolved.decisions
+        .map((decision) => decision.hunkId)
+        .filter((hunkId) => currentHunkIds.has(hunkId) && ownedCurrentHunkIds.has(hunkId)),
+    );
+    return {
+      ...indicators,
+      reviewedBlockCount: reviewedHunkIds.size,
+      totalBlockCount: snapshot.totalHunks,
+    };
+  }
+
+  /**
+   * Opening the deck: every completed file or target run of the workspace that
+   * reported at least one finding and has not been read yet is stamped with one
+   * readAt, and the answer counts the runs this call actually transitioned.
+   * Hunk explanations carry no tally and runs with nothing to read are left
+   * alone, so the mark only ever covers what the unread counter reported. Each
+   * run goes through its own ReviewRunStore update, so the check and the write
+   * are a single atomic read-modify-write — a concurrent opening that loses the
+   * race observes the stored readAt and leaves it alone instead of counting the
+   * run twice.
+   */
+  async markWorkspaceReviewResultsRead(
+    input: { workspaceId: string },
+    context: PluginHandlerContext,
+  ): Promise<{ markedRunCount: number }> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    const runs = await this.reviewRunStore.list();
+    const readAt = new Date().toISOString();
+    let markedRunCount = 0;
+    for (const run of runs) {
+      if (
+        run.workspaceId !== identity.workspaceId ||
+        run.mode === "hunk" ||
+        run.status !== "completed" ||
+        run.readAt !== undefined ||
+        (run.findingCount ?? 0) <= 0
+      ) continue;
+      const updated = await this.reviewRunStore.update(run.requestId, (current) =>
+        current.workspaceId === identity.workspaceId &&
+          current.mode !== "hunk" &&
+          current.status === "completed" &&
+          (current.findingCount ?? 0) > 0 &&
+          current.readAt === undefined
+          ? { ...current, readAt }
+          : current,
+      );
+      if (updated?.readAt === readAt) markedRunCount += 1;
+    }
+    return { markedRunCount };
+  }
+
+  /**
+   * Submit exactly one workspace's selected comments. Their records remain in
+   * the queue until the matching Agent turn explicitly reports COMPLETED.
    */
   async processProjectReview(
-    input: { projectId: string; agentId: string; workspaceId: string; workspaceCwd: string },
+    input: {
+      projectId: string;
+      agentId: string;
+      workspaceId: string;
+      workspaceCwd: string;
+      commentIds: string[];
+    },
     context: PluginHandlerContext,
   ): Promise<ProcessProjectReviewResult> {
-    // Workspace-bound agent gate: refresh first so a deleted, replaced, or
-    // re-bound agent can never be processed silently under a stale id.
+    const requestedIds = new Set(input.commentIds);
+    if (requestedIds.size !== input.commentIds.length) {
+      throw new Error("A ReviewBatch cannot contain duplicate comment ids.");
+    }
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    if (identity.projectId !== input.projectId) {
+      throw new Error(`Project ${input.projectId} does not belong to workspace ${input.workspaceId}.`);
+    }
+    if (!(await this.directoriesMatch(identity.directory, input.workspaceCwd))) {
+      throw new Error(`Workspace ${input.workspaceId} does not own directory ${input.workspaceCwd}.`);
+    }
+
+    // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
+    // can never process comments under a stale workspace selection.
     const handle = context.paseo.agents.ref(input.agentId);
-    let agent: { workspaceId?: string; cwd?: string } | null | undefined;
+    let agent: { workspaceId?: string | null; cwd?: string | null } | null | undefined;
     try {
       const fresh = await handle.refresh();
       agent = fresh?.agent ?? handle.current();
@@ -1087,128 +1791,232 @@ export class ReviewService {
       agent = handle.current();
     }
     if (!agent) {
-      throw new Error(
-        `Processing agent ${input.agentId} does not exist. Select an agent of workspace ${input.workspaceId} and retry.`,
-      );
+      throw new Error(`Processing agent ${input.agentId} does not exist. Select an Agent in workspace ${input.workspaceId} and retry.`);
     }
     if (agent.workspaceId !== input.workspaceId) {
       throw new Error(
-        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not the selected workspace ${input.workspaceId}. Project comments can only be processed by an agent of the selected workspace; no other agent was substituted.`,
+        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not ${input.workspaceId}. No other Agent was substituted.`,
       );
     }
     if (!(await this.directoriesMatch(agent.cwd ?? "", input.workspaceCwd))) {
       throw new Error(
-        `Processing agent ${input.agentId} runs in ${agent.cwd ?? "(unknown)"}, which is not the selected workspace directory ${input.workspaceCwd}. Refusing to process with an agent outside the selected workspace.`,
+        `Processing agent ${input.agentId} does not run in the selected workspace directory ${input.workspaceCwd}. Refusing to process outside that workspace.`,
       );
     }
+
     const file = await this.store.load();
-    const comments = sortProjectComments(this.projectComments(file, input.projectId));
-    if (comments.length === 0) {
-      throw new Error(`Project ${input.projectId} has no saved review comments. Save at least one commented hunk before processing.`);
+    const comments = sortProjectComments(this.projectComments(file, input.projectId))
+      .filter((comment) => requestedIds.has(comment.id));
+    if (comments.length !== requestedIds.size) {
+      throw new Error("One or more selected project comments are no longer in the queue. Refresh the queue and retry.");
     }
-    const processedCommentIds = comments.map((comment) => comment.id);
-    const { projectName, projectRootPath } = this.projectCommentIdentity(comments);
-    const commentBlocks = comments.map(
-      (comment, index) => [
-        `[${index + 1}] Comment id: ${comment.id}`,
-        `File: ${comment.filePath}`,
-        `Comment cwd (worktree): ${comment.cwd}`,
-        `Scope: ${comment.scope}`,
-        `Base ref: ${comment.baseRef ?? "(repository default)"}`,
-        `Head ref: ${comment.headRef ?? "(repository default)"}`,
-        ...(comment.workspaceId !== undefined ? [`Workspace id: ${comment.workspaceId}`] : []),
-        `Target fingerprint: ${comment.targetFingerprint}`,
-        `Hunk fingerprint: ${comment.hunkFingerprint}`,
-        `Hunk header: ${comment.hunkHeader}`,
-        `Human comment: ${comment.comment}`,
-        `Exact hunk patch:\n${comment.hunkPatch}`,
-      ].join("\n"),
-    );
-    const prompt = [
-      "Process every saved review comment below as one task.",
-      "Each comment block carries its own cwd (the exact working directory of the worktree the comment came from), scope, refs, and workspace id. The project may span multiple worktrees: you MUST validate and modify every comment inside that comment's own cwd/workspace only, and never treat the project root path, the executing agent's own workspace, or any other worktree as the target of a comment. Every comment is validated against its own cwd, even when that cwd differs from the executing agent's workspace.",
-      "You may edit the listed files and hunks to address the human comments, but never modify unrelated files or hunks, and never touch anything outside the comment's own cwd/worktree.",
-      "Verify each comment against the current state before editing. If the target fingerprint or the exact hunk fingerprint no longer matches the current change (the target drifted), stop work on that comment, do not edit it, and report it as stale.",
-      "For each matching comment, apply the requested change to exactly the listed hunk. Focused verification (running the relevant test or build for the code you changed) is allowed, but never claim that tests or builds passed unless you actually ran them.",
-      "Use exactly these headings: VERIFIED FACTS, AI INFERENCE, HUMAN VERIFICATION RECOMMENDED.",
-      "At the very end of your response, add a strict machine-parseable COMMENT OUTCOMES section with exactly one line per comment id, in this exact format:",
-      "- <comment-id> | COMPLETED | optional short detail",
-      "- <comment-id> | STALE | optional short detail",
-      "- <comment-id> | FAILED | optional short detail",
-      "- <comment-id> | UNRESOLVED | optional short detail",
-      "Mark COMPLETED only for comments you actually finished editing. Mark STALE when the target drifted, FAILED when you tried but could not complete it, UNRESOLVED when you did not address it. A comment that is not explicitly marked COMPLETED must never be treated as completed.",
-      `Project id: ${input.projectId}`,
-      ...(projectName !== undefined ? [`Project name: ${projectName}`] : []),
-      `Workspace: ${projectRootPath ?? comments[0].cwd}`,
-      `Executing agent workspace id: ${input.workspaceId}`,
-      `Executing agent workspace cwd: ${input.workspaceCwd}`,
-      `Comments (${comments.length}):`,
-      commentBlocks.join("\n\n"),
-    ].join("\n\n");
-    // Fire-and-forget submit: the prompt is handed to the agent's workflow via
-    // handle.send (send_agent_message_request — the same RPC the workspace UI
-    // uses, so the prompt lands in the selected workspace Agent's message
-    // stream). Processing time is unbounded, so we never wait for the agent:
-    // results appear in the agent's conversation and the user copies them from
-    // there. Only after the daemon accepts the prompt are the submitted
-    // comments removed from Review Deck (every commented record of the project;
-    // reviewed records are preserved); on send failure the comments are left
-    // untouched and the error propagates.
-    await handle.send(prompt);
-    // Observability-only audit row on the SAME agent's timeline: one
-    // version-1 "review-deck-handoff" plugin item recording that this batch
-    // of review comments was submitted to the agent's workflow. The row
-    // states only the submission (never completion) and carries no review
-    // content, file path, cwd, workspace, project, or agent identifiers.
-    // The append is best-effort: a failure is logged and swallowed so the
-    // established queue-clear path below still runs — an append failure can
-    // never surface as an RPC error, so a client retry can never re-send the
-    // prompt and duplicate the Agent task.
-    try {
-      await handle.timeline.append({
-        type: "plugin",
-        id: randomUUID(),
-        kind: reviewHandoffTimelineKind,
-        version: reviewHandoffTimelineVersion,
-        data: reviewHandoffTimelineSchema.parse({
-          commentCount: processedCommentIds.length,
-          submittedAt: new Date().toISOString(),
-        }),
-      });
-    } catch (error) {
-      console.error(
-        `review-deck: could not append a review-deck-handoff timeline row for agent ${input.agentId}; the batch was already sent, continuing with the queue clear`,
-        error,
-      );
+    const hasLegacyComments = comments.some((comment) => comment.workspaceId === undefined);
+    if (hasLegacyComments && !(await this.legacyCommentsBelongToWorkspace(identity, context))) {
+      throw new Error("Legacy comment workspace ownership is ambiguous; refusing to submit this batch.");
     }
-    await this.clearProjectReviewComments(input.projectId);
-    return {
+    for (const comment of comments) {
+      if (comment.workspaceId !== undefined && comment.workspaceId !== input.workspaceId) {
+        throw new Error(`Comment ${comment.id} belongs to another workspace; refusing to include it in this batch.`);
+      }
+      if (!(await this.directoriesMatch(comment.cwd, input.workspaceCwd))) {
+        throw new Error(`Comment ${comment.id} does not belong to the selected workspace directory; refusing to include it.`);
+      }
+    }
+
+    const batch: ReviewBatch = {
+      id: randomUUID(),
+      createdAt: new Date().toISOString(),
       projectId: input.projectId,
       workspaceId: input.workspaceId,
-      workspaceCwd: input.workspaceCwd,
-      processedCommentIds,
-      commentCount: processedCommentIds.length,
-      submittedAt: new Date().toISOString(),
+      agentId: input.agentId,
+      commentIds: comments.map((comment) => comment.id),
+      status: "draft",
+      outcomes: {},
     };
+    await this.reviewBatchStore.create(batch);
+    const { projectName } = this.projectCommentIdentity(comments);
+    const prompt = buildReviewBatchPrompt({
+      batchId: batch.id,
+      projectId: input.projectId,
+      ...(projectName !== undefined ? { projectName } : {}),
+      workspaceId: input.workspaceId,
+      workspaceCwd: input.workspaceCwd,
+      comments,
+    });
+
+    try {
+      await handle.send(prompt);
+    } catch (error) {
+      const completedAt = new Date().toISOString();
+      const failedOutcomes = Object.fromEntries(
+        batch.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "failed"]),
+      );
+      const failed = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status)) return current;
+        return { ...current, status: "failed", outcomes: failedOutcomes, completedAt };
+      });
+      if (failed?.submittedAt) await this.appendReviewBatchTimeline(failed, context);
+      throw error;
+    }
+
+    const submittedAt = new Date().toISOString();
+    const submitted = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (current.status !== "draft") return current;
+      return { ...current, status: "submitted", submittedAt };
+    });
+    if (!submitted) throw new Error(`ReviewBatch ${batch.id} disappeared after Agent submission.`);
+    await this.appendReviewBatchTimeline(submitted, context);
+    return submitted;
+  }
+
+  async handleAgentTurnStarted(
+    event: PluginLifecycleEvents["agent.turn_started"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
+    if (!batch) return;
+    if (batch.status === "running") {
+      if (event.turnId === null || batch.turnId === event.turnId) return;
+      await this.failActiveBatchAsUnresolved(batch.id, context);
+      return;
+    }
+    const startedAt = new Date().toISOString();
+    const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (current.status !== "draft" && current.status !== "submitted") return current;
+      return {
+        ...current,
+        status: "running",
+        submittedAt: current.submittedAt ?? startedAt,
+        ...(event.turnId !== null ? { turnId: event.turnId } : {}),
+      };
+    });
+    if (updated?.status === "running") await this.appendReviewBatchTimeline(updated, context);
+  }
+
+  async handleAgentArchived(
+    event: PluginLifecycleEvents["agent.archived"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
+    if (batch) await this.failActiveBatchAsUnresolved(batch.id, context);
+
+    const runs = await this.reviewRunStore.list();
+    for (const run of runs) {
+      if (run.parentAgentId !== event.agent.id || run.status !== "running") continue;
+      await this.reviewRunStore.update(run.requestId, (current) =>
+        current.status === "running" ? { ...current, status: "abandoned" } : current,
+      );
+      this.transientReviewAgents.delete(run.requestId);
+    }
+  }
+
+  async handleAgentTurnEnded(
+    event: PluginLifecycleEvents["agent.turn_ended"],
+    context: PluginHookContext,
+  ): Promise<void> {
+    const storedBatches = await this.reviewBatchStore.list();
+    const candidates = storedBatches.filter((batch) =>
+      batch.agentId === event.agent.id &&
+      (isActiveReviewBatch(batch.status) || isOrphanedReviewBatch(batch)),
+    );
+
+    for (const batch of candidates) {
+      const response = extractReviewBatchAssistantResponse(event.timeline, batch.id);
+      const eventMatchesBatchTurn = batch.turnId !== undefined &&
+        event.turnId !== null &&
+        batch.turnId === event.turnId;
+      if (!eventMatchesBatchTurn) {
+        if (isActiveReviewBatch(batch.status) && response.found) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+      if (!response.found || !response.hasAssistantMessage || !response.hasOutcomesSection) {
+        if (isActiveReviewBatch(batch.status)) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+      if (event.outcome.kind !== "completed") {
+        if (isActiveReviewBatch(batch.status)) {
+          await this.failActiveBatchAsUnresolved(batch.id, context);
+        }
+        continue;
+      }
+
+      const outcomes = parseReviewCommentOutcomes(response.text, batch.commentIds);
+      const values = batch.commentIds.map((commentId) => outcomes[commentId]);
+      const status: ReviewBatch["status"] = values.every((outcome) => outcome === "completed")
+        ? "completed"
+        : values.every((outcome) => outcome === "failed" || outcome === "unresolved")
+          ? "failed"
+          : "partial";
+      const completedAt = new Date().toISOString();
+      let finalized = false;
+      const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status) && !isOrphanedReviewBatch(current)) return current;
+        if (current.turnId !== event.turnId) return current;
+        finalized = true;
+        return {
+          ...current,
+          status,
+          outcomes,
+          submittedAt: current.submittedAt ?? completedAt,
+          completedAt,
+        };
+      });
+      if (!finalized || !updated) continue;
+
+      const completedCommentIds = batch.commentIds.filter((commentId) => updated.outcomes[commentId] === "completed");
+      await this.appendReviewBatchTimeline(updated, context);
+      if (completedCommentIds.length > 0) {
+        await this.clearProjectReviewComments(updated.projectId, completedCommentIds);
+      }
+    }
+  }
+  private async appendReviewBatchTimeline(
+    batch: ReviewBatch,
+    context: PluginHandlerContext | PluginHookContext,
+  ): Promise<void> {
+    await this.reviewBatchTimelineMutex.run(async () => {
+      const current = (await this.reviewBatchStore.list()).find((entry) => entry.id === batch.id);
+      if (!current || current.agentId !== batch.agentId || !current.submittedAt) return;
+      try {
+        await context.paseo.agents.ref(current.agentId).timeline.append({
+          type: "plugin",
+          id: `review-deck-batch:${current.id}`,
+          kind: reviewBatchTimelineKind,
+          version: reviewBatchTimelineVersion,
+          data: reviewBatchTimelineData(current),
+        });
+      } catch (error) {
+        console.error(`review-deck: could not update the timeline row for ReviewBatch ${current.id}`, error);
+      }
+    });
   }
 
   /**
-   * Remove every commented/has-comment record of the project (used by
-   * processProjectReview after the comments were handed to the agent's
-   * workflow); reviewed records are preserved. Returns the number of records
-   * actually cleared.
+   * Remove only the named completed comments. A comment edited while its batch
+   * ran receives a new id and therefore remains queued for the next batch.
    */
-  async clearProjectReviewComments(projectId: string): Promise<number> {
+  async clearProjectReviewComments(projectId: string, commentIds: readonly string[]): Promise<number> {
+    const completedIds = new Set(commentIds);
+    if (completedIds.size === 0) return 0;
     return this.store.runExclusive(async () => {
       const file = await this.store.load();
       let cleared = 0;
       for (const [targetFingerprint, entries] of Object.entries(file)) {
         const next = entries.filter((entry) => {
-          if (entry.projectId !== projectId) return true;
-          return !(entry.decision === "commented" || (entry.comment?.trim() ?? "") !== "");
+          if (
+            entry.projectId !== projectId ||
+            !entry.id ||
+            !completedIds.has(entry.id) ||
+            this.projectCommentBody(entry, projectId) === null
+          ) return true;
+          cleared++;
+          return false;
         });
         if (next.length === entries.length) continue;
-        cleared += entries.length - next.length;
         if (next.length === 0) delete file[targetFingerprint];
         else file[targetFingerprint] = next;
       }
@@ -1383,7 +2191,7 @@ export class ReviewService {
       aiInference: [],
       humanVerificationRecommended: [],
     };
-    let active: keyof ReviewSections | null = null;
+    let active: "verifiedFacts" | "aiInference" | "humanVerificationRecommended" | null = null;
     for (const line of text.split("\n")) {
       const heading = line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/[:：]$/, "");
       if (heading === "VERIFIED FACTS" || heading === "已确认事实" || heading === "已验证事实") active = "verifiedFacts";
@@ -1535,7 +2343,7 @@ export class ReviewService {
       schemaVersion: prompt.schemaVersion,
     }));
 
-    this.sweepTransientReviewAgents();
+    await this.sweepTransientReviewAgents();
     if (settings.aiReviewCacheEnabled) {
       let cached: AiReviewCacheEntry | null = null;
       try {
@@ -1556,7 +2364,7 @@ export class ReviewService {
         && cached.depth === depth
       ) {
         const requestId = randomUUID();
-        this.transientReviewAgents.set(requestId, {
+        const entry: TransientReviewEntry = {
           handle: null,
           cachedResult: { review: cached.review, sections: cached.sections, usage: cached.usage },
           locale: input.locale,
@@ -1574,7 +2382,9 @@ export class ReviewService {
           cacheKey,
           inputFingerprint: prompt.inputFingerprint,
           thinkingOptionId: reviewer.thinkingOptionId,
-        });
+        };
+        await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "completed"));
+        this.transientReviewAgents.set(requestId, entry);
         return requestId;
       }
     }
@@ -1796,37 +2606,16 @@ export class ReviewService {
     },
     context: PluginHandlerContext,
   ): Promise<string> {
-    const agentConfig = {
-      provider: input.reviewer.configProvider,
-      modeId: input.reviewer.modeId,
-      ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
-    };
-    let child: TransientReviewChildHandle;
-    try {
-      child = await context.paseo.agents.create({
-        config: agentConfig,
-        cwd: input.worktreePath,
-        parent: input.agentId,
-        title: input.locale === "zh" ? "Review Deck AI 评审" : "Review Deck AI review",
-        autoArchive: true,
-        prompt: input.prompt,
-      });
-    } catch (error) {
-      throw new Error(
-        input.locale === "zh"
-          ? `评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未在所选工作区 Agent 的会话流中运行。`
-          : `Failed to create the review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
-      );
-    }
     const requestId = randomUUID();
-    this.transientReviewAgents.set(requestId, {
-      handle: child,
+    const startedAt = Date.now();
+    const entry: TransientReviewEntry = {
+      handle: null,
       locale: input.locale,
       provider: input.reviewer.provider,
       model: input.reviewer.model,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
-      startedAt: Date.now(),
+      startedAt,
       mode: input.mode,
       reviewerPermissionMode: input.reviewer.reviewerPermissionMode,
       depth: input.depth,
@@ -1836,7 +2625,60 @@ export class ReviewService {
       cacheKey: input.cacheKey,
       inputFingerprint: input.inputFingerprint,
       thinkingOptionId: input.reviewer.thinkingOptionId,
-    });
+    };
+    await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "running"));
+
+    const agentConfig = {
+      provider: input.reviewer.configProvider,
+      modeId: input.reviewer.modeId,
+      ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
+    };
+    let child: TransientReviewChildHandle;
+    try {
+      child = await context.paseo.agents.create({
+        idempotencyKey: requestId,
+        config: agentConfig,
+        cwd: input.worktreePath,
+        parent: input.agentId,
+        title: input.locale === "zh" ? "Review Deck AI 评审" : "Review Deck AI review",
+        autoArchive: true,
+        ...(supportsStructuredReviewOutput(input.reviewer.provider)
+          ? { outputSchema: AI_REVIEW_OUTPUT_SCHEMA }
+          : {}),
+        labels: {
+          "review-deck.kind": "ai-review",
+          "review-deck.request": requestId,
+          "review-deck.mode": input.mode,
+        },
+        prompt: input.prompt,
+      });
+    } catch (error) {
+      await this.reviewRunStore.update(requestId, (current) =>
+        current.status === "running" ? { ...current, status: "failed" } : current,
+      ).catch(() => null);
+      throw new Error(
+        input.locale === "zh"
+          ? `评审子 Agent 创建失败：${error instanceof Error ? error.message : String(error)}。评审未在所选工作区 Agent 的会话流中运行。`
+          : `Failed to create the review child agent: ${error instanceof Error ? error.message : String(error)}. The review did not run on the selected workspace Agent's stream.`,
+      );
+    }
+
+    let stored: ReviewRun | null;
+    try {
+      stored = await this.reviewRunStore.update(requestId, (current) =>
+        current.status === "running" ? { ...current, childAgentId: child.id } : current,
+      );
+    } catch (error) {
+      await context.paseo.agents.ref(child.id).archive().catch(() => undefined);
+      throw new Error("The review Agent was created, but its recovery record could not be saved.", { cause: error });
+    }
+    if (!stored || stored.status !== "running" || stored.childAgentId !== child.id) {
+      await context.paseo.agents.ref(child.id).archive().catch(() => undefined);
+      throw new Error(`ReviewRun ${requestId} stopped before its child Agent was recorded.`);
+    }
+
+    entry.handle = child;
+    this.transientReviewAgents.set(requestId, entry);
     return requestId;
   }
 
@@ -1882,13 +2724,152 @@ export class ReviewService {
   }
 
   /**
+   * Stamp a terminal AI review result onto its stored run in one
+   * ReviewRunStore update: the terminal status, the completion time, and — for
+   * a completed file or target review — the finding tally. A hunk explanation
+   * is an inline answer rather than a review result, so it keeps the status and
+   * completion time but never a tally; that is what keeps it out of unread
+   * findings. A cached run is already completed and is stamped once on its
+   * first poll; a run that already carries its completion time is returned
+   * unchanged, so repeated polls can never move the timestamp. Returns null
+   * when the store cannot be written — the polled result is returned either
+   * way, so a damaged store never hides a finished review.
+   */
+  private async recordReviewRunCompletion(
+    requestId: string,
+    completion: { status: "completed" | "failed" } & AiReviewFindingCounts & { completedAt: string },
+  ): Promise<ReviewRun | null> {
+    try {
+      return await this.reviewRunStore.update(requestId, (current) => {
+        const tally: Partial<AiReviewFindingCounts> =
+          completion.status === "completed" && current.mode !== "hunk"
+            ? { findingCount: completion.findingCount, highRiskFindingCount: completion.highRiskFindingCount }
+            : {};
+        if (current.status === "running") {
+          return { ...current, status: completion.status, completedAt: completion.completedAt, ...tally };
+        }
+        if (current.status === completion.status && current.completedAt === undefined) {
+          return { ...current, completedAt: completion.completedAt, ...tally };
+        }
+        return current;
+      });
+    } catch (error) {
+      console.error(`[Review Deck] Could not persist terminal ReviewRun ${requestId}; returning its result.`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Append or update the stable v1.7 AI review row on the parent Agent's
+   * timeline. The payload is counts, status, usage, mode/depth, the workspace
+   * id, and the completion time — never the review text, findings, file paths,
+   * patches, or comment ids. The row id is keyed by request id, so a repeated
+   * poll (or a recovered run) re-appends the same row in place, and hunk
+   * explanations are skipped because the row's contract covers whole file and
+   * target reviews. An append failure is logged and swallowed: the AI result
+   * itself is already persisted and is about to be returned.
+   */
+  private async appendAiReviewTimeline(
+    input: {
+      requestId: string;
+      workspaceId: string;
+      parentAgentId: string;
+      mode: AiReviewMode;
+      status: "completed" | "failed";
+      resultSource: AiReviewResultSource;
+      depth?: AiReviewDepth;
+      usage?: AiReviewUsage;
+      completedAt: string;
+    } & AiReviewFindingCounts,
+    context: PluginHandlerContext,
+  ): Promise<void> {
+    const mode = input.mode;
+    if (mode === "hunk") return;
+    const data = reviewAiTimelineSchema.safeParse({
+      workspaceId: input.workspaceId,
+      mode,
+      status: input.status,
+      findingCount: input.findingCount,
+      highRiskFindingCount: input.highRiskFindingCount,
+      resultSource: input.resultSource,
+      ...(input.depth !== undefined ? { depth: input.depth } : {}),
+      ...(input.usage !== undefined ? { usage: input.usage } : {}),
+      completedAt: input.completedAt,
+    });
+    if (!data.success) return;
+    try {
+      await context.paseo.agents.ref(input.parentAgentId).timeline.append({
+        type: "plugin",
+        id: `${reviewAiTimelineKind}:${input.requestId}`,
+        kind: reviewAiTimelineKind,
+        version: reviewAiTimelineVersion,
+        data: data.data,
+      });
+    } catch (error) {
+      console.error(`review-deck: could not update the timeline row for AI review ${input.requestId}`, error);
+    }
+  }
+
+  /**
    * Polls a one-shot reviewer. Cache hits use the same request capability and
    * result contract as fresh runs; fresh runs preserve status and token usage.
    */
-  async pollAiReview(input: { requestId: string; workspaceId: string; agentId: string }): Promise<PollAiReviewResult> {
-    this.sweepTransientReviewAgents();
-    const entry = this.transientReviewAgents.get(input.requestId);
-    if (!entry || entry.workspaceId !== input.workspaceId || entry.agentId !== input.agentId) {
+  async pollAiReview(
+    input: { requestId: string; workspaceId: string; agentId: string },
+    context: PluginHandlerContext,
+  ): Promise<PollAiReviewResult> {
+    await this.sweepTransientReviewAgents();
+    let entry = this.transientReviewAgents.get(input.requestId);
+    if (!entry) {
+      const recovery = await this.restoreTransientReviewEntry(input, context);
+      if (recovery.kind === "retry") {
+        const run = recovery.run;
+        return {
+          status: "running",
+          review: "",
+          sections: emptyReviewSections(),
+          provider: run.provider,
+          model: run.model ?? "unknown",
+          thinkingOptionId: run.thinkingOptionId,
+          reviewerPermissionMode: run.reviewerPermissionMode,
+          resultSource: run.resultSource,
+          mode: run.mode,
+          ...(run.depth ? { depth: run.depth } : {}),
+          ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+        };
+      }
+      if (recovery.kind === "unavailable") {
+        const run = recovery.run;
+        const bindingMatches = run &&
+          run.workspaceId === input.workspaceId &&
+          run.parentAgentId === input.agentId;
+        const locale = bindingMatches ? run.locale ?? "en" : "en";
+        const statusMessage = bindingMatches && run.status === "abandoned"
+          ? locale === "zh" ? "AI 评审运行已放弃，请重新开始。" : "The AI review run was abandoned; start it again."
+          : bindingMatches && run.status === "failed"
+            ? locale === "zh" ? "AI 评审运行失败，请重新开始。" : "The AI review run failed; start it again."
+            : locale === "zh"
+              ? "AI 评审请求已不可用。"
+              : "The AI review request is no longer available.";
+        return {
+          status: "error",
+          review: statusMessage,
+          sections: emptyReviewSections(),
+          provider: bindingMatches ? run.provider : "",
+          model: bindingMatches ? run.model ?? "unknown" : "",
+          ...(bindingMatches ? {
+            thinkingOptionId: run.thinkingOptionId,
+            reviewerPermissionMode: run.reviewerPermissionMode,
+            resultSource: run.resultSource,
+            mode: run.mode,
+            ...(run.depth ? { depth: run.depth } : {}),
+            ...(run.reviewPreset ? { reviewPreset: run.reviewPreset } : {}),
+          } : {}),
+        };
+      }
+      entry = recovery.entry;
+    }
+    if (entry.workspaceId !== input.workspaceId || entry.agentId !== input.agentId) {
       return {
         status: "error",
         review: "The AI review request is no longer available.",
@@ -1898,7 +2879,25 @@ export class ReviewService {
       };
     }
     if (entry.cachedResult) {
-      this.transientReviewAgents.delete(input.requestId);
+      const findingCounts = countSectionFindings(entry.cachedResult.sections);
+      const completedAt = new Date().toISOString();
+      const stored = await this.recordReviewRunCompletion(input.requestId, {
+        status: "completed",
+        completedAt,
+        ...findingCounts,
+      });
+      await this.appendAiReviewTimeline({
+        requestId: input.requestId,
+        workspaceId: entry.workspaceId,
+        parentAgentId: entry.agentId,
+        mode: entry.mode,
+        status: "completed",
+        resultSource: entry.resultSource,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.cachedResult.usage ? { usage: entry.cachedResult.usage } : {}),
+        completedAt: stored?.completedAt ?? completedAt,
+        ...findingCounts,
+      }, context);
       return {
         status: "idle",
         review: entry.cachedResult.review,
@@ -1907,7 +2906,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "cached",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -1915,7 +2914,6 @@ export class ReviewService {
       };
     }
     if (!entry.handle) {
-      this.transientReviewAgents.delete(input.requestId);
       return {
         status: "error",
         review: "The AI review request has no active reviewer.",
@@ -1924,7 +2922,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -1942,7 +2940,7 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -1958,7 +2956,23 @@ export class ReviewService {
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
         reviewerPermissionMode: entry.reviewerPermissionMode,
-        resultSource: "fresh",
+        resultSource: entry.resultSource,
+        mode: entry.mode,
+        ...(entry.depth ? { depth: entry.depth } : {}),
+        ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+        ...(usage ? { usage } : {}),
+      };
+    }
+    if (result.status === "permission") {
+      return {
+        status: "permission",
+        review: result.error ?? "",
+        sections: emptyReviewSections(),
+        provider: entry.provider,
+        model: entry.model ?? "unknown",
+        thinkingOptionId: entry.thinkingOptionId,
+        reviewerPermissionMode: entry.reviewerPermissionMode,
+        resultSource: entry.resultSource,
         mode: entry.mode,
         ...(entry.depth ? { depth: entry.depth } : {}),
         ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
@@ -1966,14 +2980,20 @@ export class ReviewService {
       };
     }
 
-    this.transientReviewAgents.delete(input.requestId);
     const locale = entry.locale ?? "en";
     const assistantText =
       result.lastMessage?.trim()
         ? result.lastMessage
         : await this.extractLastAssistantText(entry.handle);
-    const review = assistantText ?? result.error ?? (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
-    const sections = this.parseReviewSections(review);
+    const structured = result.status === "idle" && assistantText
+      ? parseStructuredReviewResult(assistantText)
+      : null;
+    const normalizedStructured = structured ? normalizeStructuredReviewResult(structured) : null;
+    const review = normalizedStructured?.review ??
+      assistantText ??
+      result.error ??
+      (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
+    const sections = normalizedStructured?.sections ?? this.parseReviewSections(review);
     if (result.status === "idle" && assistantText && entry.cacheEnabled && entry.cacheKey && entry.inputFingerprint) {
       try {
         await this.aiReviewCacheStore.put({
@@ -1985,7 +3005,7 @@ export class ReviewService {
           promptVersion: AI_REVIEW_PROMPT_VERSION,
           schemaVersion: AI_REVIEW_SCHEMA_VERSION,
           inputFingerprint: entry.inputFingerprint,
-          review: assistantText,
+          review,
           sections,
           ...(entry.depth ? { depth: entry.depth } : {}),
           ...(usage ? { usage } : {}),
@@ -1993,6 +3013,37 @@ export class ReviewService {
       } catch {
         // A successful review remains usable even when the optional cache is unavailable.
       }
+    }
+    const nextStatus: "completed" | "failed" = result.status === "idle" ? "completed" : "failed";
+    const findingCounts = nextStatus === "completed"
+      ? countSectionFindings(sections)
+      : { findingCount: 0, highRiskFindingCount: 0 };
+    const completedAt = new Date().toISOString();
+    const stored = await this.recordReviewRunCompletion(input.requestId, {
+      status: nextStatus,
+      completedAt,
+      ...findingCounts,
+    });
+    await this.appendAiReviewTimeline({
+      requestId: input.requestId,
+      workspaceId: entry.workspaceId,
+      parentAgentId: entry.agentId,
+      mode: entry.mode,
+      status: nextStatus,
+      resultSource: entry.resultSource,
+      ...(entry.depth ? { depth: entry.depth } : {}),
+      ...(usage ? { usage } : {}),
+      completedAt: stored?.completedAt ?? completedAt,
+      ...findingCounts,
+    }, context);
+    if (result.status === "idle") {
+      entry.cachedResult = {
+        review,
+        sections,
+        ...(usage ? { usage } : {}),
+      };
+    } else {
+      this.transientReviewAgents.delete(input.requestId);
     }
     return {
       status: result.status,
@@ -2002,7 +3053,7 @@ export class ReviewService {
       model: entry.model ?? "unknown",
       thinkingOptionId: entry.thinkingOptionId,
       reviewerPermissionMode: entry.reviewerPermissionMode,
-      resultSource: "fresh",
+      resultSource: entry.resultSource,
       mode: entry.mode,
       ...(entry.depth ? { depth: entry.depth } : {}),
       ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),

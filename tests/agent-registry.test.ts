@@ -5,8 +5,8 @@
  *   upsert/remove, delta resends, reconnect re-snapshots, bounded retries);
  * - the exact workspace + status filtering rules the panel relied on;
  * - complete teardown on plugin reload, including a bootstrap still in flight;
- * - the workspace header button + agent composer pill lifecycles, whose labels
- *   are fed ONLY by count-only reads, and their removal on stop;
+ * - the workspace header button + Agent composer pill lifecycles, whose badges
+ *   combine project comment counts with workspace activity indicators;
  * - recovery of the workspace headers after the list's bootstrap burst is
  *   exhausted (a scheduled re-arm), and that stop() cancels a pending re-arm.
  *
@@ -31,11 +31,13 @@ import type {
 } from "@getpaseo/client";
 import type {
   PluginButton,
+  PluginButtonMenuEntry,
   PluginButtonRegistration,
   PluginClientOpenPanelOptions,
   PluginComposerPillContribution,
   PluginHeaderButtonContribution,
 } from "@getpaseo/plugin/client";
+import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
 import type { RegistryAgent } from "../client/agent-registry";
 import type { ReviewEntryHost } from "../client/review-entries";
 
@@ -56,6 +58,7 @@ registerHooks({
 const { USABLE_AGENT_STATUSES, createAgentRegistry, selectWorkspaceAgents } = await import("../client/agent-registry");
 const { createReviewCountStore } = await import("../client/review-count-store");
 const { registerReviewEntries } = await import("../client/review-entries");
+const { createReviewEntryStatusStore } = await import("../client/review-entry-status-store");
 
 type FakeObserver = {
   snapshot(payload: unknown): void;
@@ -232,7 +235,11 @@ function agentsPayload(entries: ReturnType<typeof agentEntry>[]): PaseoAgentList
   } as unknown as PaseoAgentListResult;
 }
 
-function workspaceEntry(id: string, options: { projectId?: string; archivingAt?: string | null } = {}) {
+function workspaceEntry(id: string, options: {
+  projectId?: string;
+  archivingAt?: string | null;
+  diffStat?: { additions: number; deletions: number } | null;
+} = {}) {
   return {
     id,
     projectId: options.projectId ?? "proj-1",
@@ -243,6 +250,25 @@ function workspaceEntry(id: string, options: { projectId?: string; archivingAt?:
     name: id,
     status: "running",
     archivingAt: options.archivingAt ?? null,
+    diffStat: options.diffStat ?? null,
+  };
+}
+function workspaceIndicators(
+  workspaceId: string,
+  projectId: string,
+  overrides: Partial<ReviewWorkspaceIndicators> = {},
+): ReviewWorkspaceIndicators {
+  return {
+    workspaceId,
+    projectId,
+    projectPendingCommentCount: 0,
+    projectStaleCommentCount: 0,
+    workspacePendingCommentCount: 0,
+    workspaceStaleCommentCount: 0,
+    activeBatchCount: 0,
+    runningAiReviewCount: 0,
+    unreadAiFindingCount: 0,
+    ...overrides,
   };
 }
 
@@ -258,6 +284,7 @@ function createFakeHost() {
   const all: RegistrationLog[] = [];
   const live = new Map<string, RegistrationLog>();
   const opened: Array<{ id: string; options: PluginClientOpenPanelOptions }> = [];
+  const popoverWorkspaces: string[] = [];
   const register = (contribution: FakeContribution): PluginButtonRegistration => {
     const record: RegistrationLog = { id: contribution.id, contribution, updates: [], removed: false };
     all.push(record);
@@ -281,18 +308,38 @@ function createFakeHost() {
     openPanel(id, options) {
       opened.push({ id, options });
     },
+    createHeaderPopover(workspaceId) {
+      popoverWorkspaces.push(workspaceId);
+      return () => null;
+    },
+  };
+  const menuItem = (id: string, itemId: string): Extract<PluginButtonMenuEntry, { kind: "item" }> => {
+    const record = live.get(id);
+    assert.ok(record, `registration ${id} must be live`);
+    const behavior = record.contribution.button.behavior;
+    if (behavior.kind !== "menu") throw new Error(`registration ${id} must expose a menu`);
+    const item = behavior.items.find((entry): entry is Extract<PluginButtonMenuEntry, { kind: "item" }> =>
+      entry.kind === "item" && entry.id === itemId);
+    if (!item) throw new Error(`menu item ${itemId} must exist`);
+    return item;
   };
   return {
     all,
     live,
     opened,
+    popoverWorkspaces,
     host,
     press(id: string) {
       const record = live.get(id);
       assert.ok(record, `registration ${id} must be live`);
-      const behavior = record.contribution.button.behavior;
-      assert.equal(behavior.kind, "action");
-      if (behavior.kind === "action") void behavior.onPress();
+      return record.contribution.button.behavior;
+    },
+    menuItem,
+    async selectMenuItem(id: string, itemId: string) {
+      const item = menuItem(id, itemId);
+      assert.notEqual(item.disabled, true, `menu item ${itemId} must be enabled`);
+      if (item.behavior.kind === "action") await item.behavior.onPress();
+      return item;
     },
   };
 }
@@ -759,12 +806,17 @@ async function main() {
     assert.equal(host.live.get("review-pill-agent-a")?.contribution.button.label, "Review · 3");
     assert.equal(host.live.get("review-pill-agent-d")?.contribution.button.label, "Review · 3");
 
-    // Clicking opens the same panels the command center opens.
-    host.press("review-header-ws-1");
-    host.press("review-pill-agent-a");
+    // Clicking the Header opens its status popover; the Agent Pill opens its menu.
+    const headerBehavior = host.press("review-header-ws-1");
+    assert.equal(headerBehavior.kind, "popover");
+    assert.deepEqual(host.popoverWorkspaces, ["ws-1"]);
+    const pillBehavior = host.press("review-pill-agent-a");
+    assert.equal(pillBehavior.kind, "menu");
+    await host.selectMenuItem("review-pill-agent-a", "open-review-deck");
+    await host.selectMenuItem("review-pill-agent-a", "open-queue");
     assert.deepEqual(host.opened, [
-      { id: "review-deck", options: { workspaceId: "ws-1" } },
-      { id: "review-deck-agent", options: { workspaceId: "ws-1", agentId: "agent-a" } },
+      { id: "review-deck-agent", options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" } },
+      { id: "review-deck-agent-queue", options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" } },
     ]);
 
     // A local comment read updates every badge with no RPC at all.
@@ -797,6 +849,125 @@ async function main() {
     assert.equal(workspacesSubscription.state.released, true, "stopping releases the workspace owned observation");
     registry.stop();
     assert.equal(agentsSubscription.state.released, true, "stopping releases the agent owned observation");
+  });
+  await test("a moved Agent rebinds its Review Pill to the new workspace", async () => {
+    const fake = createFakePaseo();
+    const registry = createAgentRegistry({ retryDelaysMs: [] });
+    registry.bind(fake.paseo);
+    const agentsSubscription = fake.agents.boot(0, agentsPayload([
+      agentEntry("agent-move", { workspaceId: "ws-1", projectKey: "proj-1" }),
+    ]));
+    await flush();
+
+    const host = createFakeHost();
+    const counts = createFakeCounts();
+    const entries = registerReviewEntries({
+      client: host.host,
+      paseo: fake.paseo,
+      registry,
+      counts: counts.store,
+      retryDelaysMs: [],
+    });
+    const workspacesSubscription = fake.workspaces.boot(0, workspacesPayload([
+      workspaceEntry("ws-1", { projectId: "proj-1" }),
+      workspaceEntry("ws-2", { projectId: "proj-2" }),
+    ]));
+    await flush();
+
+    const original = host.live.get("review-pill-agent-move");
+    assert.ok(original);
+    assert.equal(original.contribution.workspaceId, "ws-1");
+    agentsSubscription.emitUpdate({
+      type: "agent_update",
+      payload: {
+        subscriptionId: "fake-sub",
+        kind: "upsert",
+        agent: agentEntry("agent-move", { workspaceId: "ws-2", projectKey: "proj-2" }).agent,
+      },
+    });
+    await flush();
+
+    const moved = host.live.get("review-pill-agent-move");
+    assert.ok(moved);
+    await host.selectMenuItem("review-pill-agent-move", "open-review-deck");
+    assert.deepEqual(host.opened, [{
+      id: "review-deck-agent",
+      options: { workspaceId: "ws-2", agentId: "agent-move", location: "workspace" },
+    }], "pressing the moved Agent's menu item must keep the new workspace binding");
+    assert.equal(moved.contribution.workspaceId, "ws-2");
+
+    entries.stop();
+    registry.stop();
+    assert.equal(workspacesSubscription.state.released, true);
+    assert.equal(agentsSubscription.state.released, true);
+  });
+  await test("Review entry badges and menus follow workspace review status", async () => {
+    const fake = createFakePaseo();
+    const registry = createAgentRegistry({ retryDelaysMs: [] });
+    registry.bind(fake.paseo);
+    const agentsSubscription = fake.agents.boot(0, agentsPayload([
+      agentEntry("agent-a", { workspaceId: "ws-1" }),
+    ]));
+    await flush();
+
+    const host = createFakeHost();
+    const counts = createFakeCounts();
+    const statuses = createReviewEntryStatusStore();
+    statuses.setStatus("ws-1", workspaceIndicators("ws-1", "proj-1", {
+      projectPendingCommentCount: 3,
+      projectStaleCommentCount: 2,
+      workspacePendingCommentCount: 1,
+      workspaceStaleCommentCount: 1,
+    }));
+    const submitted: Array<{ workspaceId: string; agentId: string }> = [];
+    const entries = registerReviewEntries({
+      client: host.host,
+      paseo: fake.paseo,
+      registry,
+      counts: counts.store,
+      statuses,
+      submitPendingComments: async (input) => { submitted.push(input); },
+      retryDelaysMs: [],
+    });
+    const workspacesSubscription = fake.workspaces.boot(0, workspacesPayload([
+      workspaceEntry("ws-1", { projectId: "proj-1", diffStat: { additions: 2, deletions: 1 } }),
+    ]));
+    await flush();
+
+    assert.equal(host.live.get("review-header-ws-1")?.contribution.button.label, "Review · 3");
+    assert.equal(host.live.get("review-pill-agent-a")?.contribution.button.label, "Review · 3");
+    const runItem = () => host.menuItem("review-pill-agent-a", "run-targeted-ai-review");
+    const submitItem = () => host.menuItem("review-pill-agent-a", "submit-pending-comments");
+    assert.equal(runItem().disabled, false);
+    assert.equal(submitItem().disabled, false);
+    await host.selectMenuItem("review-pill-agent-a", "run-targeted-ai-review");
+    await host.selectMenuItem("review-pill-agent-a", "submit-pending-comments");
+    assert.deepEqual(host.opened, [{
+      id: "review-deck-agent-targeted-review",
+      options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" },
+    }]);
+    assert.deepEqual(submitted, [{ workspaceId: "ws-1", agentId: "agent-a" }]);
+
+    statuses.setStatus("ws-1", workspaceIndicators("ws-1", "proj-1", {
+      projectStaleCommentCount: 2,
+      workspaceStaleCommentCount: 1,
+      activeBatchCount: 1,
+      runningAiReviewCount: 1,
+      unreadAiFindingCount: 4,
+    }));
+    await flush();
+    assert.equal(host.live.get("review-header-ws-1")?.contribution.button.label, "Review ⚠ 2", "stale status outranks unread findings");
+    assert.equal(runItem().disabled, true);
+    assert.equal(submitItem().disabled, true);
+
+    statuses.setStatus("ws-1", workspaceIndicators("ws-1", "proj-1", { unreadAiFindingCount: 4 }));
+    await flush();
+    assert.equal(host.live.get("review-header-ws-1")?.contribution.button.label, "Review · 4", "unread findings surface after pending and stale counts clear");
+
+    entries.stop();
+    registry.stop();
+    assert.equal(workspacesSubscription.state.released, true);
+    assert.equal(agentsSubscription.state.released, true);
   });
 
   await test("registry events drive pill lifecycle and reconnect count refreshes", async () => {
@@ -1000,32 +1171,6 @@ async function main() {
     registry.stop();
   });
 
-  await test("badges are count-only: no path to a diff or snapshot request", async () => {
-    const fake = createFakePaseo();
-    const registry = createAgentRegistry({ retryDelaysMs: [] });
-    registry.bind(fake.paseo);
-    fake.agents.boot(0, agentsPayload([agentEntry("agent-a", { workspaceId: "ws-1" })]));
-    await flush();
-    const host = createFakeHost();
-    const counts = createFakeCounts();
-    const entries = registerReviewEntries({
-      client: host.host,
-      paseo: fake.paseo,
-      registry,
-      counts: counts.store,
-      retryDelaysMs: [],
-    });
-    fake.workspaces.boot(0, workspacesPayload([workspaceEntry("ws-1", { projectId: "proj-1" })]));
-    await flush();
-    for (const pending of counts.pending.splice(0)) pending.resolve(2);
-    await flush();
-
-    assert.deepEqual(counts.asked, ["proj-1"], "the only read behind a badge is the project's comment count");
-    assert.deepEqual(Object.keys(host.host).sort(), ["addComposerPill", "addHeaderButton", "openPanel"]);
-    assert.equal(host.opened.length, 0, "registering entries opens no panel by itself");
-    entries.stop();
-    registry.stop();
-  });
 
   await test("the real SDK routes fetch_agents_response and agent_update into the registry", async () => {
     const daemon = createFakeDaemon();
@@ -1083,8 +1228,8 @@ main()
     console.log("verdict: one shared owned agents subscription (snapshot/upsert/remove/reconnect, bounded");
     console.log("         retries, teardown that also releases a pending bootstrap) backs both the panel");
     console.log("         hooks and the workspace header button / agent composer pill registrations, whose");
-    console.log("         Review badges are fed exclusively by the count-only project reads; an exhausted");
-    console.log("         workspace-list burst schedules one re-arm that stop() cancels.");
+    console.log("         Review badges combine project-comment counts with metadata-only workspace status; the");
+    console.log("         indicator path never parses Git, and stop() cancels any pending workspace re-arm.");
   })
   .catch((error) => {
     console.error(error);

@@ -50,6 +50,7 @@ export type ReviewEntryHost = {
 };
 
 type Entry = {
+  workspaceId: string;
   /** The project the badge counts; null until the workspace list resolves it. */
   projectId: string | null;
   label: string;
@@ -134,6 +135,7 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
       }
       const label = reviewLabel(counts.getCount(projectId));
       headers.set(workspaceId, {
+        workspaceId,
         projectId,
         label,
         registration: client.addHeaderButton({
@@ -176,16 +178,21 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
     }
     for (const [agentId, want] of wanted) {
       const existing = pills.get(agentId);
-      if (existing) {
+      if (existing && existing.workspaceId === want.workspaceId) {
         if (existing.projectId !== want.projectId) {
           existing.projectId = want.projectId;
           trackProject(want.projectId);
         }
         continue;
       }
+      if (existing) {
+        existing.registration.remove();
+        pills.delete(agentId);
+      }
       const label = reviewLabel(want.projectId ? counts.getCount(want.projectId) : null);
       pills.set(agentId, {
         projectId: want.projectId,
+        workspaceId: want.workspaceId,
         label,
         registration: client.addComposerPill({
           id: `review-pill-${agentId}`,

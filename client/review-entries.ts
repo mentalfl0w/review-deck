@@ -100,7 +100,7 @@ export type ReviewEntryLabels = {
 const DEFAULT_ENTRY_LABELS: ReviewEntryLabels = {
   openDeck: "Open Review Deck",
   openQueue: "Open Queue",
-  runTargeted: "Run Targeted AI Review",
+  runTargeted: "Review Current Changes with AI",
   submitComments: "Submit pending comments",
 };
 

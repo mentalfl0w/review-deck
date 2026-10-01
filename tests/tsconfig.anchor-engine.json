@@ -22,5 +22,6 @@
     "anchor-engine.test.ts",
     "ai-review-service.test.ts",
     "review-batch-service.test.ts",
+    "review-activity-service.test.ts",
   ]
 }

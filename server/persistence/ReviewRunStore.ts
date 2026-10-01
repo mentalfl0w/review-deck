@@ -60,6 +60,12 @@ export class ReviewRunStoreError extends Error {
  * with the wrong contract. `startedAt` is an ISO timestamp so the file stays
  * readable without a clock, while TTL comparisons re-parse it.
  *
+ * v1.7 adds `completedAt`, `findingCount`, `highRiskFindingCount`, and `readAt`:
+ * the completion time and finding tally of a terminal result, and the moment
+ * the user last opened Review Deck for the run's workspace. They stay counts
+ * and timestamps — the review text itself never lands here — and they are
+ * optional so a version-1 document written before v1.7 keeps loading.
+ *
  * Known fields are type-checked (a truncated or hand-edited file is rejected
  * rather than loaded half-parsed) and unknown fields are rejected too: strict
  * means a key this build does not know was written by a build that does, so the
@@ -89,6 +95,15 @@ export const reviewRunSchema = z
     // or 0 (which no prompt/schema pair uses) is a damaged record.
     promptVersion: z.number().int().positive(),
     schemaVersion: z.number().int().positive(),
+    // v1.7 completion and read metadata: when the run reached its terminal
+    // state, how many findings its result reported (and how many of those were
+    // critical/high), and when the user last opened Review Deck for the run's
+    // workspace. Still counts and timestamps only — no review content — and all
+    // optional, so every version-1 document written before v1.7 loads as-is.
+    completedAt: z.iso.datetime().optional(),
+    findingCount: z.number().int().nonnegative().optional(),
+    highRiskFindingCount: z.number().int().nonnegative().optional(),
+    readAt: z.iso.datetime().optional(),
   })
   .strict()
   .superRefine((run, context) => {
@@ -101,6 +116,30 @@ export const reviewRunSchema = z
       }
     } else if (run.childAgentId === null && run.status === "completed") {
       context.addIssue({ code: "custom", path: ["childAgentId"], message: "A completed fresh run requires its child Agent id." });
+    }
+    // Completion metadata describes a finished run: a run still in flight has
+    // no completion time (a run that finishes later keeps the timestamp it was
+    // stamped with, even after it is abandoned).
+    if (run.status === "running" && run.completedAt !== undefined) {
+      context.addIssue({ code: "custom", path: ["completedAt"], message: "A running run has no completion time." });
+    }
+    // The two finding counts describe one result and are written together; a
+    // lone count would make "unread findings" ambiguous.
+    if ((run.findingCount === undefined) !== (run.highRiskFindingCount === undefined)) {
+      context.addIssue({ code: "custom", path: ["findingCount"], message: "Finding counts are recorded together or not at all." });
+    }
+    // A run still in flight has never surfaced a result, so it can never have
+    // been read. A run that finished and is later abandoned keeps its read
+    // mark: abandoning is terminal, and recovery must not fail on it.
+    if (run.status === "running" && run.readAt !== undefined) {
+      context.addIssue({ code: "custom", path: ["readAt"], message: "A running run has no read mark." });
+    }
+    if (
+      run.findingCount !== undefined &&
+      run.highRiskFindingCount !== undefined &&
+      run.highRiskFindingCount > run.findingCount
+    ) {
+      context.addIssue({ code: "custom", path: ["highRiskFindingCount"], message: "High-risk findings cannot exceed the total findings." });
     }
   });
 

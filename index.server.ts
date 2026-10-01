@@ -23,6 +23,11 @@ import {
   startRunReview,
 } from "./shared/review";
 import { reviewDeckSettings } from "./shared/review-settings";
+import {
+  getWorkspaceReviewIndicators,
+  getWorkspaceReviewSummary,
+  markWorkspaceReviewResultsRead,
+} from "./shared/review-activity";
 
 const MAINTENANCE_INTERVAL_MS = 60_000;
 
@@ -66,6 +71,12 @@ export default function contribute(server: PluginServerContext) {
     project: await reviewService.listProjectReviewComments(projectId, context),
   }));
   server.handle(getProjectReviewCommentCount, async ({ projectId }) => reviewService.getProjectReviewCommentCount(projectId));
+  server.handle(getWorkspaceReviewIndicators, async ({ workspaceId }, context) =>
+    reviewService.getWorkspaceReviewIndicators({ workspaceId }, context));
+  server.handle(getWorkspaceReviewSummary, async ({ workspaceId }, context) =>
+    reviewService.getWorkspaceReviewSummary({ workspaceId }, context));
+  server.handle(markWorkspaceReviewResultsRead, async ({ workspaceId }, context) =>
+    reviewService.markWorkspaceReviewResultsRead({ workspaceId }, context));
   server.handle(processProjectReview, async (input, context) => reviewService.processProjectReview(input, context));
   server.handle(rejectHunk, async (input) =>
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),

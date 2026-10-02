@@ -575,7 +575,7 @@ async function run(): Promise<void> {
       aiReviewCacheEnabled: false,
     };
     parentProvider = "codex";
-    parentAvailableModes = [{ id: "read-only", label: "Read-only", description: "Read-only review mode" }];
+    parentAvailableModes = [{ id: "auto", label: "Default Permissions", description: "Edit files and run commands with Codex's default approval flow." }];
     responseQueue.push(JSON.stringify({
       summary: "Codex structured summary",
       findings: [{
@@ -590,9 +590,15 @@ async function run(): Promise<void> {
     const supportedOutputStart = await service.startRunReview(targetInput, context);
     const supportedCreate = created[created.length - 1];
     assert.equal(supportedCreate?.config.provider, "codex/parent-model");
+    assert.equal(supportedCreate?.config.modeId, "auto");
+    assert.deepEqual(supportedCreate?.config.options, {
+      approval_policy: "on-request",
+      sandbox_mode: "read-only",
+    }, "Codex's default mode must be constrained by provider options for read-only review");
     assert.ok(supportedCreate?.outputSchema, "known schema-capable providers receive outputSchema");
     const supportedOutput = await poll(supportedOutputStart.requestId);
     assert.equal(supportedOutput.sections.summary, "Codex structured summary");
+    assert.equal(supportedOutput.reviewerPermissionMode, "read-only");
     assert.equal(supportedOutput.resultSource, "fresh");
     responseQueue.push([
       "```json",

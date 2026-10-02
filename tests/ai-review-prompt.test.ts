@@ -128,8 +128,8 @@ const input = (overrides: Partial<PromptModule.AiReviewPromptInput> = {}): Promp
 // ---------------------------------------------------------------------------
 // 0. Contract constants.
 // ---------------------------------------------------------------------------
-assert.strictEqual(AI_REVIEW_PROMPT_VERSION, 4);
-assert.strictEqual(AI_REVIEW_SCHEMA_VERSION, 2);
+assert.strictEqual(AI_REVIEW_PROMPT_VERSION, 5);
+assert.strictEqual(AI_REVIEW_SCHEMA_VERSION, 3);
 assert.strictEqual(AI_REVIEW_PATCH_CHAR_LIMIT, 160_000);
 
 // ---------------------------------------------------------------------------
@@ -225,6 +225,13 @@ assert.ok(targeted.prompt.includes(`- ${hunkAlpha.stableId} · server/Foo.ts · 
 assert.ok(targeted.prompt.includes("StructuredReviewResult"));
 assert.ok(targeted.prompt.includes("Markdown headings"));
 assert.ok(targeted.prompt.includes("only when the host supplies that schema"));
+// The verification command rules: exact executable + argv, no shell strings,
+// never run by Review Deck.
+assert.ok(targeted.prompt.includes("Add `verificationCommand` ("));
+assert.ok(targeted.prompt.includes("name the exact program and its arguments"));
+assert.ok(targeted.prompt.toLowerCase().includes("never name a shell launcher"));
+assert.ok(targeted.prompt.includes("never runs a `verificationCommand` automatically"));
+assert.ok(targeted.prompt.includes("### Verification Commands"));
 assert.ok(targeted.prompt.includes("INFORMATIONAL · docs · AS NEEDED") && targeted.prompt.includes("MEDIUM · api · WITHIN BUDGET"));
 for (const forbidden of [patchAlpha, patchBeta, patchBar, "+const b = 2;", "diff --git", "HUNK PATCHES"]) {
   assert.ok(!targeted.prompt.includes(forbidden), `targeted review must not send patch text: ${forbidden}`);
@@ -357,6 +364,8 @@ assert.ok(targeted.prompt.includes("critical/high: always inspect") && targeted.
 const zh = buildAiReviewPrompt(input({ mode: "target", depth: "targeted", locale: "zh" }));
 assert.ok(zh.prompt.includes("变更块索引") && zh.prompt.includes("变更文件: 2") && zh.prompt.includes("用中文回答。"));
 assert.ok(zh.prompt.includes("- critical/high：必须检查") && zh.prompt.includes("工作区: /repo") && zh.prompt.includes("评审指纹: target-1"));
+assert.ok(zh.prompt.includes("verificationCommand") && zh.prompt.includes("不要自己运行它"));
+assert.ok(zh.prompt.includes("### Verification Commands"));
 assert.ok(!zh.prompt.includes("HUNK INDEX") && !zh.prompt.includes("Answer in English"));
 assert.ok(targeted.prompt.includes("HUNK INDEX") && targeted.prompt.includes("Answer in English.") && !targeted.prompt.includes("变更块索引"));
 assert.strictEqual(zh.locale, "zh");

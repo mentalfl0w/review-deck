@@ -13,6 +13,8 @@ import type {
   ExplainHunkResult,
   LineRangeSelection,
   PollAiReviewResult,
+  PollVerificationRunResult,
+  ListVerificationRunsResult,
   ProcessProjectReviewResult,
   ProjectReviewComment,
   ProjectReviewSummary,
@@ -26,6 +28,7 @@ import type {
   ReviewStateCurrentHunk,
   ReviewStateDecision,
   ReviewStateResult,
+  StartVerificationRunResult,
   FileViewRow,
 } from "../shared/review";
 import { aiReviewPresetDefaultDepth } from "../shared/review";
@@ -36,7 +39,6 @@ import {
 } from "../shared/review-settings";
 import {
   reviewBatchTimelineKind,
-  reviewBatchTimelineSchema,
   reviewBatchTimelineVersion,
   type ActiveReviewBatch,
   type ReviewBatch,
@@ -87,7 +89,16 @@ import {
   AI_REVIEW_OUTPUT_SCHEMA,
   normalizeStructuredReviewResult,
   parseStructuredReviewResult,
+  reviewSectionsFromMarkdown,
 } from "./structured-review";
+import { VerificationRunStore } from "./persistence/VerificationRunStore";
+import {
+  VerificationService,
+  type ListVerificationRunsInput,
+  type PollVerificationRunInput,
+  type StartVerificationRunInput,
+} from "./verification/VerificationService";
+import { VERIFICATION_RUN_TTL_MS } from "./verification/lifecycle";
 import type { ReviewAnchorFileView } from "./AnchorEngine";
 
 
@@ -97,6 +108,7 @@ export interface ReviewServiceDependencies {
   aiReviewCacheStore?: AiReviewCacheStore;
   reviewBatchStore?: ReviewBatchStore;
   reviewRunStore?: ReviewRunStore;
+  verificationRunStore?: VerificationRunStore;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -306,18 +318,42 @@ function deterministicCopy(locale: ReviewLocale | undefined): DeterministicCopy 
 
 const STRICT_READ_ONLY_MODE_NAMES = new Set(["readonly", "readonlymode", "plan", "planmode"]);
 const APPROVAL_GATED_MODE_NAMES = new Set(["ask", "alwaysask", "alwaysaskmode"]);
-function resolveReviewerMode(modes: readonly { id: string; label: string }[]): {
+type CodexReadOnlyProviderOptions = {
+  approval_policy: "on-request";
+  sandbox_mode: "read-only";
+};
+const CODEX_READ_ONLY_PROVIDER_OPTIONS: CodexReadOnlyProviderOptions = {
+  approval_policy: "on-request",
+  sandbox_mode: "read-only",
+};
+
+function resolveReviewerMode(provider: string, modes: readonly { id: string; label: string }[]): {
   id: string;
   permissionMode: AiReviewPermissionMode;
+  providerOptions?: CodexReadOnlyProviderOptions;
 } | null {
   for (const mode of modes) {
     if (STRICT_READ_ONLY_MODE_NAMES.has(mode.id.toLowerCase().replace(/[^a-z0-9]/g, "")) || STRICT_READ_ONLY_MODE_NAMES.has(mode.label.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
-      return { id: mode.id, permissionMode: "read-only" };
+      return {
+        id: mode.id,
+        permissionMode: "read-only",
+        ...(provider === "codex" ? { providerOptions: CODEX_READ_ONLY_PROVIDER_OPTIONS } : {}),
+      };
     }
   }
   for (const mode of modes) {
     if (APPROVAL_GATED_MODE_NAMES.has(mode.id.toLowerCase().replace(/[^a-z0-9]/g, "")) || APPROVAL_GATED_MODE_NAMES.has(mode.label.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
       return { id: mode.id, permissionMode: "ask" };
+    }
+  }
+  if (provider === "codex") {
+    const defaultApprovalMode = modes.find((mode) => mode.id === "auto");
+    if (defaultApprovalMode) {
+      return {
+        id: defaultApprovalMode.id,
+        permissionMode: "read-only",
+        providerOptions: CODEX_READ_ONLY_PROVIDER_OPTIONS,
+      };
     }
   }
   return null;
@@ -336,6 +372,7 @@ export class ReviewService {
   private readonly aiReviewCacheStore: AiReviewCacheStore;
   private readonly reviewBatchStore: ReviewBatchStore;
   private readonly reviewRunStore: ReviewRunStore;
+  private readonly verifications: VerificationService;
   private readonly reviewBatchTimelineMutex = createMutex();
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
@@ -615,6 +652,63 @@ export class ReviewService {
     this.diffParser = dependencies.diffParser ?? new DiffParser();
     this.repoMutexes = dependencies.repoMutexes ?? new RepoMutexRegistry();
     this.gitFactory = dependencies.gitFactory ?? ((cwd) => new GitRunner(cwd));
+    // The verification service reuses this service's workspace binding and
+    // target fingerprint: a Verification Terminal run is only ever started and
+    // confirmed against the same reviewed target the review itself uses.
+    this.verifications = new VerificationService({
+      store: dependencies.verificationRunStore ?? new VerificationRunStore(),
+      reviewedTarget: (request) => this.verificationTarget(request),
+      sameDirectory: (left, right) => this.directoriesMatch(left, right),
+      workspaceIdentity: (workspaceId, context) => this.resolveWorkspaceIdentity(workspaceId, context),
+    });
+  }
+
+  /**
+   * Narrow adapter for the Verification service: the worktree path the command
+   * runs in, and the fingerprint the run binds to. Both come from the same
+   * implementation the review snapshot uses, so a run can never be started
+   * against a target the review is not showing.
+   */
+  private async verificationTarget(
+    request: ReviewRequest,
+  ): Promise<{ targetFingerprint: string; worktreePath: string }> {
+    const { target, targetFingerprint } = await this.fingerprintTarget(request);
+    return { targetFingerprint, worktreePath: target.worktreePath };
+  }
+
+  /**
+   * Start one explicitly confirmed Verification Terminal run: a structured
+   * executable + argv typed into an interactive workspace terminal, bound to
+   * the workspace, its project, the current target fingerprint, and the
+   * command. The caller confirms the exact preview it showed the user; nothing
+   * here is ever derived from free-form review text.
+   */
+  async startVerificationRun(
+    input: StartVerificationRunInput,
+    context: PluginHandlerContext,
+  ): Promise<StartVerificationRunResult> {
+    return this.verifications.start(input, context);
+  }
+
+  /**
+   * Poll one verification run for the state of its workspace terminal. A run
+   * captures a bounded tail of output while the terminal exists and never
+   * interprets it: `open`/`closed`/`unavailable`/`error` are states of the
+   * terminal, not pass/fail verdicts, and no verified fact is ever produced.
+   */
+  async pollVerificationRun(
+    input: PollVerificationRunInput,
+    context: PluginHandlerContext,
+  ): Promise<PollVerificationRunResult> {
+    return this.verifications.poll(input, context);
+  }
+
+  /** Current-target verification runs for panel reloads and refreshes. */
+  async listVerificationRuns(
+    input: ListVerificationRunsInput,
+    context: PluginHandlerContext,
+  ): Promise<ListVerificationRunsResult> {
+    return this.verifications.list(input, context);
   }
 
   async createSnapshot(request: ReviewRequest): Promise<ReviewSnapshot> {
@@ -856,6 +950,12 @@ export class ReviewService {
       return removed;
     });
     await this.sweepTransientReviewAgents();
+    try {
+      await this.verifications.prune(VERIFICATION_RUN_TTL_MS);
+    } catch (error) {
+      // A damaged verification store is left as it is; maintenance keeps going.
+      console.error("[Review Deck] Could not prune verification runs.", error);
+    }
     return removed;
   }
 
@@ -870,6 +970,14 @@ export class ReviewService {
     }, intervalMs);
     timer.unref?.();
     return () => clearInterval(timer);
+  }
+
+  /**
+   * Refuse new verification runs before the plugin daemon session closes. The
+   * workspace terminals themselves stay open for the user to inspect or close.
+   */
+  async dispose(): Promise<void> {
+    await this.verifications.stop();
   }
 
   /**
@@ -1783,7 +1891,7 @@ export class ReviewService {
     // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
     // can never process comments under a stale workspace selection.
     const handle = context.paseo.agents.ref(input.agentId);
-    let agent: { workspaceId?: string | null; cwd?: string | null } | null | undefined;
+    let agent: { workspaceId?: string | null; cwd?: string | null; archivedAt?: string | null } | null | undefined;
     try {
       const fresh = await handle.refresh();
       agent = fresh?.agent ?? handle.current();
@@ -1792,6 +1900,9 @@ export class ReviewService {
     }
     if (!agent) {
       throw new Error(`Processing agent ${input.agentId} does not exist. Select an Agent in workspace ${input.workspaceId} and retry.`);
+    }
+    if (agent.archivedAt) {
+      throw new Error(`Processing agent ${input.agentId} is archived. Select an active Agent and retry.`);
     }
     if (agent.workspaceId !== input.workspaceId) {
       throw new Error(
@@ -2125,7 +2236,7 @@ export class ReviewService {
     });
   }
 
-  explain(snapshot: ReviewSnapshot, hunk: Hunk, locale: ReviewLocale = "en"): {
+  explain(_snapshot: ReviewSnapshot, hunk: Hunk, locale: ReviewLocale = "en"): {
     hunkId: string;
     verifiedFacts: string[];
     aiInference: string[];
@@ -2183,30 +2294,6 @@ export class ReviewService {
       aiInference,
       humanVerificationRecommended,
     };
-  }
-
-  parseReviewSections(text: string): ReviewSections {
-    const sections: ReviewSections = {
-      verifiedFacts: [],
-      aiInference: [],
-      humanVerificationRecommended: [],
-    };
-    let active: "verifiedFacts" | "aiInference" | "humanVerificationRecommended" | null = null;
-    for (const line of text.split("\n")) {
-      const heading = line.trim().toUpperCase().replace(/^#+\s*/, "").replace(/[:：]$/, "");
-      if (heading === "VERIFIED FACTS" || heading === "已确认事实" || heading === "已验证事实") active = "verifiedFacts";
-      else if (heading === "AI INFERENCE" || heading === "AI 推断" || heading === "AI推断") active = "aiInference";
-      else if (
-        heading === "HUMAN VERIFICATION RECOMMENDED"
-        || heading === "建议人工确认"
-        || heading === "人工验证建议"
-      ) active = "humanVerificationRecommended";
-      else if (active && line.trim()) sections[active].push(line.trim().replace(/^[-*]\s+/, ""));
-    }
-    if (sections.verifiedFacts.length === 0 && sections.aiInference.length === 0 && sections.humanVerificationRecommended.length === 0 && text.trim()) {
-      sections.aiInference.push(text.trim());
-    }
-    return sections;
   }
 
   private async readReviewerSettings(locale: ReviewLocale | undefined): Promise<ReviewDeckSettingsValues> {
@@ -2492,6 +2579,7 @@ export class ReviewService {
     thinkingOptionId: string | null;
     modeId: string;
     reviewerPermissionMode: AiReviewPermissionMode;
+    providerOptions?: CodexReadOnlyProviderOptions;
     configProvider: string;
   }> {
     const parent = await this.resolveParentAgentConfig(input, context);
@@ -2542,7 +2630,7 @@ export class ReviewService {
       }
       modes = providerEntry.modes ?? [];
     } else {
-      const parentMode = resolveReviewerMode(modes);
+      const parentMode = resolveReviewerMode(provider, modes);
       if (!parentMode || parentMode.permissionMode === "ask") {
         let providerEntry;
         try {
@@ -2561,13 +2649,13 @@ export class ReviewService {
           }
         } else {
           const providerModes = providerEntry.modes ?? [];
-          const providerMode = resolveReviewerMode(providerModes);
+          const providerMode = resolveReviewerMode(provider, providerModes);
           if (!parentMode || providerMode?.permissionMode === "read-only") modes = providerModes;
         }
       }
     }
 
-    const reviewerMode = resolveReviewerMode(modes);
+    const reviewerMode = resolveReviewerMode(provider, modes);
     if (!reviewerMode) {
       throw new Error(
         input.locale === "zh"
@@ -2581,6 +2669,7 @@ export class ReviewService {
       thinkingOptionId,
       modeId: reviewerMode.id,
       reviewerPermissionMode: reviewerMode.permissionMode,
+      ...(reviewerMode.providerOptions ? { providerOptions: reviewerMode.providerOptions } : {}),
       configProvider: model ? `${provider}/${model}` : provider,
     };
   }
@@ -2596,7 +2685,15 @@ export class ReviewService {
       worktreePath: string;
       locale: ReviewLocale | undefined;
       prompt: string;
-      reviewer: { provider: string; model: string | null; thinkingOptionId: string | null; modeId: string; reviewerPermissionMode: AiReviewPermissionMode; configProvider: string };
+      reviewer: {
+        provider: string;
+        model: string | null;
+        thinkingOptionId: string | null;
+        modeId: string;
+        reviewerPermissionMode: AiReviewPermissionMode;
+        configProvider: string;
+        providerOptions?: CodexReadOnlyProviderOptions;
+      };
       mode: AiReviewMode;
       depth?: AiReviewDepth;
       reviewPreset?: AiReviewBudgetPreset;
@@ -2632,6 +2729,7 @@ export class ReviewService {
       provider: input.reviewer.configProvider,
       modeId: input.reviewer.modeId,
       ...(input.reviewer.thinkingOptionId ? { thinkingOptionId: input.reviewer.thinkingOptionId } : {}),
+      ...(input.reviewer.providerOptions ? { options: input.reviewer.providerOptions } : {}),
     };
     let child: TransientReviewChildHandle;
     try {
@@ -2993,7 +3091,7 @@ export class ReviewService {
       assistantText ??
       result.error ??
       (locale === "zh" ? "评审 Agent 未返回文本。" : "The review agent returned no text.");
-    const sections = normalizedStructured?.sections ?? this.parseReviewSections(review);
+    const sections = normalizedStructured?.sections ?? reviewSectionsFromMarkdown(review);
     if (result.status === "idle" && assistantText && entry.cacheEnabled && entry.cacheKey && entry.inputFingerprint) {
       try {
         await this.aiReviewCacheStore.put({

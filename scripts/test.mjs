@@ -25,6 +25,7 @@ await run(process.execPath, ["--experimental-strip-types", "tests/agent-message-
 await run(process.execPath, ["--experimental-strip-types", "tests/review-settings-timeline.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/i18n-locale.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/agent-registry.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/review-panel-launch.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-entry-status-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/state-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/line-range-selection.test.ts"]);
@@ -35,6 +36,7 @@ await run(process.execPath, ["node_modules/.cache/review-deck-git-runner-tests/t
 await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-run-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/structured-review.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/verification-terminal.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-prompt.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/project-review-workspaces.test.ts"]);
 await run(process.execPath, [tsc, "-p", "tests/tsconfig.target-fingerprint.json"]);

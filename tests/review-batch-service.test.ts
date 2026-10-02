@@ -37,8 +37,8 @@ function commentEntry(id: string, workspaceId: string, cwd: string): StateEntry 
   };
 }
 
-function lifecycleAgent(id: string, workspaceId: string, cwd: string) {
-  return { id, workspaceId, parentAgentId: null, provider: "omp", cwd, title: id, status: "running", archivedAt: null };
+function lifecycleAgent(id: string, workspaceId: string, cwd: string, archivedAt: string | null = null) {
+  return { id, workspaceId, parentAgentId: null, provider: "omp", cwd, title: id, status: "running", archivedAt };
 }
 
 async function run(): Promise<void> {
@@ -124,6 +124,23 @@ async function run(): Promise<void> {
     const initial = await service.listProjectReviewComments(PROJECT_ID);
     assert.equal(initial?.commentCount, 6);
     assert.deepEqual(initial?.batches, []);
+    const agentA = agents.get("agent-a");
+    assert.ok(agentA);
+    agentA.archivedAt = "2026-10-01T12:00:00.000Z";
+    const batchesBeforeArchivedReject = await batchStore.listByProject(PROJECT_ID);
+    await assert.rejects(
+      () => service.processProjectReview({
+        projectId: PROJECT_ID,
+        agentId: "agent-a",
+        workspaceId: "workspace-a",
+        workspaceCwd: workspaceA,
+        commentIds: ["comment-a1"],
+      }, handlerContext),
+      /archived/,
+    );
+    assert.deepEqual(await batchStore.listByProject(PROJECT_ID), batchesBeforeArchivedReject);
+    assert.equal(prompts.has("agent-a"), false);
+    agentA.archivedAt = null;
 
     const submitted = await service.processProjectReview({
       projectId: PROJECT_ID,

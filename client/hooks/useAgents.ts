@@ -38,6 +38,7 @@ export function useAgents(params: { selectedWorkspaceId: string; reviewCwd: stri
       provider: agent.provider,
       model: agent.model,
       title: agent.title,
+      archived: agent.archived,
     })),
   [snapshot.agents]);
 

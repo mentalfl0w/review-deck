@@ -1,13 +1,19 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import type {
-  PluginAgentPanelProps,
   PluginButtonContentProps,
   PluginClientContext,
   PluginWorkspacePanelProps,
 } from "@getpaseo/plugin/client";
-import { ReviewDeckAgentPanel } from "./client/ReviewDeckAgentPanel";
 import { ReviewDeckPanel } from "./client/ReviewDeckPanel";
+import {
+  clearReviewPanelLaunches,
+  consumeReviewPanelLaunch,
+  getReviewPanelLaunch,
+  openReviewPanelInWorkspace,
+  useReviewPanelLaunch,
+  type ReviewPanelLaunchRequest,
+} from "./client/review-panel-launch";
 import { ReviewDeckSettings } from "./client/ReviewDeckSettings";
 import { ReviewAiReviewTimelineItem, type ReviewAiReviewTimelineItemProps } from "./client/components/ReviewAiReviewTimelineItem";
 import { ReviewBatchTimelineItem, type ReviewBatchTimelineItemProps } from "./client/components/ReviewBatchTimelineItem";
@@ -37,41 +43,19 @@ import {
   reviewHandoffTimelineVersion,
 } from "./shared/review-handoff";
 
-function WorkspaceQueuePanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
-  return (
-    <ReviewDeckPanel
-      theme={theme}
-      layout={layout}
-      workspaceId={workspaceId}
-      initialQueueOpen
-      markAiReviewResultsReadOnOpen={false}
-    />
+function WorkspaceReviewDeckPanel(props: PluginWorkspacePanelProps) {
+  const pendingLaunch = useReviewPanelLaunch(props.workspaceId);
+  const [launch, setLaunch] = useState<ReviewPanelLaunchRequest | null>(() =>
+    getReviewPanelLaunch(props.workspaceId),
   );
-}
 
-function AgentQueuePanel({ theme, layout, workspaceId, agentId }: PluginAgentPanelProps) {
-  return (
-    <ReviewDeckPanel
-      theme={theme}
-      layout={layout}
-      workspaceId={workspaceId}
-      preferredAgentId={agentId}
-      initialQueueOpen
-      markAiReviewResultsReadOnOpen={false}
-    />
-  );
-}
+  useEffect(() => {
+    if (!pendingLaunch) return;
+    setLaunch(pendingLaunch);
+    consumeReviewPanelLaunch(props.workspaceId, pendingLaunch.requestId);
+  }, [pendingLaunch, props.workspaceId]);
 
-function AgentTargetedReviewPanel({ theme, layout, workspaceId, agentId }: PluginAgentPanelProps) {
-  return (
-    <ReviewDeckPanel
-      theme={theme}
-      layout={layout}
-      workspaceId={workspaceId}
-      preferredAgentId={agentId}
-      autoRunTargetedReview
-    />
-  );
+  return <ReviewDeckPanel {...props} launchRequest={launch} />;
 }
 export default function contribute(client: PluginClientContext) {
   client.addWorkspacePanel({
@@ -80,39 +64,7 @@ export default function contribute(client: PluginClientContext) {
     icon: "ScanSearch",
     context: "workspace",
     locations: ["workspace", "explorer"],
-    Component: ReviewDeckPanel,
-  });
-  client.addWorkspacePanel({
-    id: "review-deck-agent",
-    title: "Review Deck",
-    icon: "ScanSearch",
-    context: "agent",
-    locations: ["workspace", "explorer"],
-    Component: ReviewDeckAgentPanel,
-  });
-  client.addWorkspacePanel({
-    id: "review-deck-queue",
-    title: "Review Queue",
-    icon: "ListTodo",
-    context: "workspace",
-    locations: ["workspace", "explorer"],
-    Component: WorkspaceQueuePanel,
-  });
-  client.addWorkspacePanel({
-    id: "review-deck-agent-queue",
-    title: "Review Queue",
-    icon: "ListTodo",
-    context: "agent",
-    locations: ["workspace", "explorer"],
-    Component: AgentQueuePanel,
-  });
-  client.addWorkspacePanel({
-    id: "review-deck-agent-targeted-review",
-    title: "AI Review",
-    icon: "Sparkles",
-    context: "agent",
-    locations: ["workspace", "explorer"],
-    Component: AgentTargetedReviewPanel,
+    Component: WorkspaceReviewDeckPanel,
   });
   client.addCommandCenterItem({
     id: "open-review-deck",
@@ -120,8 +72,8 @@ export default function contribute(client: PluginClientContext) {
     icon: "ScanSearch",
     keywords: ["review", "diff", "risk", "hunk"],
     context: "workspace",
-    onSelect({ openPanel }) {
-      openPanel("review-deck");
+    onSelect({ workspace, openPanel }) {
+      openReviewPanelInWorkspace({ workspaceId: workspace.id, action: "deck" }, openPanel);
     },
   });
   client.addCommandCenterItem({
@@ -130,8 +82,12 @@ export default function contribute(client: PluginClientContext) {
     icon: "ScanSearch",
     keywords: ["review", "diff", "risk", "hunk"],
     context: "agent",
-    onSelect({ openPanel }) {
-      openPanel("review-deck-agent");
+    onSelect({ workspace, agent, openPanel }) {
+      openReviewPanelInWorkspace({
+        workspaceId: workspace.id,
+        action: "deck",
+        preferredAgentId: agent.id,
+      }, openPanel);
     },
   });
   client.addSlashCommand({
@@ -139,8 +95,12 @@ export default function contribute(client: PluginClientContext) {
     description: "Open Review Deck for this Agent workspace",
     argumentHint: "",
     context: "agent",
-    onSubmit({ openPanel }) {
-      openPanel("review-deck-agent");
+    onSubmit({ workspace, agent, openPanel }) {
+      openReviewPanelInWorkspace({
+        workspaceId: workspace.id,
+        action: "deck",
+        preferredAgentId: agent.id,
+      }, openPanel);
     },
   });
   client.addTimelineRenderer({
@@ -166,11 +126,11 @@ export default function contribute(client: PluginClientContext) {
         <ReviewBatchTimelineItem
           {...props}
           onOpenReviewDeck={(workspaceId) =>
-            client.openPanel("review-deck-agent", {
+            openReviewPanelInWorkspace({
               workspaceId,
-              agentId: props.agentId,
-              location: "workspace",
-            })}
+              action: "deck",
+              preferredAgentId: props.agentId,
+            }, (id, options) => client.openPanel(id, { workspaceId, ...options }))}
         />
       );
     },
@@ -184,11 +144,11 @@ export default function contribute(client: PluginClientContext) {
         <ReviewAiReviewTimelineItem
           {...props}
           onOpenReviewDeck={(workspaceId) =>
-            client.openPanel("review-deck-agent", {
+            openReviewPanelInWorkspace({
               workspaceId,
-              agentId: props.agentId,
-              location: "workspace",
-            })}
+              action: "deck",
+              preferredAgentId: props.agentId,
+            }, (id, options) => client.openPanel(id, { workspaceId, ...options }))}
         />
       );
     },
@@ -251,7 +211,7 @@ export default function contribute(client: PluginClientContext) {
     if (!group || group.comments.length === 0) return;
     if (group.activeBatch) throw new Error("This workspace already has an active ReviewBatch.");
     const agent = group.eligibleAgents.find((candidate) => candidate.id === agentId);
-    if (!agent || group.selectedAgentId !== agentId || USABLE_AGENT_STATUSES[agent.status ?? ""] !== true) {
+    if (!agent || agent.archived || group.selectedAgentId !== agentId || USABLE_AGENT_STATUSES[agent.status ?? ""] !== true) {
       throw new Error("The selected Agent is no longer eligible in this workspace.");
     }
     if (!agent.cwd) throw new Error("The selected Agent has no workspace directory.");
@@ -268,7 +228,9 @@ export default function contribute(client: PluginClientContext) {
     client: {
       addHeaderButton: (contribution) => client.addHeaderButton(contribution),
       addComposerPill: (contribution) => client.addComposerPill(contribution),
-      openPanel: (id, options) => client.openPanel(id, options),
+      openReviewPanel: (input) =>
+        openReviewPanelInWorkspace(input, (id, options) =>
+          client.openPanel(id, { workspaceId: input.workspaceId, ...options })),
       createHeaderPopover: (workspaceId) => function ReviewHeaderPopoverContent(props: PluginButtonContentProps) {
         if (props.context !== "workspace" || props.workspaceId !== workspaceId) return null;
         return (
@@ -276,11 +238,13 @@ export default function contribute(client: PluginClientContext) {
             {...props}
             onOpenReviewDeck={() => {
               props.close();
-              client.openPanel("review-deck", { workspaceId, location: "workspace" });
+              openReviewPanelInWorkspace({ workspaceId, action: "deck" }, (id, options) =>
+                client.openPanel(id, { workspaceId, ...options }));
             }}
             onOpenQueue={() => {
               props.close();
-              client.openPanel("review-deck-queue", { workspaceId, location: "workspace" });
+              openReviewPanelInWorkspace({ workspaceId, action: "queue" }, (id, options) =>
+                client.openPanel(id, { workspaceId, ...options }));
             }}
           />
         );
@@ -302,6 +266,7 @@ export default function contribute(client: PluginClientContext) {
     entries.stop();
     statuses.bindFetcher(null);
     counts.bindFetcher(null);
+    clearReviewPanelLaunches();
     registry.stop();
   };
 }

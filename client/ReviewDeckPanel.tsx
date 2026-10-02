@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRpc, useSettings, type PluginAgentPanelProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { useRpc, useSettings, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n";
 import { scopeKeys, type DiffMode, type ViewMode } from "./tools";
@@ -13,44 +13,33 @@ import { useProjectComments } from "./hooks/useProjectComments";
 import { useReviewActions } from "./hooks/useReviewActions";
 import { useAgentReview } from "./hooks/useAgentReview";
 import { useFileView } from "./hooks/useFileView";
+import { useVerification } from "./hooks/useVerification";
 import { ContextBar } from "./components/ContextBar";
 import { FileNavigator } from "./components/FileNavigator";
 import { FileDetail } from "./components/FileDetail";
 import { QueueModal } from "./components/QueueModal";
 import { MoreModal } from "./components/MoreModal";
 import { ManageModal } from "./components/ManageModal";
-import { reviewDeckSettings } from "../shared/review-settings";
+import { isReviewPreviewUrl, reviewDeckSettings, setProjectPreviewUrl } from "../shared/review-settings";
+import type { ReviewPanelLaunchRequest } from "./review-panel-launch";
 import { markWorkspaceReviewResultsRead } from "../shared/review-activity";
 import { getReviewEntryStatusStore } from "./review-entry-status-store";
-import type { AiReviewBudgetPreset, AiReviewDepth } from "../shared/review";
+import type { AiReviewBudgetPreset, AiReviewDepth, ReviewRequest } from "../shared/review";
 
-/** The host surface the deck consumes, shared by the workspace and agent
- * panel contexts, plus the optional preferred agent target. Both host prop
- * shapes ({@link PluginWorkspacePanelProps} and {@link PluginAgentPanelProps})
- * satisfy it; workspace registrations stay byte-for-byte compatible. */
-export type ReviewDeckPanelProps = Pick<PluginWorkspacePanelProps, "theme" | "layout" | "workspaceId"> & {
-  /** Agent-context panels preselect the hosting Agent once the registry settles. */
-  preferredAgentId?: string | null;
-  /** Dedicated native entry variants can open the existing queue immediately. */
-  initialQueueOpen?: boolean;
-  /** Targeted Review Pill entry starts a working-tree targeted review after the snapshot settles. */
-  autoRunTargetedReview?: boolean;
-  /** Queue-only panel variants do not count as opening unread AI findings. */
-  markAiReviewResultsReadOnOpen?: boolean;
+/** Review Deck's single workspace-scoped tab receives transient launch intent
+ * from the Header, Command Center, timeline, or Agent Composer. */
+export type ReviewDeckPanelProps = Pick<PluginWorkspacePanelProps, "theme" | "layout" | "workspaceId" | "navigation"> & {
+  launchRequest?: ReviewPanelLaunchRequest | null;
 };
 
 /** Review Deck panel: a minimal composition layer wiring the domain hooks to
  * the presentational components. */
-export function ReviewDeckPanel({
-  theme,
-  layout,
-  workspaceId,
-  preferredAgentId,
-  initialQueueOpen = false,
-  autoRunTargetedReview = false,
-  markAiReviewResultsReadOnOpen = true,
-}: ReviewDeckPanelProps) {
+export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launchRequest = null }: ReviewDeckPanelProps) {
   const settings = useSettings(reviewDeckSettings);
+  const preferredAgentId = launchRequest?.preferredAgentId ?? null;
+  const initialQueueOpen = launchRequest?.action === "queue";
+  const targetedReviewRequestId = launchRequest?.action === "targeted" ? launchRequest.requestId : null;
+  const markAiReviewResultsReadOnOpen = launchRequest?.action !== "queue";
   const [manualLocale, setManualLocale] = useState<Locale | null>(null);
   const configuredLocale = settings.status === "ready" ? settings.values.locale : "auto";
   const locale = manualLocale ?? (configuredLocale === "auto" ? detectLocale() : configuredLocale);
@@ -75,18 +64,62 @@ export function ReviewDeckPanel({
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [compactFilesOpen, setCompactFilesOpen] = useState(layout.compact);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [previewUrlDraft, setPreviewUrlDraft] = useState("");
+  const previewUrlProjectRef = useRef<string | null>(null);
+  const previewUrlDraftDirtyRef = useRef(false);
   const [reviewDepthOverride, setReviewDepthOverride] = useState<AiReviewDepth | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const appliedPreferredAgentId = useRef<string | null>(null);
+  const appliedPreferredAgentRequestId = useRef<number | null>(null);
   const hasAppliedPreferredAgent = useRef(false);
-  const initialQueueOpenedForRef = useRef<string | null>(null);
-  const autoRunTargetedStartedRef = useRef(false);
+  const initialQueueOpenedForRef = useRef<number | null>(null);
+  const autoRunTargetedStartedRef = useRef<number | null>(null);
   const markReadRpc = useRpc(markWorkspaceReviewResultsRead);
   const [detailHeight, setDetailHeight] = useState(0);
   const handleDetailHeightChange = useCallback((height: number) => {
     setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
   }, []);
   const scopeApi = useReviewScope(workspaceId);
+  const previewProjectId = scopeApi.effectiveProjectId;
+  const configuredPreviewUrl = settings.status === "ready" && previewProjectId
+    ? settings.values.projectPreviewUrls[previewProjectId] ?? ""
+    : "";
+  useEffect(() => {
+    if (previewUrlProjectRef.current !== previewProjectId) {
+      previewUrlProjectRef.current = previewProjectId;
+      previewUrlDraftDirtyRef.current = false;
+    }
+    if (!previewUrlDraftDirtyRef.current && settings.status === "ready") {
+      setPreviewUrlDraft(configuredPreviewUrl);
+    }
+  }, [configuredPreviewUrl, previewProjectId, settings.status]);
+  const updatePreviewUrlDraft = useCallback((url: string) => {
+    previewUrlDraftDirtyRef.current = true;
+    setPreviewUrlDraft(url);
+  }, []);
+  const commitPreviewUrl = useCallback(() => {
+    if (!previewProjectId || settings.status !== "ready") return;
+    const url = previewUrlDraft.trim();
+    if (url !== "" && !isReviewPreviewUrl(url)) return;
+    previewUrlDraftDirtyRef.current = false;
+    const next = setProjectPreviewUrl(settings.values, previewProjectId, url);
+    if (next !== settings.values) void settings.save(next, settings.revision);
+  }, [previewProjectId, previewUrlDraft, settings]);
+  const openPreview = useCallback(() => {
+    const openBrowser = navigation?.openBrowser;
+    const selectedWorkspaceId = scopeApi.selectedWorkspaceId;
+    const url = previewUrlDraft.trim();
+    if (
+      !openBrowser ||
+      !previewProjectId ||
+      !selectedWorkspaceId ||
+      settings.status !== "ready" ||
+      !isReviewPreviewUrl(url)
+    ) return;
+    commitPreviewUrl();
+    setMoreOpen(false);
+    openBrowser({ url, workspaceId: selectedWorkspaceId });
+  }, [commitPreviewUrl, navigation, previewProjectId, previewUrlDraft, scopeApi.selectedWorkspaceId, settings.status]);
   useEffect(() => {
     setReviewDepthOverride(null);
   }, [scopeApi.selectedWorkspaceId]);
@@ -119,6 +152,24 @@ export function ReviewDeckPanel({
     workspaceStatus: scopeApi.workspace?.status ?? null,
     agentRevision: agentsApi.agentRevision,
     setActionError,
+  });
+  const verificationRequest = useMemo<ReviewRequest | null>(() => {
+    if (!scopeApi.reviewCwd) return null;
+    const filePath = scopeApi.filePath.trim();
+    return {
+      cwd: scopeApi.reviewCwd,
+      scope: scopeApi.scope,
+      locale,
+      ...(scopeApi.scope === "commits" ? { baseRef: scopeApi.baseRef, headRef: scopeApi.headRef } : {}),
+      ...(filePath ? { filePath } : {}),
+    };
+  }, [locale, scopeApi.baseRef, scopeApi.filePath, scopeApi.headRef, scopeApi.reviewCwd, scopeApi.scope]);
+  const verificationApi = useVerification({
+    workspaceId: scopeApi.selectedWorkspaceId,
+    request: verificationRequest,
+    targetFingerprint: snapshotApi.snapshot?.targetFingerprint ?? null,
+    enabled: Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale),
+    onError: setActionError,
   });
   useEffect(() => {
     if (!snapshotApi.snapshot) return;
@@ -153,10 +204,11 @@ export function ReviewDeckPanel({
     t,
   });
   useEffect(() => {
-    if (!initialQueueOpen || !scopeApi.workspace || initialQueueOpenedForRef.current === workspaceId) return;
-    initialQueueOpenedForRef.current = workspaceId;
+    if (!initialQueueOpen || !scopeApi.workspace || !launchRequest ||
+      initialQueueOpenedForRef.current === launchRequest.requestId) return;
+    initialQueueOpenedForRef.current = launchRequest.requestId;
     commentsApi.openProjectQueue();
-  }, [commentsApi.openProjectQueue, initialQueueOpen, scopeApi.workspace, workspaceId]);
+  }, [commentsApi.openProjectQueue, initialQueueOpen, launchRequest, scopeApi.workspace, workspaceId]);
   const actionsApi = useReviewActions({
     reviewCwd: scopeApi.reviewCwd,
     scope: scopeApi.scope,
@@ -211,8 +263,8 @@ export function ReviewDeckPanel({
   }, [agentApi.runAgentReview, reviewDepthOverride]);
   useEffect(() => {
     if (
-      !autoRunTargetedReview ||
-      autoRunTargetedStartedRef.current ||
+      targetedReviewRequestId === null ||
+      autoRunTargetedStartedRef.current === targetedReviewRequestId ||
       !preferredAgentId ||
       selectedAgentId !== preferredAgentId ||
       agentsApi.agentsLoading ||
@@ -222,18 +274,19 @@ export function ReviewDeckPanel({
       snapshotApi.snapshot.totalHunks === 0 ||
       agentApi.agentReviewBusy
     ) return;
-    autoRunTargetedStartedRef.current = true;
+    autoRunTargetedStartedRef.current = targetedReviewRequestId;
     runReviewForAgent(preferredAgentId, undefined, "targeted");
   }, [
     agentApi.agentReviewBusy,
     agentsApi.agentsLoading,
-    autoRunTargetedReview,
     preferredAgentId,
     runReviewForAgent,
     selectedAgentId,
     snapshotApi.loading,
     snapshotApi.snapshot,
     snapshotApi.stale,
+    targetedReviewRequestId,
+    workspaceId,
   ]);
   useEffect(() => {
     if (!markAiReviewResultsReadOnOpen || !agentApi.agentReviewMeta || agentApi.agentReviewBusy) return;
@@ -270,18 +323,16 @@ export function ReviewDeckPanel({
   }, [actionsApi.activeCommentKey, actionsApi.selectedFileComments, actionsApi.stageSavedCommentDraft, selectHunk]);
 
   const styles = useMemo(() => buildPanelStyles(theme, layout), [layout.compact, theme]);
-  // Agent selection policy: More is the sole selection surface. A single
-  // eligible agent is selected automatically; with several, keep a still-valid
-  // prior selection or select none — never silently target the first agent.
-  // Agent-context wrappers supply a preferredAgentId. Apply that preference
-  // once after a non-empty registry settles, then retain any valid user choice
-  // from More rather than reasserting the initial target on every update.
+  // A workspace launch request may prefer its originating Agent. Apply that
+  // preference once per request after the registry settles, then preserve the
+  // user's choice from More until another launch arrives.
   useEffect(() => {
     if (agentsApi.agentsLoading) return;
     const validIds = new Set(agentsApi.agents.map((agent) => agent.id));
     if (preferredAgentId) {
       const preferredChanged = !hasAppliedPreferredAgent.current ||
-        appliedPreferredAgentId.current !== preferredAgentId;
+        appliedPreferredAgentId.current !== preferredAgentId ||
+        appliedPreferredAgentRequestId.current !== launchRequest?.requestId;
       if (preferredChanged) {
         // Wait for a non-empty settled list: otherwise an initial empty
         // subscription snapshot could permanently suppress preselection.
@@ -290,6 +341,7 @@ export function ReviewDeckPanel({
           return;
         }
         hasAppliedPreferredAgent.current = true;
+        appliedPreferredAgentRequestId.current = launchRequest?.requestId ?? null;
         appliedPreferredAgentId.current = preferredAgentId;
         setSelectedAgentId(validIds.has(preferredAgentId) ? preferredAgentId : null);
         return;
@@ -299,6 +351,7 @@ export function ReviewDeckPanel({
     }
     hasAppliedPreferredAgent.current = false;
     appliedPreferredAgentId.current = null;
+    appliedPreferredAgentRequestId.current = null;
     if (agentsApi.agents.length === 0) {
       setSelectedAgentId(null);
     } else if (agentsApi.agents.length === 1) {
@@ -306,7 +359,7 @@ export function ReviewDeckPanel({
     } else {
       setSelectedAgentId((current) => (current !== null && validIds.has(current) ? current : null));
     }
-  }, [agentsApi.agents, agentsApi.agentsLoading, preferredAgentId]);
+  }, [agentsApi.agents, agentsApi.agentsLoading, launchRequest?.requestId, preferredAgentId]);
   const scopeOptions = useMemo(() => scopeKeys.map((option) => ({ value: option.value, label: t(option.key) })), [t]);
 
   const activeWorkspaceName = scopeApi.workspace?.name ?? "";
@@ -420,6 +473,11 @@ export function ReviewDeckPanel({
       agentSections={agentApi.agentSections}
       agentReviewMeta={agentApi.agentReviewMeta}
       agentReviewBusy={agentApi.agentReviewBusy}
+      verificationRuns={verificationApi.runs}
+      verificationEnabled={Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale && !analysisStale)}
+      onRunVerification={verificationApi.start}
+      onRefreshVerification={verificationApi.refresh}
+      onVerificationError={setActionError}
       showAiReviewUsage={showAiReviewUsage}
       activeCommentDraft={actionsApi.activeCommentDraft}
       activeSavedComment={actionsApi.activeSavedComment}
@@ -574,7 +632,10 @@ export function ReviewDeckPanel({
         t={t}
         styles={styles}
         open={moreOpen}
-        onClose={() => setMoreOpen(false)}
+        onClose={() => {
+          commitPreviewUrl();
+          setMoreOpen(false);
+        }}
         scopeOptions={scopeOptions}
         scope={scopeApi.scope}
         agents={agentsApi.agents}
@@ -597,6 +658,13 @@ export function ReviewDeckPanel({
         onHeadRefChange={scopeApi.setHeadRef}
         loading={snapshotApi.loading}
         onRefresh={() => void snapshotApi.refresh()}
+        previewUrl={previewUrlDraft}
+        previewUrlSaveError={settings.status === "ready" ? settings.saveError : null}
+        previewProjectAvailable={Boolean(previewProjectId)}
+        browserPreviewAvailable={Boolean(navigation?.openBrowser && previewProjectId && scopeApi.selectedWorkspaceId && settings.status === "ready")}
+        onPreviewUrlChange={updatePreviewUrlDraft}
+        onPreviewUrlCommit={commitPreviewUrl}
+        onOpenPreview={openPreview}
         selected={snapshotApi.selected}
         decisions={snapshotApi.decisions}
         snapshot={snapshotApi.snapshot}

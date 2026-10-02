@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import type {
   ExplainHunkAiResult,
   ExplainHunkResult,
   LineRangeSelection,
+  PollVerificationRunResult,
   ReviewAnchor,
   ReviewAnchorIssue,
   ReviewScope,
   PollAiReviewResult,
   ReviewSections,
+  ReviewVerificationSuggestion,
 } from "../../shared/review";
 import { hunkHeaderParts } from "../diffView";
 import { anchorLineRange, lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
@@ -17,7 +19,6 @@ import {
   severityLabelKeys,
   severityOrder,
   type AgentFeedbackMap,
-  type AgentInfo,
   type DiffMode,
   type FileCommentDraft,
   type FileCommentEntry,
@@ -37,10 +38,11 @@ import { FileView } from "./FileView";
 import { CommentSheet } from "./CommentSheet";
 import { AnchorIssues } from "./AnchorIssues";
 import { AiReviewMeta } from "./AiReviewMeta";
+import { VerificationCommands } from "./VerificationCommands";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentReviewMeta, agentReviewBusy, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -82,6 +84,11 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   aiExplanation: ExplainHunkAiResult | null;
   agentReview: string | null;
   agentSections: ReviewSections | null;
+  verificationRuns: Readonly<Record<string, PollVerificationRunResult>>;
+  verificationEnabled: boolean;
+  onRunVerification: (suggestion: ReviewVerificationSuggestion) => Promise<void>;
+  onRefreshVerification: (runId: string) => Promise<void>;
+  onVerificationError: (message: string) => void;
   agentReviewMeta: Pick<PollAiReviewResult, "provider" | "model" | "thinkingOptionId" | "reviewerPermissionMode" | "resultSource" | "mode" | "depth" | "reviewPreset" | "usage"> | null;
   agentReviewBusy: boolean;
   showAiReviewUsage: boolean;
@@ -324,13 +331,26 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
               agentSections.summary ||
               agentSections.verifiedFacts.length > 0 ||
               agentSections.aiInference.length > 0 ||
-              agentSections.humanVerificationRecommended.length > 0
+              agentSections.humanVerificationRecommended.length > 0 ||
+              (agentSections.verificationCommands?.length ?? 0) > 0
             ) ? (
               <>
                 {agentSections.summary ? <Text selectable style={styles.scopeDesc}>{agentSections.summary}</Text> : null}
                 <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
+                <VerificationCommands
+                  theme={theme}
+                  layout={layout}
+                  t={t}
+                  styles={styles}
+                  commands={agentSections.verificationCommands ?? []}
+                  runs={verificationRuns}
+                  enabled={verificationEnabled}
+                  onRun={onRunVerification}
+                  onError={onVerificationError}
+                  onRefresh={onRefreshVerification}
+                />
               </>
             ) : <Text selectable style={styles.rawReview}>{agentReview}</Text>}
           </View>
@@ -349,7 +369,7 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
           selectionPending={lineSelection?.awaitingEnd ?? false}
           busyIssueId={reanchorBusyIssueId}
           notice={reanchorNotice}
-          onSelectCandidate={(issue, candidate) => {
+          onSelectCandidate={(_issue, candidate) => {
             // Candidates are hunk or range anchors by construction; a file
             // anchor carries no change block to jump to.
             if (candidate.kind !== "file") onSelectHunk(candidate.hunkId);

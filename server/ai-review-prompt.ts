@@ -28,10 +28,10 @@ import type { AiReviewBudgetPreset, AiReviewDepth, AiReviewMode, ReviewLocale, R
 import { canonicalJson, hunkContentId, sha256 } from "./util/crypto";
 
 /** Version of the prompt layout/instructions; bump on any wording change. */
-export const AI_REVIEW_PROMPT_VERSION = 4;
+export const AI_REVIEW_PROMPT_VERSION = 5;
 
 /** Version of the structured review output contract the prompt requests. */
-export const AI_REVIEW_SCHEMA_VERSION = 2;
+export const AI_REVIEW_SCHEMA_VERSION = 3;
 
 /** Maximum patch text (in characters) a full review prompt may carry. */
 export const AI_REVIEW_PATCH_CHAR_LIMIT = 160_000;
@@ -305,6 +305,10 @@ const PROMPT_COPY: Record<ReviewLocale, PromptCopy> = {
       "Return structured JSON matching the supplied `StructuredReviewResult` schema only when the host supplies that schema; otherwise use the Markdown fallback headings below.",
       "Use the exact file path from the index; include `hunkId` only when the finding is tied to a listed stable hunk id.",
       "Never invent a hunk id or substitute a hunk header or line number.",
+      "Add `verificationCommand` (`{ \"executable\": \"<program>\", \"args\": [\"…\"] }`) only when you can name the exact program and its arguments for verifying a finding, and only for a finding you report as `ai_inference` or `human_verification_recommended`. Never put a command line, shell operator, pipe, redirection, glob, substitution, terminal control character (including Tab), or bidi formatting character there; prefer an ASCII executable name. Never name a shell launcher, builtin, evaluator, web-request alias, or process launcher (`sh`, `bash`, `cmd`, `powershell`, `eval`, `.`, `source`, `exec`, `alias`, `iex`, `icm`, `iwr`, `irm`, `Invoke-Expression`, `Invoke-WebRequest`, `curl`, `wget`, `start`, `saps`) or a destructive action (delete, reset, overwrite, install, publish). Omit the command when in doubt.",
+      "Also never name PowerShell's `sajb` alias for `Start-Job`.",
+      "Review Deck never runs a `verificationCommand` automatically and never runs it for you: the user sees the exact command and confirms it before anything executes. Do not run it yourself.",
+      "In the Markdown fallback, put commands in a `### Verification Commands` section holding one JSON array of `{ \"executable\": \"<program>\", \"args\": [\"…\"] }` objects (optionally `hunkId`, `filePath`, `label`, `evidenceKind`); any other shape is ignored.",
       "If a supplied structured schema is rejected or the returned JSON is invalid, use these Markdown headings: `### Verified Facts`, `### AI Inference`, and `### Human Verification Recommended`.",
       "Report only findings you can ground in the change or in what you inspected.",
       "Answer in English.",
@@ -350,6 +354,10 @@ const PROMPT_COPY: Record<ReviewLocale, PromptCopy> = {
       "只有 host 确实提供了 `StructuredReviewResult` schema 时才返回匹配的结构化 JSON；否则使用下方 Markdown fallback 标题。",
       "使用索引中的准确文件路径；只有结论对应某个已列出的稳定变更块时，才填写对应的 `hunkId`。",
       "不要编造 hunk ID，也不要用 hunk header 或行号替代。",
+      "只有当你能给出用于验证某条结论的确切程序及其参数时，才添加 `verificationCommand`（`{ \"executable\": \"<程序>\", \"args\": [\"…\"] }`），并且只用于标记为 `ai_inference` 或 `human_verification_recommended` 的结论。不得包含命令行、shell 操作符、管道、重定向、通配符、命令替换、终端控制字符（包括 Tab）或双向格式控制符；executable 优先使用 ASCII 字符。不得使用 shell 启动器、内置命令、代码求值器、网络请求别名或进程启动器（`sh`、`bash`、`cmd`、`powershell`、`eval`、`.`、`source`、`exec`、`alias`、`iex`、`icm`、`iwr`、`irm`、`Invoke-Expression`、`Invoke-WebRequest`、`curl`、`wget`、`start`、`saps`），也不得使用破坏性操作（删除、重置、覆盖、安装、发布）。不确定时请省略命令。",
+      "也不要使用 PowerShell `Start-Job` 的 `sajb` alias。",
+      "Review Deck 不会自动执行 `verificationCommand`，也不会代你执行：用户会看到确切命令并在执行前确认。请不要自己运行它。",
+      "使用 Markdown fallback 时，请把命令放在 `### Verification Commands` 一节中，内容为一个 JSON 数组，元素形如 `{ \"executable\": \"<程序>\", \"args\": [\"…\"] }`（可选 `hunkId`、`filePath`、`label`、`evidenceKind`）；其他形式一律忽略。",
       "如果 host 拒绝结构化 schema 或返回的 JSON 无效，请使用以下 Markdown 标题：`### Verified Facts`、`### AI Inference`、`### Human Verification Recommended`。",
       "只报告能在变更本身或你检查过的内容中证实的结论。",
       "用中文回答。",

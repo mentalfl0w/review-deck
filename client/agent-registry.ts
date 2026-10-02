@@ -86,12 +86,13 @@ function normalizeCwd(value: string | null | undefined): string | null {
  * admitted through its cwd, so sibling workspaces sharing a directory cannot
  * leak into each other's panel.
  */
-export function selectWorkspaceAgents<T extends { workspaceId: string | null; cwd?: string | null }>(
+export function selectWorkspaceAgents<T extends { workspaceId: string | null; cwd?: string | null; archived?: boolean }>(
   agents: readonly T[],
   params: { selectedWorkspaceId: string; reviewCwd: string | null },
 ): T[] {
   const review = normalizeCwd(params.reviewCwd);
   return agents.filter((agent) => {
+    if (agent.archived) return false;
     if (agent.workspaceId) return agent.workspaceId === params.selectedWorkspaceId;
     const cwd = normalizeCwd(agent.cwd);
     return !!cwd && !!review && cwd === review;

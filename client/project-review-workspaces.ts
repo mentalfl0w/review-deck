@@ -53,7 +53,7 @@ export function groupProjectReviewComments(input: {
 
   return Array.from(groups.values(), (group) => {
     const eligibleAgents = group.workspaceId
-      ? input.agents.filter((agent) => agent.workspaceId === group.workspaceId)
+      ? input.agents.filter((agent) => agent.workspaceId === group.workspaceId && !agent.archived)
       : [];
     const activeBatch = input.batches.find((batch) => batch.workspaceId === group.workspaceId) ?? null;
     const storedSelection = input.selectedAgentByWorkspace[group.key];

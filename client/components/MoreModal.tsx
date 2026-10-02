@@ -1,5 +1,6 @@
 import { Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { AiReviewBudgetPreset, AiReviewDepth, ReviewScope, ReviewSnapshot } from "../../shared/review";
+import { isReviewPreviewUrl } from "../../shared/review-settings";
 import {
   scopeDescKeys,
   type AgentInfo,
@@ -12,9 +13,10 @@ import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
 import { ActionButton, HoverTooltip, Segmented } from "./ui";
 
-/** Centered "More & management" modal: scope/refs/path inputs, the Agent
- * registry/selection surface and the safety (review-state) actions. */
-export function MoreModal({ theme, layout, t, styles, open, onClose, agents, agentsLoading, selectedAgentId, onSelectAgent, onRunTargetReview, agentReviewBusy, defaultReviewPreset, reviewDepthOverride, onReviewDepthOverrideChange, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
+/** Centered "More & management" modal: scope/refs/path inputs, the current
+ * project's Browser Preview target, the Agent registry/selection surface and
+ * the safety (review-state) actions. */
+export function MoreModal({ theme, layout, t, styles, open, onClose, agents, agentsLoading, selectedAgentId, onSelectAgent, onRunTargetReview, agentReviewBusy, defaultReviewPreset, reviewDepthOverride, onReviewDepthOverrideChange, scopeOptions, scope, onScopeChange, filePath, onFilePathChange, baseRef, onBaseRefChange, headRef, onHeadRefChange, loading, onRefresh, previewUrl, previewUrlSaveError, previewProjectAvailable, browserPreviewAvailable, onPreviewUrlChange, onPreviewUrlCommit, onOpenPreview, selected, decisions, snapshot, onClearCurrentHunk, onClearCurrentReview, onManage }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -41,6 +43,16 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
   onHeadRefChange: (ref: string) => void;
   loading: boolean;
   onRefresh: () => void;
+  /** Preview target of the active project, as a controlled draft value ("" when unset). */
+  previewUrl: string;
+  /** True when the current Review Deck scope resolves to a project. */
+  previewProjectAvailable: boolean;
+  previewUrlSaveError: string | null;
+  /** True only when the host exposes navigation.openBrowser (Electron). */
+  browserPreviewAvailable: boolean;
+  onPreviewUrlCommit: () => void;
+  onPreviewUrlChange: (url: string) => void;
+  onOpenPreview: () => void;
   selected: SelectedHunk | null;
   decisions: ReviewDecision[];
   snapshot: ReviewSnapshot | null;
@@ -60,6 +72,9 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
     { value: "targeted", label: t("settingsReviewDepthTargeted") },
     { value: "full", label: t("settingsReviewDepthFull") },
   ];
+  // Only a non-empty absolute http(s) draft may be opened; the parent enforces
+  // the same rule at the save and navigation boundaries.
+  const previewUrlValid = isReviewPreviewUrl(previewUrl);
   return (
     <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable style={styles.centeredModalWrap} onPress={onClose}>
@@ -115,6 +130,44 @@ export function MoreModal({ theme, layout, t, styles, open, onClose, agents, age
                 layout={layout}
               />
             </View>
+
+            {previewProjectAvailable ? (
+              <View style={styles.modalSection}>
+                <Text style={styles.sectionTitle}>{t("previewTitle")}</Text>
+                <Text style={styles.scopeDesc}>{t("previewDesc")}</Text>
+                <View style={styles.inputRow}>
+                  <Text style={styles.label}>{t("previewUrlLabel")}</Text>
+                  <TextInput
+                    value={previewUrl}
+                    onChangeText={onPreviewUrlChange}
+                    onBlur={onPreviewUrlCommit}
+                    placeholder={t("previewUrlPlaceholder")}
+                    placeholderTextColor={theme.colors.foregroundMuted}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    keyboardType="url"
+                    style={[styles.input, styles.inputFlex]}
+                  />
+                </View>
+                {previewUrl.trim().length > 0 && !previewUrlValid ? (
+                  <Text style={styles.muted}>{t("previewUrlInvalid")}</Text>
+                ) : null}
+                {previewUrlSaveError ? (
+                  <Text style={styles.errorText}>{t("settingsSaveFailed")} · {previewUrlSaveError}</Text>
+                ) : null}
+                {browserPreviewAvailable ? (
+                  <ActionButton
+                    variant="primary"
+                    label={t("previewOpen")}
+                    tooltip={t("previewOpenHint")}
+                    disabled={!previewUrlValid}
+                    onPress={onOpenPreview}
+                    theme={theme}
+                    layout={layout}
+                  />
+                ) : <Text style={styles.muted}>{t("previewUnavailable")}</Text>}
+              </View>
+            ) : null}
 
             <View style={styles.modalSection}>
               <Text style={styles.sectionTitle}>{t("moreAgentTitle")}</Text>

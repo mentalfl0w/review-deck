@@ -9,7 +9,6 @@ import type {
   PluginButtonBehavior,
   PluginButtonContentProps,
   PluginButtonRegistration,
-  PluginClientOpenPanelOptions,
   PluginComposerPillContribution,
   PluginHeaderButtonContribution,
 } from "@getpaseo/plugin/client";
@@ -19,6 +18,7 @@ import { openOwnedEntries, USABLE_AGENT_STATUSES, type AgentRegistry, type Owned
 import type { ReviewCountStore } from "./review-count-store";
 import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./review-entry-status-store";
 import type { StringKey } from "./i18n";
+import type { ReviewPanelLaunchInput } from "./review-panel-launch";
 
 /**
  * Native Review Deck entry points:
@@ -43,9 +43,6 @@ import type { StringKey } from "./i18n";
  * bootstrap leaves no subscription behind.
  */
 
-const AGENT_PANEL_ID = "review-deck-agent";
-const AGENT_QUEUE_PANEL_ID = "review-deck-agent-queue";
-const AGENT_TARGETED_REVIEW_PANEL_ID = "review-deck-agent-targeted-review";
 const BUTTON_ICON = "ScanSearch";
 
 /** The parts of PluginClientContext the entry points need (a structural seam
@@ -53,7 +50,7 @@ const BUTTON_ICON = "ScanSearch";
 export type ReviewEntryHost = {
   addHeaderButton(contribution: PluginHeaderButtonContribution): PluginButtonRegistration;
   addComposerPill(contribution: PluginComposerPillContribution): PluginButtonRegistration;
-  openPanel(id: string, options: PluginClientOpenPanelOptions): void;
+  openReviewPanel(input: ReviewPanelLaunchInput): void;
   createHeaderPopover(workspaceId: string): ComponentType<PluginButtonContentProps>;
   createPillMenu(actions: readonly ReviewPillMenuAction[]): ComponentType<PluginButtonContentProps>;
 };
@@ -159,20 +156,20 @@ function pillMenuBehavior(
       id: "open-review-deck",
       labelKey: "reviewBatchOpenReviewDeck",
       icon: BUTTON_ICON,
-      onPress: () => client.openPanel(AGENT_PANEL_ID, {
+      onPress: () => client.openReviewPanel({
         workspaceId: target.workspaceId,
-        agentId: target.agentId,
-        location: "workspace",
+        action: "deck",
+        preferredAgentId: target.agentId,
       }),
     },
     {
       id: "open-queue",
       labelKey: "reviewEntryOpenQueue",
       icon: "ListTodo",
-      onPress: () => client.openPanel(AGENT_QUEUE_PANEL_ID, {
+      onPress: () => client.openReviewPanel({
         workspaceId: target.workspaceId,
-        agentId: target.agentId,
-        location: "workspace",
+        action: "queue",
+        preferredAgentId: target.agentId,
       }),
     },
     {
@@ -180,10 +177,10 @@ function pillMenuBehavior(
       labelKey: "reviewEntryRunTargeted",
       icon: "Sparkles",
       disabled: !canRunTargetedReview(status, target),
-      onPress: () => client.openPanel(AGENT_TARGETED_REVIEW_PANEL_ID, {
+      onPress: () => client.openReviewPanel({
         workspaceId: target.workspaceId,
-        agentId: target.agentId,
-        location: "workspace",
+        action: "targeted",
+        preferredAgentId: target.agentId,
       }),
     },
     {
@@ -310,7 +307,8 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
         projectId,
         label,
         registration: client.addHeaderButton({
-          id: `review-header-${workspaceId}`,
+          // The host scopes IDs by workspace; keep opaque `wks_*` IDs out.
+          id: "review-header",
           workspaceId,
           button: {
             title: label,
@@ -377,7 +375,8 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
         label,
         menuSignature,
         registration: client.addComposerPill({
-          id: `review-pill-${agentId}`,
+          // The host scopes IDs by workspace and Agent.
+          id: "review-pill",
           workspaceId: want.workspaceId,
           agentId,
           button: {

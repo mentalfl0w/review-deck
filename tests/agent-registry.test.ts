@@ -33,10 +33,10 @@ import type {
   PluginButton,
   PluginButtonContentProps,
   PluginButtonRegistration,
-  PluginClientOpenPanelOptions,
   PluginComposerPillContribution,
   PluginHeaderButtonContribution,
 } from "@getpaseo/plugin/client";
+import type { ReviewPanelLaunchInput } from "../client/review-panel-launch";
 import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
 import type { RegistryAgent } from "../client/agent-registry";
 import type { ReviewEntryHost, ReviewPillMenuAction } from "../client/review-entries";
@@ -283,11 +283,13 @@ function workspacesPayload(entries: ReturnType<typeof workspaceEntry>[]): PaseoW
 function createFakeHost() {
   const all: RegistrationLog[] = [];
   const live = new Map<string, RegistrationLog>();
-  const opened: Array<{ id: string; options: PluginClientOpenPanelOptions }> = [];
+  const opened: ReviewPanelLaunchInput[] = [];
   const popoverWorkspaces: string[] = [];
   const pillActionsByContent = new WeakMap<object, readonly ReviewPillMenuAction[]>();
   const register = (contribution: FakeContribution): PluginButtonRegistration => {
-    const record: RegistrationLog = { id: contribution.id, contribution, updates: [], removed: false };
+    assert.match(contribution.id, /^[a-z][a-z0-9-]*$/, "Paseo button IDs must use lowercase letters, digits, and hyphens");
+    const scopeId = "agentId" in contribution ? contribution.agentId : contribution.workspaceId;
+    const record: RegistrationLog = { id: `${contribution.id}-${scopeId}`, contribution, updates: [], removed: false };
     all.push(record);
     live.set(record.id, record);
     return {
@@ -306,8 +308,8 @@ function createFakeHost() {
   const host: ReviewEntryHost = {
     addHeaderButton: register,
     addComposerPill: register,
-    openPanel(id, options) {
-      opened.push({ id, options });
+    openReviewPanel(input) {
+      opened.push(input);
     },
     createHeaderPopover(workspaceId) {
       popoverWorkspaces.push(workspaceId);
@@ -368,7 +370,7 @@ function createFakeCounts() {
   return { store, asked, pending };
 }
 
-function registryAgent(id: string, options: { workspaceId: string | null; cwd?: string }): RegistryAgent {
+function registryAgent(id: string, options: { workspaceId: string | null; cwd?: string; archived?: boolean }): RegistryAgent {
   return {
     id,
     workspaceId: options.workspaceId,
@@ -377,7 +379,7 @@ function registryAgent(id: string, options: { workspaceId: string | null; cwd?: 
     provider: "claude",
     model: null,
     title: null,
-    archived: false,
+    archived: options.archived ?? false,
     projectKey: null,
   };
 }
@@ -746,6 +748,7 @@ async function main() {
 
     const agents = [
       registryAgent("bound", { workspaceId: "ws-1", cwd: "/other" }),
+      registryAgent("archived", { workspaceId: "ws-1", cwd: "/repo", archived: true }),
       registryAgent("sibling", { workspaceId: "ws-2", cwd: "/repo/" }),
       registryAgent("unbound-matching", { workspaceId: null, cwd: "/repo/" }),
       registryAgent("unbound-other", { workspaceId: null, cwd: "/elsewhere" }),
@@ -786,7 +789,7 @@ async function main() {
       retryDelaysMs: [],
     });
     await flush();
-    assert.ok(host.all.every((record) => /^[a-z][a-z0-9-]*$/.test(record.id)), "Paseo contribution IDs use lowercase letters, digits, and hyphens only");
+    assert.ok(host.all.every((record) => /^[a-z][a-z0-9-]*$/.test(record.contribution.id)), "Paseo contribution IDs use lowercase letters, digits, and hyphens only");
 
     assert.deepEqual(
       [...host.live.keys()].sort(),
@@ -800,12 +803,14 @@ async function main() {
 
     const workspacesSubscription = fake.workspaces.boot(0, workspacesPayload([
       workspaceEntry("ws-1", { projectId: "proj-1" }),
+      workspaceEntry("wks_c5789415785b7982", { projectId: "proj-1" }),
       workspaceEntry("ws-2", { projectId: "proj-2", archivingAt: "2026-01-01T00:00:00Z" }),
     ]));
     await flush();
+    assert.ok(host.all.every((record) => /^[a-z][a-z0-9-]*$/.test(record.contribution.id)), "Header IDs remain valid for PASEO wks_* workspace IDs");
     assert.deepEqual(
       [...host.live.keys()].sort(),
-      ["review-header-ws-1", "review-pill-agent-a", "review-pill-agent-d"],
+      ["review-header-wks_c5789415785b7982", "review-header-ws-1", "review-pill-agent-a", "review-pill-agent-d"],
       "one header per live workspace; an archiving workspace is skipped",
     );
     assert.equal(host.live.get("review-header-ws-1")?.contribution.button.label, "Review");
@@ -820,7 +825,7 @@ async function main() {
     // The Header uses its status popover; the Agent Pill uses a settings-aware action popover.
     const headerBehavior = host.press("review-header-ws-1");
     assert.equal(headerBehavior.kind, "popover");
-    assert.deepEqual(host.popoverWorkspaces, ["ws-1"]);
+    assert.deepEqual(host.popoverWorkspaces, ["ws-1", "wks_c5789415785b7982"]);
     const pillBehavior = host.press("review-pill-agent-a");
     assert.equal(pillBehavior.kind, "popover");
     assert.deepEqual(
@@ -836,8 +841,8 @@ async function main() {
     await host.selectMenuItem("review-pill-agent-a", "open-review-deck");
     await host.selectMenuItem("review-pill-agent-a", "open-queue");
     assert.deepEqual(host.opened, [
-      { id: "review-deck-agent", options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" } },
-      { id: "review-deck-agent-queue", options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" } },
+      { workspaceId: "ws-1", action: "deck", preferredAgentId: "agent-a" },
+      { workspaceId: "ws-1", action: "queue", preferredAgentId: "agent-a" },
     ]);
 
     // A local comment read updates every badge with no RPC at all.
@@ -911,11 +916,9 @@ async function main() {
     const moved = host.live.get("review-pill-agent-move");
     assert.ok(moved);
     await host.selectMenuItem("review-pill-agent-move", "open-review-deck");
-    assert.deepEqual(host.opened, [{
-      id: "review-deck-agent",
-      options: { workspaceId: "ws-2", agentId: "agent-move", location: "workspace" },
-    }], "pressing the moved Agent's menu item must keep the new workspace binding");
-    assert.equal(moved.contribution.workspaceId, "ws-2");
+    assert.deepEqual(host.opened, [
+      { workspaceId: "ws-2", action: "deck", preferredAgentId: "agent-move" },
+    ], "pressing the moved Agent's menu item must keep the new workspace binding");
 
     entries.stop();
     registry.stop();
@@ -963,10 +966,9 @@ async function main() {
     assert.equal(submitItem().disabled, false);
     await host.selectMenuItem("review-pill-agent-a", "run-targeted-ai-review");
     await host.selectMenuItem("review-pill-agent-a", "submit-pending-comments");
-    assert.deepEqual(host.opened, [{
-      id: "review-deck-agent-targeted-review",
-      options: { workspaceId: "ws-1", agentId: "agent-a", location: "workspace" },
-    }]);
+    assert.deepEqual(host.opened, [
+      { workspaceId: "ws-1", action: "targeted", preferredAgentId: "agent-a" },
+    ]);
     assert.deepEqual(submitted, [{ workspaceId: "ws-1", agentId: "agent-a" }]);
 
     statuses.setStatus("ws-1", workspaceIndicators("ws-1", "proj-1", {

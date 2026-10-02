@@ -16,11 +16,14 @@ import {
   listProjectReviewComments,
   listReviewStates,
   pollAiReview,
+  pollVerificationRun,
+  listVerificationRuns,
   processProjectReview,
   rejectHunk,
   revertFile,
   startExplainHunkAi,
   startRunReview,
+  startVerificationRun,
 } from "./shared/review";
 import { reviewDeckSettings } from "./shared/review-settings";
 import {
@@ -47,6 +50,9 @@ export default function contribute(server: PluginServerContext) {
   server.handle(startExplainHunkAi, async (input, context) => reviewService.startExplainHunkAi(input, context));
   server.handle(startRunReview, async (input, context) => reviewService.startRunReview(input, context));
   server.handle(pollAiReview, async (input, context) => reviewService.pollAiReview(input, context));
+  server.handle(startVerificationRun, async (input, context) => reviewService.startVerificationRun(input, context));
+  server.handle(pollVerificationRun, async (input, context) => reviewService.pollVerificationRun(input, context));
+  server.handle(listVerificationRuns, async (input, context) => reviewService.listVerificationRuns(input, context));
   server.handle(clearAiReviewCache, async () => ({
     cleared: await reviewService.clearAiReviewCache(),
   }));
@@ -92,10 +98,11 @@ export default function contribute(server: PluginServerContext) {
     reviewService.handleAgentArchived(event, context),
   );
   const stopMaintenance = reviewService.startMaintenance(MAINTENANCE_INTERVAL_MS);
-  return () => {
+  return async () => {
     stopTurnEnded();
     stopTurnStarted();
     stopAgentArchived();
     stopMaintenance();
+    await reviewService.dispose();
   };
 }

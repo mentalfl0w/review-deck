@@ -36,7 +36,7 @@ const comment = (id: string, cwd: string, workspaceId?: string): ProjectReviewCo
   savedAt: "2026-09-30T12:00:00.000Z",
 });
 
-const agent = (id: string, workspaceId: string, cwd: string): AgentEntry => ({
+const agent = (id: string, workspaceId: string, cwd: string, archived = false): AgentEntry => ({
   id,
   workspaceId,
   cwd,
@@ -44,11 +44,13 @@ const agent = (id: string, workspaceId: string, cwd: string): AgentEntry => ({
   provider: "omp",
   model: "model-a",
   title: id,
+  archived,
 });
 
 const agents = [
   agent("agent-a1", "workspace-a", "/repo/worktree-a"),
   agent("agent-a2", "workspace-a", "/repo/worktree-a"),
+  agent("agent-a-archived", "workspace-a", "/repo/worktree-a", true),
   agent("agent-b", "workspace-b", "/repo/worktree-b"),
 ];
 const workspaceDirectoryOwners = [

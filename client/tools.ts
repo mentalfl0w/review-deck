@@ -23,6 +23,7 @@ export type AgentEntry = {
   provider?: string;
   model?: string | null;
   title?: string | null;
+  archived?: boolean;
 };
 export type WorkspaceEntry = {
   id: string;

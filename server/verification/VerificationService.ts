@@ -269,9 +269,9 @@ export class VerificationService {
 
   /**
    * Lists recent runs only for the requested current target. A changed
-   * fingerprint or workspace binding fails closed, so a run can never be
-   * reported as belonging to a diff the user is no longer reviewing. Open runs
-   * are polled for their current state and a bounded output tail.
+   * fingerprint or workspace binding returns no runs and marks the result as
+   * stale, so run metadata can never be shown for a diff the user is no longer
+   * reviewing. Open runs are polled for their current state and a bounded tail.
    */
   async list(
     input: ListVerificationRunsInput,
@@ -283,11 +283,7 @@ export class VerificationService {
       target.targetFingerprint !== input.expectedTargetFingerprint ||
       !(await this.dependencies.sameDirectory(identity.directory, target.worktreePath))
     ) {
-      throw new Error(
-        input.request.locale === "zh"
-          ? "评审目标或工作区已发生变化，无法读取旧验证结果。请刷新后重试。"
-          : "The review target or workspace changed; old verification results are unavailable. Refresh and retry.",
-      );
+      return { runs: [], targetChanged: true };
     }
     const candidates = await this.store.list();
     const runs: VerificationRunRecord[] = [];
@@ -308,7 +304,7 @@ export class VerificationService {
           : Promise.resolve(this.result(run)),
       ),
     );
-    return { runs: results };
+    return { runs: results, targetChanged: false };
   }
 
   /**

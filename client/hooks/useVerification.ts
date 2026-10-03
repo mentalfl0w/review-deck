@@ -23,6 +23,7 @@ export function useVerification(input: {
   targetFingerprint: string | null;
   enabled: boolean;
   onError: (message: string) => void;
+  onTargetChanged: (stale: boolean) => void;
 }): {
   runs: VerificationRuns;
   start: (suggestion: ReviewVerificationSuggestion) => Promise<void>;
@@ -58,8 +59,12 @@ export function useVerification(input: {
       workspaceId: input.workspaceId,
       request: input.request,
       expectedTargetFingerprint: input.targetFingerprint,
-    }).then(({ runs: storedRuns }) => {
+    }).then(({ runs: storedRuns, targetChanged }) => {
       if (cancelled || bindingRef.current !== binding) return;
+      if (targetChanged) {
+        input.onTargetChanged(true);
+        return;
+      }
       const latest: Record<string, PollVerificationRunResult> = {};
       for (const run of storedRuns) {
         const previous = latest[run.suggestionId];
@@ -73,7 +78,7 @@ export function useVerification(input: {
       cancelled = true;
       if (bindingRef.current === binding) bindingRef.current = "";
     };
-  }, [binding, input.onError, input.request, input.targetFingerprint, input.workspaceId, listRunsRpc]);
+  }, [binding, input.onError, input.onTargetChanged, input.request, input.targetFingerprint, input.workspaceId, listRunsRpc]);
 
   const start = useCallback(async (suggestion: ReviewVerificationSuggestion) => {
     const workspaceId = input.workspaceId;

@@ -20,6 +20,7 @@
   "files": [
     "../server/ReviewService.ts",
     "../client/hooks/useReviewSnapshot.ts",
-    "target-fingerprint.test.ts"
+    "target-fingerprint.test.ts",
+    "verification-hook.test.ts"
   ]
 }

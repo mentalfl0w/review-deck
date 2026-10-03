@@ -170,6 +170,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     targetFingerprint: snapshotApi.snapshot?.targetFingerprint ?? null,
     enabled: Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale),
     onError: setActionError,
+    onTargetChanged: snapshotApi.setStale,
   });
   useEffect(() => {
     if (!snapshotApi.snapshot) return;

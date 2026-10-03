@@ -813,6 +813,7 @@ export const pollVerificationRun = defineRpc({
  */
 export const listVerificationRunsResultSchema = z.object({
   runs: z.array(pollVerificationRunResultSchema),
+  targetChanged: z.boolean(),
 }).strict();
 export type ListVerificationRunsResult = z.infer<typeof listVerificationRunsResultSchema>;
 

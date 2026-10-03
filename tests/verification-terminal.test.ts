@@ -749,7 +749,8 @@ assert.equal((await flowStore.get(reboundRun))?.status, "error");
 workspaceDirectory = "/repo";
 
 // List: only the requested current target and workspace binding are reported,
-// and an open run is polled for its live tail.
+// and an open run is polled for its live tail. A target/workspace race fails
+// closed with an empty list instead of surfacing as a Review Deck-wide error.
 const listedRun = await startFlowRun();
 terminal.lines = ["listed output"];
 const listed = await service.list({
@@ -757,6 +758,7 @@ const listed = await service.list({
   request: flowInput.request,
   expectedTargetFingerprint: "fingerprint-1",
 }, context);
+assert.equal(listed.targetChanged, false);
 assert.ok(listed.runs.some((run) => run.runId === listedRun && run.status === "open"));
 assert.equal(listed.runs.find((run) => run.runId === listedRun)?.outputTail?.[0], "listed output");
 for (const run of listed.runs) {
@@ -766,23 +768,19 @@ for (const run of listed.runs) {
   assert.equal("verifiedFact" in run, false);
 }
 assert.equal(verificationRunResultSchema.safeParse(listed.runs[0]).success, true);
-await assert.rejects(
-  () => service.list({
-    workspaceId: "workspace-1",
-    request: flowInput.request,
-    expectedTargetFingerprint: "fingerprint-2",
-  }, context),
-  /review target or workspace changed/,
-);
+const staleFingerprintList = await service.list({
+  workspaceId: "workspace-1",
+  request: flowInput.request,
+  expectedTargetFingerprint: "fingerprint-2",
+}, context);
+assert.deepEqual(staleFingerprintList, { runs: [], targetChanged: true });
 workspaceDirectory = "/somewhere-else";
-await assert.rejects(
-  () => service.list({
-    workspaceId: "workspace-1",
-    request: flowInput.request,
-    expectedTargetFingerprint: "fingerprint-1",
-  }, context),
-  /review target or workspace changed/,
-);
+const movedWorkspaceList = await service.list({
+  workspaceId: "workspace-1",
+  request: flowInput.request,
+  expectedTargetFingerprint: "fingerprint-1",
+}, context);
+assert.deepEqual(movedWorkspaceList, { runs: [], targetChanged: true });
 workspaceDirectory = "/repo";
 
 // Starts are refused before anything runs: a changed target, a moved workspace

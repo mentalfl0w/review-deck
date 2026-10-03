@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { useRpc, type PluginButtonContentProps } from "@getpaseo/plugin/client";
+import { useRpc, useSettings, type PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { getWorkspaceReviewSummary, type WorkspaceReviewSummary } from "../../shared/review-activity";
+import { reviewDeckSettings } from "../../shared/review-settings";
 import { detectLocale, makeT } from "../i18n";
+import { resolveConfiguredLocale } from "../locale";
 import { getReviewCountStore } from "../review-count-store";
 import { getReviewEntryStatusStore } from "../review-entry-status-store";
 
@@ -19,7 +21,11 @@ export function ReviewHeaderPopover({
   onOpenReviewDeck,
   onOpenQueue,
 }: ReviewHeaderPopoverProps) {
-  const t = useMemo(() => makeT(detectLocale()), []);
+  const settings = useSettings(reviewDeckSettings);
+  const automaticLocale = useMemo(() => detectLocale(), []);
+  const configuredLocale = settings.status === "ready" ? settings.values.locale : "auto";
+  const locale = resolveConfiguredLocale(configuredLocale, automaticLocale);
+  const t = useMemo(() => makeT(locale), [locale]);
   const summaryRpc = useRpc(getWorkspaceReviewSummary);
   const [summary, setSummary] = useState<WorkspaceReviewSummary | null>(null);
   const [error, setError] = useState(false);

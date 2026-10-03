@@ -110,6 +110,17 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
     ...(scope === "commits" ? { baseRef, headRef } : {}),
     ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
   }, [baseRef, filePath, headRef, locale, reviewCwd, scope]);
+  // Workspace-activity bursts share one probe and at most one queued follow-up.
+  // Keep the request with the lock so a scope/workspace switch cannot let an old
+  // probe launch a snapshot that supersedes the new request.
+  const backgroundProbeRef = useRef<{
+    request: ReviewRequest | null;
+    inFlight: boolean;
+    queued: boolean;
+  }>({ request, inFlight: false, queued: false });
+  if (backgroundProbeRef.current.request !== request) {
+    backgroundProbeRef.current = { request, inFlight: false, queued: false };
+  }
 
   /** Full snapshot + saved decisions. Manual/initial refreshes are foreground
    * (loading + surfaced errors); probe-armed refreshes are background (no
@@ -187,14 +198,32 @@ export function useReviewSnapshot(params: ReviewSnapshotWatcherParams) {
    * Git read) leaves everything to the next probe or a manual refresh. */
   const probeAndRefresh = useCallback(async () => {
     if (!request) return;
-    let targetFingerprint: string;
-    try {
-      ({ targetFingerprint } = await fingerprintRpc(request));
-    } catch {
+    const probe = backgroundProbeRef.current;
+    if (probe.inFlight) {
+      probe.queued = true;
       return;
     }
-    if (!mountedRef.current || targetFingerprint === targetFingerprintRef.current) return;
-    await refresh({ background: true });
+    probe.inFlight = true;
+    try {
+      do {
+        probe.queued = false;
+        let targetFingerprint: string;
+        try {
+          ({ targetFingerprint } = await fingerprintRpc(request));
+        } catch {
+          continue;
+        }
+        if (backgroundProbeRef.current !== probe || !mountedRef.current) return;
+        if (targetFingerprint === targetFingerprintRef.current) continue;
+        await refresh({ background: true });
+      } while (
+        backgroundProbeRef.current === probe &&
+        probe.queued &&
+        mountedRef.current
+      );
+    } finally {
+      if (backgroundProbeRef.current === probe) probe.inFlight = false;
+    }
   }, [fingerprintRpc, refresh, request]);
 
   // Mount guard arm: paired with the cleanup below so a response arriving

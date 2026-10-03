@@ -476,6 +476,44 @@ async function main(): Promise<void> {
 
     // A commits-scope target carries its refs into both calls.
     watcher.unmount();
+    // Remote workspace and agent updates can arrive in a burst while a
+    // fingerprint probe is in flight. Coalesce them and probe once more after
+    // the resulting snapshot lands instead of launching parallel snapshots.
+    currentFingerprint = "tfp-5";
+    snapshotTarget = "tfp-5";
+    registerRpcStub(SNAPSHOT_RPC, async () => snapshotFor(snapshotTarget));
+    const pendingFingerprints: Array<(value: { targetFingerprint: string }) => void> = [];
+    let coalescedProbeCalls = 0;
+    registerRpcStub(FINGERPRINT_RPC, () => {
+      coalescedProbeCalls += 1;
+      return new Promise((resolve) => pendingFingerprints.push(resolve));
+    });
+    const snapshotsBeforeCoalescing = rpcCallCount(SNAPSHOT_RPC);
+    const coalescingWatcher = mountWatcher(useReviewSnapshot, baseProps);
+    await flushMicrotasks();
+    assert.equal(rpcCallCount(SNAPSHOT_RPC), snapshotsBeforeCoalescing + 1, "the coalescing scenario starts with one snapshot");
+    const activityProps = { ...baseProps, workspaceDiffStat: { additions: 2, deletions: 1 } };
+    coalescingWatcher.setProps(activityProps);
+    await flushMicrotasks();
+    assert.equal(coalescedProbeCalls, 1, "the first activity starts one fingerprint probe");
+    coalescingWatcher.setProps({ ...activityProps, agentRevision: 2 });
+    await flushMicrotasks();
+    assert.equal(coalescedProbeCalls, 1, "activity arriving during a probe is queued, not sent concurrently");
+    assert.equal(pendingFingerprints.length, 1);
+
+    currentFingerprint = "tfp-6";
+    snapshotTarget = "tfp-6";
+    pendingFingerprints[0]!({ targetFingerprint: "tfp-6" });
+    await flushMicrotasks();
+    await flushMicrotasks();
+    assert.equal(rpcCallCount(SNAPSHOT_RPC), snapshotsBeforeCoalescing + 2, "a burst landing on one new target runs one background snapshot");
+    assert.equal(coalescedProbeCalls, 2, "the queued activity receives one follow-up probe after the snapshot");
+    assert.equal(pendingFingerprints.length, 2);
+    pendingFingerprints[1]!({ targetFingerprint: "tfp-6" });
+    await flushMicrotasks();
+    assert.equal(rpcCallCount(SNAPSHOT_RPC), snapshotsBeforeCoalescing + 2, "the follow-up probe does not reload an unchanged target");
+    assert.equal(coalescingWatcher.value.snapshot?.targetFingerprint, "tfp-6");
+    coalescingWatcher.unmount();
     registerRpcStub(SNAPSHOT_RPC, async () => snapshotFor("tfp-5"));
     registerRpcStub(FINGERPRINT_RPC, async () => ({ targetFingerprint: "tfp-5" }));
     const commitsWatcher = mountWatcher(useReviewSnapshot, {

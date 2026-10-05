@@ -1,10 +1,48 @@
-import type {
-  OwnedSubscription,
-  PaseoAgent,
-  PaseoAgentListResult,
-  PaseoApi,
-} from "@getpaseo/client";
-import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import type { PluginClientContext } from "@getpaseo/plugin/client";
+
+type PluginPaseoApi = PluginClientContext["paseo"];
+type AgentSnapshot = {
+  id: string;
+  provider: string;
+  cwd: string;
+  workspaceId?: string;
+  model: string | null;
+  status: string;
+  title: string | null;
+  archivedAt?: string | null;
+};
+type AgentListEntry = {
+  agent: AgentSnapshot;
+  project?: { projectKey?: string | null } | null;
+};
+type AgentListResult = { entries: readonly AgentListEntry[] };
+type AgentListFrame = AgentListResult & {
+  sync?: {
+    mode?: string;
+    removals?: readonly { id: string }[];
+  };
+};
+type AgentRegistryUpdate =
+  | {
+      type: "agent_update";
+      payload:
+        | {
+            kind: "upsert";
+            agent: AgentSnapshot;
+            project?: { projectKey?: string | null } | null;
+          }
+        | { kind: "remove"; agentId: string };
+    }
+  | { type: "fetch_agents_response"; payload: AgentListFrame };
+
+type OwnedEntriesSubscription<Payload> = {
+  subscribe(observer: {
+    snapshot(snapshot: Payload): void;
+    update(message: unknown): void;
+    error?(error: unknown): void;
+  }): () => void;
+  release(): Promise<void>;
+};
 
 /**
  * The one live agent registry of this plugin.
@@ -58,7 +96,7 @@ export type AgentRegistry = {
    * Binds the registry to a Paseo API and (re)starts the shared subscription
    * when none is live. Idempotent: repeated binds of the same API are free.
    */
-  bind(paseo: PaseoApi): void;
+  bind(paseo: PluginPaseoApi): void;
   /** Releases the subscription and drops every listener. */
   stop(): void;
   readonly stopped: boolean;
@@ -120,9 +158,9 @@ export type OwnedEntriesGateOptions<Payload extends { entries: readonly unknown[
    * APIs without a signal (the workspace list) still clean up through the
    * subscription release below.
    */
-  open(signal: AbortSignal): Promise<Payload & { subscription: OwnedSubscription<Payload> }>;
+  open(signal: AbortSignal): Promise<Payload & { subscription: OwnedEntriesSubscription<Payload> }>;
   onSnapshot(payload: Payload): void;
-  onUpdate(message: SessionOutboundMessage): void;
+  onUpdate(message: unknown): void;
   /** Called once the retry budget is exhausted with nothing live left. */
   onError(error: unknown): void;
   retryDelaysMs?: readonly number[];
@@ -143,7 +181,7 @@ export function openOwnedEntries<Payload extends { entries: readonly unknown[] }
   const abort = new AbortController();
   let cancelRetry: (() => void) | null = null;
   let unsubscribe: (() => void) | null = null;
-  let ownedSubscription: OwnedSubscription<Payload> | null = null;
+  let ownedSubscription: OwnedEntriesSubscription<Payload> | null = null;
   let disposed = false;
 
   const detach = (): void => {
@@ -187,7 +225,7 @@ export function openOwnedEntries<Payload extends { entries: readonly unknown[] }
 
   const attempt = (index: number): void => {
     if (disposed) return;
-    let pending: Promise<Payload & { subscription: OwnedSubscription<Payload> }>;
+    let pending: Promise<Payload & { subscription: OwnedEntriesSubscription<Payload> }>;
     try {
       pending = options.open(abort.signal);
     } catch (error) {
@@ -244,8 +282,7 @@ export function openOwnedEntries<Payload extends { entries: readonly unknown[] }
   };
 }
 
-type AgentListFrame = Extract<SessionOutboundMessage, { type: "fetch_agents_response" }>["payload"];
-type RegistryAgentInput = AgentListFrame["entries"][number];
+type RegistryAgentInput = AgentListEntry;
 
 function sameAgent(a: RegistryAgent, b: RegistryAgent): boolean {
   return a.id === b.id &&
@@ -268,7 +305,7 @@ export function createAgentRegistry(options: AgentRegistryOptions = {}): AgentRe
   const listeners = new Set<() => void>();
   let agents = new Map<string, RegistryAgent>();
   let snapshot: AgentRegistrySnapshot = { agents: [], loading: true, error: null, revision: 0, bootstraps: 0 };
-  let paseo: PaseoApi | null = null;
+  let paseo: PluginPaseoApi | null = null;
   let gate: { stop(): void } | null = null;
   let stopped = false;
 
@@ -277,7 +314,7 @@ export function createAgentRegistry(options: AgentRegistryOptions = {}): AgentRe
     for (const listener of [...listeners]) listener();
   };
 
-  const toRecord = (agent: PaseoAgent, projectKey: string | null, previous: RegistryAgent | undefined): RegistryAgent => {
+  const toRecord = (agent: AgentListEntry["agent"], projectKey: string | null, previous: RegistryAgent | undefined): RegistryAgent => {
     const record: RegistryAgent = {
       id: agent.id,
       workspaceId: agent.workspaceId ?? null,
@@ -332,7 +369,7 @@ export function createAgentRegistry(options: AgentRegistryOptions = {}): AgentRe
     apply(next, true);
   };
 
-  const handleMessage = (message: SessionOutboundMessage): void => {
+  const handleMessage = (message: AgentRegistryUpdate): void => {
     if (message.type === "agent_update") {
       const payload = message.payload;
       if (payload.kind === "upsert") {
@@ -365,13 +402,13 @@ export function createAgentRegistry(options: AgentRegistryOptions = {}): AgentRe
     // A settled error is retried on the next bind: show the loading state
     // again instead of a stale "no agents" view.
     if (snapshot.error !== null) publish({ loading: true, error: null });
-    gate = openOwnedEntries<PaseoAgentListResult>({
+    gate = openOwnedEntries<AgentListResult>({
       open: (signal) => api.agents.list({ subscribe: {}, signal }),
       onSnapshot: (payload) => {
         if (!stopped) applySnapshot(payload);
       },
       onUpdate: (message) => {
-        if (!stopped) handleMessage(message);
+        if (!stopped) handleMessage(message as AgentRegistryUpdate);
       },
       onError: (error) => {
         if (stopped) return;

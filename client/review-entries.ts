@@ -1,24 +1,44 @@
 import type { ComponentType } from "react";
 import type {
-  PaseoApi,
-  PaseoWorkspace,
-  PaseoWorkspaceListResult,
-} from "@getpaseo/client";
-import type {
   PluginButton,
   PluginButtonBehavior,
   PluginButtonContentProps,
   PluginButtonRegistration,
+  PluginClientContext,
   PluginComposerPillContribution,
   PluginHeaderButtonContribution,
 } from "@getpaseo/plugin/client";
-import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
 import { openOwnedEntries, USABLE_AGENT_STATUSES, type AgentRegistry, type OwnedEntriesGateOptions } from "./agent-registry";
 import type { ReviewCountStore } from "./review-count-store";
 import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./review-entry-status-store";
 import type { StringKey } from "./i18n";
 import type { ReviewPanelLaunchInput } from "./review-panel-launch";
+
+type PluginPaseoApi = PluginClientContext["paseo"];
+type Workspace = {
+  id: string;
+  projectId: string;
+  workspaceDirectory?: string;
+  archivingAt?: string | null;
+  diffStat?: { additions: number; deletions: number } | null;
+};
+type WorkspaceListResult = { entries: readonly Workspace[] };
+type WorkspaceListFrame = WorkspaceListResult & {
+  sync?: {
+    mode?: string;
+    removals?: readonly { id: string }[];
+  };
+};
+type WorkspaceUpdateMessage =
+  | {
+      type: "workspace_update";
+      payload:
+        | { kind: "upsert"; workspace: Workspace }
+        | { kind: "remove"; id: string };
+    }
+  | { type: "fetch_workspaces_response"; payload: WorkspaceListFrame };
+
 
 /**
  * Native Review Deck entry points:
@@ -75,14 +95,14 @@ type WantedPill = Omit<PillEntry, "label" | "menuSignature" | "registration">;
 
 export type ReviewEntriesOptions = {
   client: ReviewEntryHost;
-  paseo: PaseoApi;
+  paseo: PluginPaseoApi;
   registry: AgentRegistry;
   counts: ReviewCountStore;
   statuses?: ReviewEntryStatusStore;
   submitPendingComments?(input: { workspaceId: string; agentId: string }): Promise<void>;
   /** Test seams for the workspace bootstrap; production uses the defaults. */
   retryDelaysMs?: readonly number[];
-  schedule?: OwnedEntriesGateOptions<PaseoWorkspaceListResult>["schedule"];
+  schedule?: OwnedEntriesGateOptions<WorkspaceListResult>["schedule"];
 };
 
 export type ReviewEntries = { stop(): void };
@@ -218,7 +238,7 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
   const pills = new Map<string, PillEntry>();
   const trackedProjects = new Set<string>();
   const trackedWorkspaces = new Set<string>();
-  const workspaces = new Map<string, PaseoWorkspace>();
+  const workspaces = new Map<string, Workspace>();
   let lastBootstraps = registry.getSnapshot().bootstraps;
   let stopped = false;
 
@@ -400,14 +420,14 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
     applyLabels();
   };
 
-  const replaceWorkspaces = (entries: Iterable<PaseoWorkspace>): void => {
+  const replaceWorkspaces = (entries: Iterable<Workspace>): void => {
     workspaces.clear();
     for (const entry of entries) workspaces.set(entry.id, entry);
     syncHeaders();
     syncPills();
     void statuses.refreshMany(workspaces.keys());
   };
-  const handleWorkspaceMessage = (message: SessionOutboundMessage): void => {
+  const handleWorkspaceMessage = (message: WorkspaceUpdateMessage): void => {
     if (message.type === "workspace_update") {
       const payload = message.payload;
       if (payload.kind === "upsert") {
@@ -428,7 +448,7 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
           workspaces.set(entry.id, entry);
           refreshWorkspaceStatus(entry.id);
         }
-        for (const removal of payload.sync.removals) workspaces.delete(removal.id);
+        for (const removal of payload.sync.removals ?? []) workspaces.delete(removal.id);
         syncHeaders();
         syncPills();
         return;
@@ -461,10 +481,10 @@ export function registerReviewEntries(options: ReviewEntriesOptions): ReviewEntr
    * duplicate subscriptions cannot exist. */
   const openGate = (): void => {
     gate?.stop();
-    gate = openOwnedEntries<PaseoWorkspaceListResult>({
+    gate = openOwnedEntries<WorkspaceListResult>({
       open: () => paseo.workspaces.list({ subscribe: {} }),
       onSnapshot: (payload) => replaceWorkspaces(payload.entries),
-      onUpdate: handleWorkspaceMessage,
+      onUpdate: (message) => handleWorkspaceMessage(message as WorkspaceUpdateMessage),
       onError: () => {
         // The header buttons are a convenience: while the list is unreachable
         // the pills (which carry their own workspace id) stay in place. The

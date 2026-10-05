@@ -1,6 +1,6 @@
 {
   "name": "review-deck",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Human-in-the-loop code review workspace for Paseo with inline file comments and project-level AI processing.",
   "license": "MIT",

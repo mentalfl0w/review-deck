@@ -186,6 +186,7 @@ paseo plugin install /absolute/path/to/review-deck
 paseo plugin reload review-deck
 paseo plugin ls
 ```
+Git-based installs compile client source in a fresh checkout, without the development dependencies installed by the commands above. Client code should use Paseo-provided types from `@getpaseo/plugin/client`; direct type imports from `@getpaseo/client` or `@getpaseo/protocol` may not resolve during installation.
 
 ## Acknowledge
 

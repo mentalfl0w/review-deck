@@ -14,6 +14,7 @@
   "homepage": "https://github.com/mentalfl0w/review-deck#readme",
   "files": [
     "paseo-plugin.json",
+    "OVERVIEW.md",
     "index.client.tsx",
     "index.server.ts",
     "client/**/*.ts",

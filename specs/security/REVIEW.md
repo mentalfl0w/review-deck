@@ -1,7 +1,7 @@
-# Security Review — Review Deck V2.0.2
+# Security Review — Review Deck V2.0.3 npm preparation
 
 Date: 2026-10-10
-Scope: V2.0.2 worktree diff from `4fe8e04c362224b2f5b37dcad399c9b7f1d638a2`; ReviewBatch dispatch, persistence/migration, timeline correlation, prompt construction, anchor preflight, and recovery UI.
+Scope: V2.0.2 ReviewBatch dispatch, persistence/migration, timeline correlation, prompt construction, anchor preflight, and recovery UI; plus V2.0.3 npm package metadata and files.
 
 ## Findings
 
@@ -19,6 +19,6 @@ Scope: V2.0.2 worktree diff from `4fe8e04c362224b2f5b37dcad399c9b7f1d638a2`; Rev
 
 - `npm run typecheck` — passed.
 - `npm test` — passed, including ReviewBatch service/store, prompt/parser, Agent registry, workspace grouping, and legacy replay/manual-release regressions.
-- `npm pack --dry-run` — passed for `review-deck@2.0.2`.
-
+- `npm publish --access public --dry-run --json` — passed for `review-deck@2.0.3`; the package contains 76 source/manifest/overview/asset files and excludes local generated `.js` files.
+- `npm view review-deck` returned 404. Public availability looked unclaimed, but npm account ownership/auth was not verified. No package was published.
 Coverage percentages and interactive Paseo Host UI smoke were not measured; the repository has no coverage script and no configured/open Host UI runtime in this worktree.

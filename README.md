@@ -157,13 +157,19 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 
 ## Installation
 
-Review Deck requires Paseo 0.10.0 or newer (`>=0.10.0`).
+Review Deck requires Paseo 0.10.0 or newer (`>=0.10.0`). Installing from npm requires Paseo 0.11.0 or newer.
 
-Install it from GitHub:
+Install the published npm package:
 
 ```sh
-paseo plugin add mentalfl0w/review-deck
+paseo plugin install npm:review-deck@2.0.3
 paseo plugin ls
+```
+
+To install directly from GitHub instead:
+
+```sh
+paseo plugin install git:https://github.com/mentalfl0w/review-deck.git
 ```
 
 Open the panel from the Command Center (**⌘K** on macOS, **Ctrl+K** on Windows/Linux) with **Open Review Deck** — or, from inside an Agent, use **Open Review Deck for this Agent** or the **`/review-deck`** slash command for the Agent-bound deck.

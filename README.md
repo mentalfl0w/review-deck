@@ -162,7 +162,7 @@ Review Deck requires Paseo 0.10.0 or newer (`>=0.10.0`). Installing from npm req
 Install the published npm package:
 
 ```sh
-paseo plugin install npm:review-deck@2.0.3
+paseo plugin install npm:@mentalfl0w/review-deck@2.0.4
 paseo plugin ls
 ```
 

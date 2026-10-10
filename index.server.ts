@@ -19,6 +19,7 @@ import {
   pollVerificationRun,
   listVerificationRuns,
   processProjectReview,
+  releaseUnknownReviewBatch,
   rejectHunk,
   revertFile,
   startExplainHunkAi,
@@ -84,6 +85,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(markWorkspaceReviewResultsRead, async ({ workspaceId }, context) =>
     reviewService.markWorkspaceReviewResultsRead({ workspaceId }, context));
   server.handle(processProjectReview, async (input, context) => reviewService.processProjectReview(input, context));
+  server.handle(releaseUnknownReviewBatch, async (input, context) => reviewService.releaseUnknownReviewBatch(input, context));
   server.handle(rejectHunk, async (input) =>
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),
   );

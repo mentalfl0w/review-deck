@@ -43,6 +43,7 @@ type Indicators = {
   workspacePendingCommentCount: number;
   workspaceStaleCommentCount: number;
   activeBatchCount: number;
+  deliveryUnknownBatchCount: number;
   runningAiReviewCount: number;
   unreadAiFindingCount: number;
 };
@@ -275,6 +276,7 @@ try {
     workspacePendingCommentCount: 2,
     workspaceStaleCommentCount: 2,
     activeBatchCount: 1,
+    deliveryUnknownBatchCount: 1,
     runningAiReviewCount: 1,
     // Completed runs of this workspace without a read mark: 3 + 1 findings.
     unreadAiFindingCount: 4,
@@ -291,6 +293,7 @@ try {
     workspaceStaleCommentCount: 0,
     activeBatchCount: 1,
     runningAiReviewCount: 1,
+    deliveryUnknownBatchCount: 1,
     unreadAiFindingCount: 5,
   });
 
@@ -336,6 +339,7 @@ try {
     workspacePendingCommentCount: 0,
     workspaceStaleCommentCount: 0,
     activeBatchCount: 0,
+    deliveryUnknownBatchCount: 0,
     runningAiReviewCount: 0,
     unreadAiFindingCount: 0,
   });
@@ -460,6 +464,7 @@ try {
     Object.keys(summary).sort(),
     [
       "activeBatchCount",
+      "deliveryUnknownBatchCount",
       "projectId",
       "projectPendingCommentCount",
       "projectStaleCommentCount",
@@ -474,6 +479,7 @@ try {
     "the summary exposes counts only",
   );
   assert.equal(summary.workspaceId, WORKSPACE_A);
+  assert.equal(summary.deliveryUnknownBatchCount, 0);
   assert.equal(summary.totalBlockCount, 3);
   assert.equal(
     summary.reviewedBlockCount,

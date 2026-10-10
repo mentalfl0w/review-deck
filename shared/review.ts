@@ -683,6 +683,20 @@ export const processProjectReview = defineRpc({
   }),
   output: processProjectReviewResultSchema,
 });
+// Explicitly releases an ambiguous delivery claim after the user accepts the duplicate-risk warning.
+export const releaseUnknownReviewBatch = defineRpc({
+  name: "review-deck.release-unknown-review-batch",
+  input: z.object({
+    projectId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    batchId: z.string().min(1),
+    confirmDuplicateRisk: z.literal(true),
+  }).strict(),
+  output: z.object({
+    batchId: z.string().min(1),
+    released: z.literal(true),
+  }).strict(),
+});
 
 // ---------------------------------------------------------------------------
 // Verification Terminal (v2.0)

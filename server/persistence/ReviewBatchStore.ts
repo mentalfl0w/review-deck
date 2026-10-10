@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { link, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { reviewBatchSchema, type ReviewBatch, type ReviewBatchStatus } from "../../shared/review-batch";
+import {
+  reviewBatchSchema,
+  reviewBatchV1PayloadSchema,
+  type ReviewBatch,
+  type ReviewBatchStatus,
+} from "../../shared/review-batch";
 import { createMutex, type Mutex } from "../util/mutex";
 
 /** Envelope version written to disk. */
-export const REVIEW_BATCH_VERSION = 1;
+export const REVIEW_BATCH_VERSION = 2;
+const LEGACY_REVIEW_BATCH_VERSION = 1;
 
 export type ReviewBatchEnvelope = {
   version: typeof REVIEW_BATCH_VERSION;
@@ -51,11 +58,12 @@ const ACTIVE_BY_STATUS: Record<ReviewBatchStatus, boolean> = {
 };
 
 /**
- * The version-1 envelope is strict: an unknown envelope key (or an unknown key
- * on a batch, which `reviewBatchSchema` already rejects) means the document was
- * written by something this build does not understand, so it fails closed
- * rather than being rewritten.
+ * Both supported on-disk envelopes are strict. Version 1 is read only to
+ * migrate it; only version 2 is written.
  */
+const reviewBatchEnvelopeV1Schema = z
+  .object({ version: z.literal(LEGACY_REVIEW_BATCH_VERSION), batches: z.array(reviewBatchV1PayloadSchema) })
+  .strict();
 const reviewBatchEnvelopeSchema = z
   .object({ version: z.literal(REVIEW_BATCH_VERSION), batches: z.array(reviewBatchSchema) })
   .strict();
@@ -99,23 +107,16 @@ function assertActiveUniqueness(others: readonly ReviewBatch[], candidate: Revie
  * Persistence for ReviewBatches: one JSON file holding every batch, oldest
  * first, terminal batches included.
  *
- * The file is a strict version-1 envelope (`{ version: 1, batches }`); a
- * document that is not valid JSON, declares another version, or fails batch
- * validation raises `ReviewBatchStoreError` and is left untouched, so a damaged
- * store is visible instead of being quietly reset. Only `ENOENT` means "nothing
- * stored yet": an empty or whitespace-only file is malformed, exactly as it is
- * for the AI review cache.
+ * The strict version-2 envelope is the only format this build writes. A
+ * validated version-1 store is copied byte-for-byte to
+ * `review-batches.json.v1.bak` before it is atomically rewritten; malformed,
+ * unsupported, or damaged data is never replaced.
  *
- * Every operation runs inside one critical section, so the read-modify-write
- * cycle is atomic within the process, and writes go to a UUID temp file in the
- * same directory that is renamed into place, so a crash can never leave a
- * truncated store. The critical section is per store instance: two instances
- * pointed at the same file serialize only against themselves, and the atomic
- * rename keeps the file valid (last writer wins) rather than corrupt. Two
- * invariants are enforced on write: batch ids are unique
- * across the file, and at most one in-flight (`draft`/`submitted`/`running`)
- * batch may exist per workspace, Agent, or comment id. Terminal batches stay
- * on disk for history and never block a new active batch.
+ * Every operation runs inside one critical section. Writes use a UUID temp
+ * file in the same directory and atomically rename it into place. Batch ids
+ * and persisted message ids are unique; once created, a message id cannot
+ * change or be removed. At most one in-flight (`draft`/`submitted`/`running`)
+ * batch may exist per workspace, Agent, or comment id.
  */
 export class ReviewBatchStore {
   private readonly storagePath: string;
@@ -153,9 +154,9 @@ export class ReviewBatchStore {
 
   /**
    * Append one batch. The payload is validated before the store is read, so an
-   * invalid batch never touches (or creates) the file. A duplicate id, a second
-   * in-flight batch for the same agent, or an in-flight batch that already
-   * claims one of this batch's comments is rejected without a write.
+   * invalid batch never touches (or creates) the file. A duplicate batch or
+   * message id, a second in-flight batch for the same agent, or an in-flight
+   * batch that already claims one of this batch's comments is rejected without a write.
    */
   create(batch: ReviewBatch): Promise<ReviewBatch> {
     const parsed = reviewBatchSchema.safeParse(batch);
@@ -175,6 +176,14 @@ export class ReviewBatchStore {
           `ReviewBatch store at ${this.storagePath} already stores ReviewBatch ${created.id}; the store was left untouched.`,
         );
       }
+      if (
+        created.delivery &&
+        batches.some((stored) => stored.delivery?.messageId === created.delivery?.messageId)
+      ) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch store at ${this.storagePath} already uses message id ${created.delivery.messageId}; the store was left untouched.`,
+        );
+      }
       assertActiveUniqueness(batches, created, this.storagePath);
       await this.write([...batches, created]);
       return created;
@@ -184,9 +193,9 @@ export class ReviewBatchStore {
   /**
    * Replace one stored batch with the result of `transform`, or resolve null
    * when no batch has that id (no write happens in that case). The transformed
-   * batch is validated before writing, and the id and active-claim invariants
-   * are re-checked, so an update can complete, fail, or advance a batch but can
-   * never mint a second active claim or collide with another id.
+   * batch is validated before writing, and the id, immutable message identity,
+   * and active-claim invariants are re-checked so an update cannot mint a
+   * second active claim or collide with another id.
    */
   update(
     id: string,
@@ -210,6 +219,19 @@ export class ReviewBatchStore {
           `ReviewBatch store at ${this.storagePath} already stores ReviewBatch ${updated.id}; the update was rejected and the store was left untouched.`,
         );
       }
+      if (updated.delivery?.messageId !== batches[index]?.delivery?.messageId) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch ${id} cannot change or remove its persisted message id; the store was left untouched.`,
+        );
+      }
+      if (
+        updated.delivery &&
+        others.some((other) => other.delivery?.messageId === updated.delivery?.messageId)
+      ) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch store at ${this.storagePath} already uses message id ${updated.delivery.messageId}; the update was rejected.`,
+        );
+      }
       assertActiveUniqueness(others, updated, this.storagePath);
       const next = [...batches];
       next[index] = updated;
@@ -218,7 +240,7 @@ export class ReviewBatchStore {
     });
   }
 
-  /** Read and validate the store; a missing file is an empty store. */
+  /** Read, validate, and migrate the store before exposing any records. */
   private async read(): Promise<ReviewBatch[]> {
     let raw: string;
     try {
@@ -229,11 +251,14 @@ export class ReviewBatchStore {
         cause: error,
       });
     }
-    return this.parse(raw);
+    const document = this.parse(raw);
+    return document.version === LEGACY_REVIEW_BATCH_VERSION
+      ? this.migrateLegacy(raw, document.batches)
+      : document.batches;
   }
 
-  /** Parse and validate a store document; throws without touching the file. */
-  private parse(raw: string): ReviewBatch[] {
+  /** Parse a strict v1 or v2 envelope without touching the file. */
+  private parse(raw: string): { version: 1 | 2; batches: ReviewBatch[] } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -243,28 +268,54 @@ export class ReviewBatchStore {
         { cause: error },
       );
     }
-    // An empty or whitespace-only file is malformed JSON (JSON.parse already
-    // rejected the truly empty case); only ENOENT means "nothing stored yet".
+    // An empty or whitespace-only file is malformed JSON; only ENOENT means empty.
     const marked = reviewBatchVersionMarkerSchema.safeParse(parsed);
     if (!marked.success) {
       throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} is not a version ${REVIEW_BATCH_VERSION} store; the file was left untouched.`,
+        `ReviewBatch store at ${this.storagePath} has no supported version marker; the file was left untouched.`,
       );
     }
-    if (marked.data.version !== REVIEW_BATCH_VERSION) {
+
+    let version: 1 | 2;
+    let batches: ReviewBatch[];
+    if (marked.data.version === LEGACY_REVIEW_BATCH_VERSION) {
+      const legacy = reviewBatchEnvelopeV1Schema.safeParse(parsed);
+      if (!legacy.success) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch store at ${this.storagePath} has an invalid version 1 envelope; the file was left untouched.`,
+          { cause: legacy.error },
+        );
+      }
+      version = LEGACY_REVIEW_BATCH_VERSION;
+      batches = [];
+      for (const legacyBatch of legacy.data.batches) {
+        const validated = reviewBatchSchema.safeParse(legacyBatch);
+        if (!validated.success) {
+          throw new ReviewBatchStoreError(
+            `ReviewBatch store at ${this.storagePath} has an invalid version 1 batch; the file was left untouched.`,
+            { cause: validated.error },
+          );
+        }
+        batches.push(validated.data);
+      }
+    } else if (marked.data.version === REVIEW_BATCH_VERSION) {
+      const envelope = reviewBatchEnvelopeSchema.safeParse(parsed);
+      if (!envelope.success) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch store at ${this.storagePath} has an invalid version ${REVIEW_BATCH_VERSION} envelope; the file was left untouched.`,
+          { cause: envelope.error },
+        );
+      }
+      version = REVIEW_BATCH_VERSION;
+      batches = envelope.data.batches;
+    } else {
       throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads version ${REVIEW_BATCH_VERSION} and left the file untouched.`,
+        `ReviewBatch store at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads versions ${LEGACY_REVIEW_BATCH_VERSION} and ${REVIEW_BATCH_VERSION} and left the file untouched.`,
       );
     }
-    const envelope = reviewBatchEnvelopeSchema.safeParse(parsed);
-    if (!envelope.success) {
-      throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} has an invalid version ${REVIEW_BATCH_VERSION} envelope; the file was left untouched.`,
-        { cause: envelope.error },
-      );
-    }
-    const batches = envelope.data.batches;
+
     const seen = new Set<string>();
+    const seenMessageIds = new Set<string>();
     for (const batch of batches) {
       if (seen.has(batch.id)) {
         throw new ReviewBatchStoreError(
@@ -272,8 +323,104 @@ export class ReviewBatchStore {
         );
       }
       seen.add(batch.id);
+      if (batch.delivery) {
+        if (seenMessageIds.has(batch.delivery.messageId)) {
+          throw new ReviewBatchStoreError(
+            `ReviewBatch store at ${this.storagePath} repeats message id ${batch.delivery.messageId}; the file was left untouched.`,
+          );
+        }
+        seenMessageIds.add(batch.delivery.messageId);
+      }
     }
+    return { version, batches };
+  }
+
+  /** Preserve the exact legacy bytes before atomically rewriting v2. */
+  private async migrateLegacy(raw: string, batches: ReviewBatch[]): Promise<ReviewBatch[]> {
+    let current: string;
+    try {
+      current = await readFile(this.storagePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return [];
+      throw new ReviewBatchStoreError(`ReviewBatch store at ${this.storagePath} could not be re-read for migration.`, {
+        cause: error,
+      });
+    }
+    if (current !== raw) {
+      const latest = this.parse(current);
+      if (latest.version === REVIEW_BATCH_VERSION) return latest.batches;
+      throw new ReviewBatchStoreError(
+        `ReviewBatch store at ${this.storagePath} changed during version 1 migration; the file was left untouched. Retry after inspecting the store.`,
+      );
+    }
+
+    await this.backupLegacy(raw);
+    let rechecked: string;
+    try {
+      rechecked = await readFile(this.storagePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return [];
+      throw new ReviewBatchStoreError(`ReviewBatch store at ${this.storagePath} could not be re-read for migration.`, {
+        cause: error,
+      });
+    }
+    if (rechecked !== raw) {
+      const latest = this.parse(rechecked);
+      if (latest.version === REVIEW_BATCH_VERSION) return latest.batches;
+      throw new ReviewBatchStoreError(
+        `ReviewBatch store at ${this.storagePath} changed during version 1 migration; the file was left untouched. Retry after inspecting the store.`,
+      );
+    }
+    await this.write(batches);
     return batches;
+  }
+
+  /** Create a non-overwritable, read-only copy of the v1 bytes beside the store. */
+  private async backupLegacy(raw: string): Promise<void> {
+    const backupPath = `${this.storagePath}.v1.bak`;
+    if (await this.verifyLegacyBackup(backupPath, raw)) return;
+
+    const temporary = `${backupPath}.${randomUUID()}.tmp`;
+    try {
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(temporary, raw, { encoding: "utf8", mode: 0o400, flag: "wx" });
+      await link(temporary, backupPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST" && await this.verifyLegacyBackup(backupPath, raw)) {
+        return;
+      }
+      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be created.`, { cause: error });
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  }
+
+  private async verifyLegacyBackup(backupPath: string, raw: string): Promise<boolean> {
+    let metadata: Stats;
+    try {
+      metadata = await lstat(backupPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be inspected.`, { cause: error });
+    }
+    if (!metadata.isFile() || (metadata.mode & 0o222) !== 0) {
+      throw new ReviewBatchStoreError(
+        `Version 1 backup for ${this.storagePath} already exists but is not a read-only regular file; migration was refused.`,
+      );
+    }
+    let existing: string;
+    try {
+      existing = await readFile(backupPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be read.`, { cause: error });
+    }
+    if (existing !== raw) {
+      throw new ReviewBatchStoreError(
+        `Version 1 backup for ${this.storagePath} already exists with different contents; migration was refused.`,
+      );
+    }
+    return true;
   }
 
   /** Write the envelope atomically: temp file in the same directory, renamed. */

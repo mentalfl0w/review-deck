@@ -18,7 +18,27 @@ export const reviewCommentOutcomeSchema = z.enum([
 ]);
 export type ReviewCommentOutcome = z.infer<typeof reviewCommentOutcomeSchema>;
 
-export const reviewBatchSchema = z.object({
+/** Message transport state is orthogonal to the ReviewBatch work lifecycle. */
+export const reviewBatchDeliveryPhaseSchema = z.enum([
+  "prepared",
+  "sending",
+  "accepted",
+  "unknown",
+  "rejected",
+]);
+export type ReviewBatchDeliveryPhase = z.infer<typeof reviewBatchDeliveryPhaseSchema>;
+
+export const reviewBatchDeliverySchema = z.object({
+  messageId: z.string().min(1),
+  phase: reviewBatchDeliveryPhaseSchema,
+  attempts: z.number().int().nonnegative(),
+  updatedAt: z.iso.datetime(),
+  lastErrorCode: z.string().min(1).optional(),
+}).strict();
+export type ReviewBatchDelivery = z.infer<typeof reviewBatchDeliverySchema>;
+
+/** Strict pre-delivery shape used only to validate version-1 Store records. */
+export const reviewBatchV1PayloadSchema = z.object({
   id: z.string().min(1),
   createdAt: z.iso.datetime(),
   projectId: z.string().min(1),
@@ -30,7 +50,13 @@ export const reviewBatchSchema = z.object({
   status: reviewBatchStatusSchema,
   outcomes: z.record(z.string().min(1), reviewCommentOutcomeSchema),
   turnId: z.string().min(1).optional(),
-}).strict().superRefine((batch, context) => {
+}).strict();
+
+const reviewBatchFieldsSchema = reviewBatchV1PayloadSchema.extend({
+  delivery: reviewBatchDeliverySchema.optional(),
+}).strict();
+
+export const reviewBatchSchema = reviewBatchFieldsSchema.superRefine((batch, context) => {
   const commentIds = new Set(batch.commentIds);
   if (commentIds.size !== batch.commentIds.length) {
     context.addIssue({ code: "custom", path: ["commentIds"], message: "ReviewBatch comment ids must be unique." });
@@ -62,6 +88,7 @@ export const activeReviewBatchSchema = z.object({
   agentId: z.string().min(1),
   commentIds: z.array(z.string().min(1)).min(1),
   status: z.enum(["draft", "submitted", "running"]),
+  delivery: reviewBatchDeliverySchema.optional(),
 }).strict();
 export type ActiveReviewBatch = z.infer<typeof activeReviewBatchSchema>;
 

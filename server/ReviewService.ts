@@ -119,7 +119,7 @@ export interface ReviewServiceDependencies {
 const READONLY_REVIEW_POLL_WAIT_MS = 2_000;
 /** Persistent run records remain recoverable for one hour. */
 const READONLY_REVIEW_ENTRY_TTL_MS = 60 * 60_000;
-/** Give the Agent a bounded startup window before releasing a lost submission. */
+/** Bound startup expiry to Batches that never persisted a send attempt. */
 const REVIEW_BATCH_START_TIMEOUT_MS = 2 * 60_000;
 
 /** Conservative allowlist: Paseo currently forwards outputSchema only for these provider adapters. */
@@ -371,6 +371,7 @@ export class ReviewService {
   private readonly store: StateStore;
   private readonly aiReviewCacheStore: AiReviewCacheStore;
   private readonly reviewBatchStore: ReviewBatchStore;
+  private readonly sendingReviewBatchIds = new Set<string>();
   private readonly reviewRunStore: ReviewRunStore;
   private readonly verifications: VerificationService;
   private readonly reviewBatchTimelineMutex = createMutex();
@@ -1492,6 +1493,7 @@ export class ReviewService {
         agentId: batch.agentId,
         commentIds: batch.commentIds,
         status: batch.status as ActiveReviewBatch["status"],
+        ...(batch.delivery ? { delivery: batch.delivery } : {}),
       })),
     };
   }
@@ -1499,11 +1501,73 @@ export class ReviewService {
   private async reconcileStalledReviewBatches(projectId: string, context: PluginHandlerContext): Promise<void> {
     const batches = await this.reviewBatchStore.listActiveByProject(projectId);
     for (const batch of batches) {
-      const turnWasObserved = batch.status === "running" ||
-        (batch.status === "submitted" && batch.turnId !== undefined);
-      const startExpired = (batch.status === "draft" || batch.status === "submitted") &&
-        Date.now() - Date.parse(batch.createdAt) >= REVIEW_BATCH_START_TIMEOUT_MS;
-      const handle = context.paseo.agents.ref(batch.agentId);
+      if (this.sendingReviewBatchIds.has(batch.id)) continue;
+      let current = batch;
+      if (!current.delivery) continue;
+      if (current.delivery.phase === "rejected") {
+        await this.failActiveBatchAsUnresolved(current.id, context);
+        continue;
+      }
+      if (current.delivery.phase === "sending") {
+        const recovered = await this.reviewBatchStore.update(current.id, (stored) => {
+          if (!isActiveReviewBatch(stored.status) || stored.delivery?.phase !== "sending") return stored;
+          return {
+            ...stored,
+            delivery: {
+              ...stored.delivery,
+              phase: "unknown",
+              updatedAt: new Date().toISOString(),
+              lastErrorCode: "send_interrupted",
+            },
+          };
+        });
+        if (!recovered || !isActiveReviewBatch(recovered.status)) continue;
+        current = recovered;
+      }
+      if (!current.delivery) continue;
+      if (
+        (current.delivery.phase === "unknown" || current.delivery.phase === "accepted") &&
+        current.turnId === undefined
+      ) {
+        const observed = await this.findReviewBatchTimelineMessage(current, context);
+        if (!observed.found) continue;
+        const acceptedAt = new Date().toISOString();
+        const recovered = await this.reviewBatchStore.update(current.id, (stored) => {
+          if (
+            !isActiveReviewBatch(stored.status) ||
+            !stored.delivery ||
+            stored.delivery.messageId !== current.delivery?.messageId ||
+            (observed.turnId !== null && stored.turnId !== undefined && stored.turnId !== observed.turnId)
+          ) return stored;
+          return {
+            ...stored,
+            ...(observed.turnId !== null ? {
+              status: "running",
+              submittedAt: stored.submittedAt ?? acceptedAt,
+              turnId: stored.turnId ?? observed.turnId,
+            } : {}),
+            delivery: stored.delivery.phase === "accepted"
+              ? stored.delivery
+              : { ...stored.delivery, phase: "accepted", updatedAt: acceptedAt },
+          };
+        });
+        if (!recovered || !isActiveReviewBatch(recovered.status)) continue;
+        current = recovered;
+        if (recovered.submittedAt) await this.appendReviewBatchTimeline(recovered, context);
+        if (observed.turnId === null) continue;
+      }
+      const delivery = current.delivery;
+      if (!delivery) continue;
+      if (delivery.phase === "rejected") {
+        await this.failActiveBatchAsUnresolved(current.id, context);
+        continue;
+      }
+      const turnWasObserved = current.turnId !== undefined;
+      if ((delivery.phase === "accepted" || delivery.phase === "unknown") && !turnWasObserved) continue;
+      const startExpired = delivery.phase === "prepared" &&
+        (current.status === "draft" || current.status === "submitted") &&
+        Date.now() - Date.parse(current.createdAt) >= REVIEW_BATCH_START_TIMEOUT_MS;
+      const handle = context.paseo.agents.ref(current.agentId);
       let refreshed;
       try {
         refreshed = await handle.refresh();
@@ -1511,10 +1575,11 @@ export class ReviewService {
         // An RPC/transport failure is not evidence that the Agent is gone.
         continue;
       }
-      const agent = refreshed?.agent ?? handle.current();
-      if (agent && !agent.archivedAt && (agent.status === "running" || agent.status === "initializing")) continue;
+      const agent = refreshed?.agent;
+      if (!agent) continue;
+      if (!agent.archivedAt && (agent.status === "running" || agent.status === "initializing")) continue;
       if (!turnWasObserved && !startExpired) continue;
-      await this.failActiveBatchAsUnresolved(batch.id, context);
+      await this.failActiveBatchAsUnresolved(current.id, context);
     }
   }
 
@@ -1739,6 +1804,12 @@ export class ReviewService {
       activeBatchCount: batches.filter(
         (batch) => batch.workspaceId === identity.workspaceId && isActiveReviewBatch(batch.status),
       ).length,
+      deliveryUnknownBatchCount: batches.filter(
+        (batch) =>
+          batch.workspaceId === identity.workspaceId &&
+          isActiveReviewBatch(batch.status) &&
+          (!batch.delivery || batch.delivery.phase === "sending" || batch.delivery.phase === "unknown"),
+      ).length,
       runningAiReviewCount: runs.filter(
         (run) => run.workspaceId === identity.workspaceId && run.status === "running",
       ).length,
@@ -1862,6 +1933,172 @@ export class ReviewService {
     return { markedRunCount };
   }
 
+  private projectCommentPreflightIdentity(comment: ProjectReviewComment): string {
+    return canonicalJson([
+      comment.id,
+      comment.projectId,
+      comment.workspaceId ?? null,
+      comment.targetFingerprint,
+      comment.hunkId,
+      comment.hunkFingerprint,
+      comment.filePath,
+      comment.hunkHeader,
+      comment.hunkPatch,
+      comment.cwd,
+      comment.scope,
+      comment.baseRef ?? null,
+      comment.headRef ?? null,
+      comment.comment,
+      comment.savedAt,
+      comment.anchor ?? null,
+      comment.anchorState ?? null,
+    ]);
+  }
+
+  /**
+   * Resolve every selected comment against a fresh snapshot before dispatch.
+   * This is read-only: stale or ambiguous anchors fail the whole batch, while
+   * unique relocations are reflected only in the prompt payload.
+   */
+  private async preflightProjectReviewComments(
+    comments: readonly ProjectReviewComment[],
+    selectedIds: ReadonlySet<string>,
+    identity: { projectId: string; workspaceId: string; directory: string },
+  ): Promise<ProjectReviewComment[]> {
+    const state = await this.store.load();
+    const currentComments = sortProjectComments(this.projectComments(state, identity.projectId))
+      .filter((comment) => selectedIds.has(comment.id));
+    const currentIds = new Set(currentComments.map((comment) => comment.id));
+    if (
+      currentComments.length !== selectedIds.size ||
+      currentIds.size !== selectedIds.size ||
+      currentComments.some((comment, index) => comment.id !== comments[index]?.id)
+    ) {
+      throw new Error("The selected comments changed during preflight. Refresh the queue and confirm the batch again.");
+    }
+    const currentById = new Map(currentComments.map((comment) => [comment.id, comment]));
+    for (const comment of comments) {
+      const current = currentById.get(comment.id);
+      if (
+        !current ||
+        this.projectCommentPreflightIdentity(current) !== this.projectCommentPreflightIdentity(comment)
+      ) {
+        throw new Error("The selected comments changed during preflight. Refresh the queue and confirm the batch again.");
+      }
+    }
+
+    const entriesById = new Map<string, StateEntry[]>();
+    for (const entries of Object.values(state)) {
+      for (const entry of entries) {
+        if (!entry.id || !selectedIds.has(entry.id)) continue;
+        const matches = entriesById.get(entry.id) ?? [];
+        matches.push(entry);
+        entriesById.set(entry.id, matches);
+      }
+    }
+    const targets = new Map<string, { request: ReviewRequest; comments: ProjectReviewComment[] }>();
+    for (const comment of currentComments) {
+      const request: ReviewRequest = {
+        cwd: identity.directory,
+        scope: comment.scope,
+        ...(comment.baseRef !== undefined ? { baseRef: comment.baseRef } : {}),
+        ...(comment.headRef !== undefined ? { headRef: comment.headRef } : {}),
+      };
+      const key = canonicalJson([request.cwd, request.scope, request.baseRef ?? null, request.headRef ?? null]);
+      const target = targets.get(key) ?? { request, comments: [] };
+      target.comments.push(comment);
+      targets.set(key, target);
+    }
+
+    const preflighted = new Map<string, ProjectReviewComment>();
+    const constraints: OwnershipConstraints = {
+      projectId: identity.projectId,
+      workspaceId: identity.workspaceId,
+      cwd: identity.directory,
+    };
+    for (const { request, comments: targetComments } of targets.values()) {
+      const snapshot = await this.createSnapshot(request);
+      const currentHunks: ReviewStateCurrentHunk[] = snapshot.files.flatMap((file) =>
+        file.hunks.map((hunk) => ({
+          hunkId: hunk.id,
+          filePath: hunk.filePath,
+          ...(file.oldPath !== undefined ? { oldPath: file.oldPath } : {}),
+          hunkHeader: hunk.header,
+          hunkPatch: hunk.patch,
+        })),
+      );
+      const descriptors = currentHunkDescriptors(snapshot.targetFingerprint, currentHunks);
+      const fileViews = await this.loadAnchorFileViews({
+        targetFingerprint: snapshot.targetFingerprint,
+        currentHunks,
+        request,
+        projectId: identity.projectId,
+        workspaceId: identity.workspaceId,
+      });
+      for (const comment of targetComments) {
+        const entries = entriesById.get(comment.id) ?? [];
+        if (entries.length !== 1) {
+          throw new Error(`Comment ${comment.id} no longer has one unambiguous stored record. Refresh the queue.`);
+        }
+        const entry = entries[0]!;
+        if (entry.decision !== "commented" || ownershipMismatch(entry, { ...constraints, scope: comment.scope }) !== null) {
+          throw new Error(`Comment ${comment.id} no longer belongs to the selected workspace and review scope.`);
+        }
+        const resolution = resolveAnchor({
+          entry,
+          descriptors,
+          sameTarget: entry.targetFingerprint === snapshot.targetFingerprint,
+          fullDrift: true,
+          fileViews,
+        });
+        if ((resolution.state !== "exact" && resolution.state !== "relocated") || !resolution.descriptor) {
+          throw new Error(`Comment ${comment.id} is stale or ambiguous at the current target. Re-anchor it before submission.`);
+        }
+        const descriptor = resolution.descriptor;
+        preflighted.set(comment.id, {
+          ...comment,
+          targetFingerprint: snapshot.targetFingerprint,
+          hunkId: descriptor.hunk.hunkId,
+          hunkFingerprint: descriptor.fingerprint,
+          filePath: descriptor.hunk.filePath,
+          hunkHeader: descriptor.hunk.hunkHeader,
+          hunkPatch: descriptor.hunk.hunkPatch,
+          anchor: resolution.anchor ?? entry.anchor ?? {
+            kind: "hunk",
+            filePath: descriptor.hunk.filePath,
+            hunkId: descriptor.hunk.hunkId,
+            hunkFingerprint: descriptor.fingerprint,
+            contentId: descriptor.contentId,
+          },
+          anchorState: resolution.state,
+        });
+      }
+    }
+    const finalState = await this.store.load();
+    const finalComments = sortProjectComments(this.projectComments(finalState, identity.projectId))
+      .filter((comment) => selectedIds.has(comment.id));
+    const finalIds = new Set(finalComments.map((comment) => comment.id));
+    if (
+      finalComments.length !== selectedIds.size ||
+      finalIds.size !== selectedIds.size ||
+      finalComments.some((comment, index) => comment.id !== currentComments[index]?.id)
+    ) {
+      throw new Error("The selected comments changed during preflight. Refresh the queue and confirm the batch again.");
+    }
+    const finalById = new Map(finalComments.map((comment) => [comment.id, comment]));
+    for (const comment of currentComments) {
+      const final = finalById.get(comment.id);
+      if (!final || this.projectCommentPreflightIdentity(final) !== this.projectCommentPreflightIdentity(comment)) {
+        throw new Error("The selected comments changed during preflight. Refresh the queue and confirm the batch again.");
+      }
+    }
+    return currentComments.map((comment) => {
+      const current = preflighted.get(comment.id);
+      if (!current) throw new Error(`Comment ${comment.id} did not resolve during preflight.`);
+      return current;
+    });
+  }
+
   /**
    * Submit exactly one workspace's selected comments. Their records remain in
    * the queue until the matching Agent turn explicitly reports COMPLETED.
@@ -1888,35 +2125,9 @@ export class ReviewService {
       throw new Error(`Workspace ${input.workspaceId} does not own directory ${input.workspaceCwd}.`);
     }
 
-    // Refresh before creating a batch so a deleted, replaced, or re-bound Agent
-    // can never process comments under a stale workspace selection.
-    const handle = context.paseo.agents.ref(input.agentId);
-    let agent: { workspaceId?: string | null; cwd?: string | null; archivedAt?: string | null } | null | undefined;
-    try {
-      const fresh = await handle.refresh();
-      agent = fresh?.agent ?? handle.current();
-    } catch {
-      agent = handle.current();
-    }
-    if (!agent) {
-      throw new Error(`Processing agent ${input.agentId} does not exist. Select an Agent in workspace ${input.workspaceId} and retry.`);
-    }
-    if (agent.archivedAt) {
-      throw new Error(`Processing agent ${input.agentId} is archived. Select an active Agent and retry.`);
-    }
-    if (agent.workspaceId !== input.workspaceId) {
-      throw new Error(
-        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not ${input.workspaceId}. No other Agent was substituted.`,
-      );
-    }
-    if (!(await this.directoriesMatch(agent.cwd ?? "", input.workspaceCwd))) {
-      throw new Error(
-        `Processing agent ${input.agentId} does not run in the selected workspace directory ${input.workspaceCwd}. Refusing to process outside that workspace.`,
-      );
-    }
 
     const file = await this.store.load();
-    const comments = sortProjectComments(this.projectComments(file, input.projectId))
+    let comments = sortProjectComments(this.projectComments(file, input.projectId))
       .filter((comment) => requestedIds.has(comment.id));
     if (comments.length !== requestedIds.size) {
       throw new Error("One or more selected project comments are no longer in the queue. Refresh the queue and retry.");
@@ -1933,18 +2144,24 @@ export class ReviewService {
         throw new Error(`Comment ${comment.id} does not belong to the selected workspace directory; refusing to include it.`);
       }
     }
+    const selectedComments = comments;
+    comments = await this.preflightProjectReviewComments(comments, requestedIds, identity);
 
+
+    const batchId = randomUUID();
+    const createdAt = new Date().toISOString();
+    const messageId = `review-deck-batch:${batchId}`;
     const batch: ReviewBatch = {
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
+      id: batchId,
+      createdAt,
       projectId: input.projectId,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
       commentIds: comments.map((comment) => comment.id),
       status: "draft",
       outcomes: {},
+      delivery: { messageId, phase: "prepared", attempts: 0, updatedAt: createdAt },
     };
-    await this.reviewBatchStore.create(batch);
     const { projectName } = this.projectCommentIdentity(comments);
     const prompt = buildReviewBatchPrompt({
       batchId: batch.id,
@@ -1955,29 +2172,205 @@ export class ReviewService {
       comments,
     });
 
-    try {
-      await handle.send(prompt);
-    } catch (error) {
-      const completedAt = new Date().toISOString();
-      const failedOutcomes = Object.fromEntries(
-        batch.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "failed"]),
+    const currentIdentity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    if (
+      currentIdentity.projectId !== identity.projectId ||
+      !(await this.directoriesMatch(currentIdentity.directory, identity.directory)) ||
+      !(await this.directoriesMatch(currentIdentity.directory, input.workspaceCwd))
+    ) {
+      throw new Error("Workspace identity changed during preflight. Refresh Review Deck and confirm the batch again.");
+    }
+    // Recheck the Agent after Git and anchor preflight so only a freshly idle,
+    // still-bound Agent can receive the message. The SDK has no atomic
+    // send-if-idle operation; the final status check remains best-effort.
+    const handle = context.paseo.agents.ref(input.agentId);
+    const refreshed = await handle.refresh().catch(() => null);
+    const agent = refreshed?.agent ?? null;
+    if (!agent) {
+      throw new Error(`Could not verify the status of Agent ${input.agentId}; no ReviewBatch was sent.`);
+    }
+    if (agent.id !== input.agentId) {
+      throw new Error(`Processing agent ${input.agentId} could not be verified. No ReviewBatch was sent.`);
+    }
+    if (agent.archivedAt) {
+      throw new Error(`Processing agent ${input.agentId} is archived. Select an active Agent and retry.`);
+    }
+    if (agent.status !== "idle") {
+      throw new Error(`Processing agent ${input.agentId} is busy (${agent.status}); only an idle Agent can receive Review Deck comments.`);
+    }
+    if (agent.workspaceId !== input.workspaceId) {
+      throw new Error(
+        `Processing agent ${input.agentId} belongs to workspace ${agent.workspaceId ?? "(none)"}, not ${input.workspaceId}. No other Agent was substituted.`,
       );
-      const failed = await this.reviewBatchStore.update(batch.id, (current) => {
-        if (!isActiveReviewBatch(current.status)) return current;
-        return { ...current, status: "failed", outcomes: failedOutcomes, completedAt };
+    }
+    if (!(await this.directoriesMatch(agent.cwd ?? "", currentIdentity.directory))) {
+      throw new Error(
+        `Processing agent ${input.agentId} does not run in the selected workspace directory ${currentIdentity.directory}. Refusing to process outside that workspace.`,
+      );
+    }
+    await this.store.runExclusive(async () => {
+      const latestState = await this.store.load();
+      const latestComments = sortProjectComments(this.projectComments(latestState, input.projectId))
+        .filter((comment) => requestedIds.has(comment.id));
+      if (
+        latestComments.length !== selectedComments.length ||
+        latestComments.some((comment, index) =>
+          comment.id !== selectedComments[index]?.id ||
+          this.projectCommentPreflightIdentity(comment) !==
+            this.projectCommentPreflightIdentity(selectedComments[index]!),
+        )
+      ) {
+        throw new Error("The selected comments changed before dispatch. Refresh the queue and confirm the batch again.");
+      }
+      await this.reviewBatchStore.create(batch);
+    });
+
+    this.sendingReviewBatchIds.add(batch.id);
+    try {
+      const sending = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status) || current.delivery?.phase !== "prepared") return current;
+        return {
+          ...current,
+          delivery: {
+            ...current.delivery,
+            phase: "sending",
+            attempts: current.delivery.attempts + 1,
+            updatedAt: new Date().toISOString(),
+          },
+        };
       });
-      if (failed?.submittedAt) await this.appendReviewBatchTimeline(failed, context);
+      if (!sending || sending.delivery?.phase !== "sending") {
+        throw new Error(`ReviewBatch ${batch.id} could not persist its send intent; no message was sent.`);
+      }
+      await handle.send(prompt, { messageId });
+    } catch (error) {
+      const unknown = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (current.delivery?.phase !== "sending") return current;
+        return {
+          ...current,
+          delivery: {
+            ...current.delivery,
+            phase: "unknown",
+            updatedAt: new Date().toISOString(),
+            lastErrorCode: "send_outcome_unknown",
+          },
+        };
+      });
+      if (unknown?.submittedAt) await this.appendReviewBatchTimeline(unknown, context);
       throw error;
+    } finally {
+      this.sendingReviewBatchIds.delete(batch.id);
     }
 
-    const submittedAt = new Date().toISOString();
-    const submitted = await this.reviewBatchStore.update(batch.id, (current) => {
-      if (current.status !== "draft") return current;
-      return { ...current, status: "submitted", submittedAt };
+    const acceptedAt = new Date().toISOString();
+    const accepted = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (!current.delivery) return current;
+      const delivery = { ...current.delivery, phase: "accepted" as const, updatedAt: acceptedAt };
+      if (current.status !== "draft") return { ...current, delivery };
+      return {
+        ...current,
+        status: "submitted",
+        submittedAt: current.submittedAt ?? acceptedAt,
+        delivery,
+      };
     });
-    if (!submitted) throw new Error(`ReviewBatch ${batch.id} disappeared after Agent submission.`);
-    await this.appendReviewBatchTimeline(submitted, context);
-    return submitted;
+    if (!accepted) throw new Error(`ReviewBatch ${batch.id} disappeared after the Agent accepted its message.`);
+    await this.appendReviewBatchTimeline(accepted, context);
+    return accepted;
+  }
+  async releaseUnknownReviewBatch(
+    input: { projectId: string; workspaceId: string; batchId: string; confirmDuplicateRisk: true },
+    context: PluginHandlerContext,
+  ): Promise<{ batchId: string; released: true }> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    if (identity.projectId !== input.projectId) {
+      throw new Error(`Project ${input.projectId} does not belong to workspace ${input.workspaceId}.`);
+    }
+    const batch = (await this.reviewBatchStore.listByProject(input.projectId))
+      .find((entry) => entry.id === input.batchId);
+    if (!batch || batch.workspaceId !== input.workspaceId) {
+      throw new Error("The ReviewBatch is no longer available in this workspace.");
+    }
+    if (
+      !isActiveReviewBatch(batch.status) ||
+      (batch.delivery !== undefined &&
+        batch.delivery.phase !== "sending" &&
+        batch.delivery.phase !== "unknown" &&
+        batch.delivery.phase !== "accepted")
+    ) {
+      throw new Error("Only an active ReviewBatch with an ambiguous delivery can be released.");
+    }
+    if (this.sendingReviewBatchIds.has(batch.id)) {
+      throw new Error("The ReviewBatch send is still in progress; wait for its result before releasing it.");
+    }
+
+    const completedAt = new Date().toISOString();
+    let released = false;
+    const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+      if (
+        !isActiveReviewBatch(current.status) ||
+        (current.delivery !== undefined &&
+          current.delivery.phase !== "sending" &&
+          current.delivery.phase !== "unknown" &&
+          current.delivery.phase !== "accepted")
+      ) return current;
+      released = true;
+      return {
+        ...current,
+        status: "failed",
+        outcomes: Object.fromEntries(
+          current.commentIds.map((commentId): [string, ReviewCommentOutcome] => [commentId, "unresolved"]),
+        ),
+        completedAt,
+      };
+    });
+    if (!released || !updated) {
+      throw new Error("The ReviewBatch changed before it could be released. Refresh the queue and retry.");
+    }
+    if (updated.submittedAt) await this.appendReviewBatchTimeline(updated, context);
+    return { batchId: updated.id, released: true };
+  }
+
+
+  /** Find a Batch's exact message in a public Agent timeline page. */
+  private async findReviewBatchTimelineMessage(
+    batch: ReviewBatch,
+    context: PluginHandlerContext | PluginHookContext,
+  ): Promise<{ found: boolean; turnId: string | null }> {
+    const delivery = batch.delivery;
+    if (!delivery) return { found: false, turnId: null };
+    try {
+      const timeline = await context.paseo.agents.ref(batch.agentId).timeline.refetch({
+        direction: "tail",
+        limit: 100,
+        projection: "canonical",
+      });
+      const marker = `REVIEW DECK BATCH: ${batch.id}`;
+      let markerWithoutIdentityTurnId: string | null | undefined;
+      let sawDifferentMessageIdentity = false;
+      for (const entry of timeline.entries) {
+        if (
+          entry.item.type !== "user_message" ||
+          !entry.item.text.split(/\r?\n/).some((line) => line.trim() === marker)
+        ) continue;
+        const hasMessageIdentity = entry.item.messageId !== undefined || entry.item.clientMessageId !== undefined;
+        if (!hasMessageIdentity) {
+          if (markerWithoutIdentityTurnId === undefined) markerWithoutIdentityTurnId = entry.turnId ?? null;
+          continue;
+        }
+        sawDifferentMessageIdentity = true;
+        if (
+          entry.item.messageId === delivery.messageId ||
+          entry.item.clientMessageId === delivery.messageId
+        ) return { found: true, turnId: entry.turnId ?? null };
+      }
+      if (!sawDifferentMessageIdentity && markerWithoutIdentityTurnId !== undefined) {
+        return { found: true, turnId: markerWithoutIdentityTurnId };
+      }
+    } catch {
+      return { found: false, turnId: null };
+    }
+    return { found: false, turnId: null };
   }
 
   async handleAgentTurnStarted(
@@ -1985,23 +2378,40 @@ export class ReviewService {
     context: PluginHookContext,
   ): Promise<void> {
     const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
-    if (!batch) return;
-    if (batch.status === "running") {
-      if (event.turnId === null || batch.turnId === event.turnId) return;
-      await this.failActiveBatchAsUnresolved(batch.id, context);
-      return;
-    }
+    const turnId = event.turnId;
+    if (
+      !batch ||
+      !batch.delivery ||
+      turnId === null ||
+      batch.delivery.phase === "prepared" ||
+      batch.delivery.phase === "rejected"
+    ) return;
+    const message = await this.findReviewBatchTimelineMessage(batch, context);
+    if (!message.found || message.turnId !== turnId) return;
+    if (batch.status === "running" && batch.turnId !== undefined) return;
+
     const startedAt = new Date().toISOString();
     const updated = await this.reviewBatchStore.update(batch.id, (current) => {
-      if (current.status !== "draft" && current.status !== "submitted") return current;
+      if (
+        current.delivery?.phase === "prepared" ||
+        current.delivery?.phase === "rejected" ||
+        (current.turnId !== undefined && current.turnId !== turnId) ||
+        (current.status !== "draft" && current.status !== "submitted" &&
+          !(current.status === "running" && current.turnId === undefined))
+      ) return current;
       return {
         ...current,
         status: "running",
         submittedAt: current.submittedAt ?? startedAt,
-        ...(event.turnId !== null ? { turnId: event.turnId } : {}),
+        turnId,
+        ...(current.delivery ? {
+          delivery: { ...current.delivery, phase: "accepted" as const, updatedAt: startedAt },
+        } : {}),
       };
     });
-    if (updated?.status === "running") await this.appendReviewBatchTimeline(updated, context);
+    if (updated?.status === "running" && updated.turnId === turnId) {
+      await this.appendReviewBatchTimeline(updated, context);
+    }
   }
 
   async handleAgentArchived(
@@ -2009,7 +2419,15 @@ export class ReviewService {
     context: PluginHookContext,
   ): Promise<void> {
     const batch = await this.reviewBatchStore.findActiveForAgent(event.agent.id);
-    if (batch) await this.failActiveBatchAsUnresolved(batch.id, context);
+    if (batch?.delivery) {
+      const deliveryMayStillExecute =
+        batch.delivery.phase === "sending" ||
+        batch.delivery.phase === "unknown" ||
+        batch.delivery.phase === "accepted";
+      if (!deliveryMayStillExecute || batch.turnId !== undefined) {
+        await this.failActiveBatchAsUnresolved(batch.id, context);
+      }
+    }
 
     const runs = await this.reviewRunStore.list();
     for (const run of runs) {
@@ -2032,16 +2450,29 @@ export class ReviewService {
     );
 
     for (const batch of candidates) {
-      const response = extractReviewBatchAssistantResponse(event.timeline, batch.id);
-      const eventMatchesBatchTurn = batch.turnId !== undefined &&
-        event.turnId !== null &&
-        batch.turnId === event.turnId;
-      if (!eventMatchesBatchTurn) {
-        if (isActiveReviewBatch(batch.status) && response.found) {
-          await this.failActiveBatchAsUnresolved(batch.id, context);
-        }
-        continue;
+      if (!batch.delivery) continue;
+      const eventTurnId = event.turnId;
+      if (eventTurnId === null) continue;
+      const response = extractReviewBatchAssistantResponse(event.timeline, batch.id, batch.delivery?.messageId);
+      if (batch.turnId !== undefined && batch.turnId !== eventTurnId) continue;
+      if (batch.turnId === undefined || batch.delivery === undefined) {
+        const observed = await this.findReviewBatchTimelineMessage(batch, context);
+        if (!observed.found || observed.turnId !== eventTurnId) continue;
       }
+      const acceptedAt = new Date().toISOString();
+      const linked = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (!isActiveReviewBatch(current.status) && !isOrphanedReviewBatch(current)) return current;
+        if (current.turnId !== undefined && current.turnId !== eventTurnId) return current;
+        return {
+          ...current,
+          turnId: current.turnId ?? eventTurnId,
+          ...(response.found && current.delivery && current.delivery.phase !== "accepted" &&
+          current.delivery.phase !== "rejected" ? {
+            delivery: { ...current.delivery, phase: "accepted" as const, updatedAt: acceptedAt },
+          } : {}),
+        };
+      });
+      if (!linked || linked.turnId !== eventTurnId) continue;
       if (!response.found || !response.hasAssistantMessage || !response.hasOutcomesSection) {
         if (isActiveReviewBatch(batch.status)) {
           await this.failActiveBatchAsUnresolved(batch.id, context);
@@ -2074,6 +2505,9 @@ export class ReviewService {
           outcomes,
           submittedAt: current.submittedAt ?? completedAt,
           completedAt,
+          ...(current.delivery ? {
+            delivery: { ...current.delivery, phase: "accepted" as const, updatedAt: completedAt },
+          } : {}),
         };
       });
       if (!finalized || !updated) continue;

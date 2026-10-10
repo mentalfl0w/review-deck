@@ -15,6 +15,7 @@ export const reviewWorkspaceIndicatorsSchema = z.object({
   workspacePendingCommentCount: z.number().int().nonnegative(),
   workspaceStaleCommentCount: z.number().int().nonnegative(),
   activeBatchCount: z.number().int().nonnegative(),
+  deliveryUnknownBatchCount: z.number().int().nonnegative(),
   runningAiReviewCount: z.number().int().nonnegative(),
   unreadAiFindingCount: z.number().int().nonnegative(),
 }).strict();

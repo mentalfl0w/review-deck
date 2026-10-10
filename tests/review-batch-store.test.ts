@@ -1,11 +1,10 @@
 /**
- * Persistence contract for ReviewBatches (v1.5).
+ * Persistence contract for ReviewBatches (v2).
  *
- * `review-batches.json` is a strict version-1 envelope
- * (`{ version: 1, batches }`) holding every batch, oldest first. A document
- * that is not valid JSON, declares another version, or fails batch validation
- * raises ReviewBatchStoreError and is left byte-identical, so a damaged store
- * is visible rather than quietly reset; only ENOENT means "nothing stored yet".
+ * `review-batches.json` is a strict version-2 envelope holding every batch,
+ * oldest first. A validated version-1 envelope is backed up byte-for-byte to
+ * `.v1.bak` before migration; malformed or future data stays byte-identical.
+ * Only ENOENT means "nothing stored yet".
  *
  * Writes are serialized per store instance and land through a same-directory
  * temp file renamed into place, so concurrent creates cannot lose entries and
@@ -16,7 +15,7 @@
  * Run: node tests/review-batch-store.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
@@ -99,7 +98,7 @@ try {
   // -------------------------------------------------------------------------
   // 0. Contract constants: the default path sits beside the review store.
   // -------------------------------------------------------------------------
-  assert.strictEqual(REVIEW_BATCH_VERSION, 1);
+  assert.strictEqual(REVIEW_BATCH_VERSION, 2);
   assert.ok(DEFAULT_REVIEW_BATCH_PATH.endsWith(join("review-deck", "review-batches.json")));
   // All three constructor forms are accepted; the no-arg form is never written.
   assert.ok(new ReviewBatchStore() instanceof ReviewBatchStore);
@@ -116,9 +115,46 @@ try {
   assert.strictEqual(await fresh.findActiveForAgent("agent-batch-1"), null);
   await assert.rejects(readRaw(storePath), (error) => (error as NodeJS.ErrnoException).code === "ENOENT");
   assert.deepStrictEqual(await tempFiles(storePath), []);
+  const legacyPath = join(root, "legacy", "review-batches.json");
+  const legacyBatch = batch("legacy-v1", { status: "submitted", submittedAt: ISO });
+  const legacyRaw = `${JSON.stringify({ version: 1, batches: [legacyBatch] }, null, 2)}\n`;
+  await mkdir(dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, legacyRaw, "utf8");
+  const migratedLegacy = await store(legacyPath).list();
+  assert.deepStrictEqual(migratedLegacy, [legacyBatch], "v1 data migrates without inventing delivery identity");
+  assert.equal("delivery" in migratedLegacy[0]!, false);
+  assert.deepStrictEqual(await readStore(legacyPath), { version: 2, batches: [legacyBatch] });
+  const legacyBackupPath = `${legacyPath}.v1.bak`;
+  assert.equal(await readRaw(legacyBackupPath), legacyRaw, "the exact v1 bytes are retained for downgrade recovery");
+  assert.equal((await stat(legacyBackupPath)).mode & 0o222, 0, "the migration backup is read-only");
+  assert.deepStrictEqual(await store(legacyPath).list(), [legacyBatch], "repeated reads do not change migrated records");
+  assert.equal(await readRaw(legacyBackupPath), legacyRaw, "repeated reads never replace the v1 backup");
+
+  const backupConflictPath = join(root, "backup-conflict", "review-batches.json");
+  const backupConflictRaw = `${JSON.stringify({ version: 1, batches: [batch("legacy-conflict")] })}\n`;
+  await mkdir(dirname(backupConflictPath), { recursive: true });
+  await writeFile(backupConflictPath, backupConflictRaw, "utf8");
+  await writeFile(`${backupConflictPath}.v1.bak`, "preserve existing backup", "utf8");
+  await assert.rejects(store(backupConflictPath).list(), (error) =>
+    error instanceof ReviewBatchStoreError && error.message.includes("backup"),
+  );
+  assert.equal(await readRaw(backupConflictPath), backupConflictRaw);
+  assert.equal(await readRaw(`${backupConflictPath}.v1.bak`), "preserve existing backup");
+  const writableBackupPath = join(root, "writable-backup", "review-batches.json");
+  const writableBackupRaw = `${JSON.stringify({ version: 1, batches: [batch("legacy-writable")] })}\n`;
+  await mkdir(dirname(writableBackupPath), { recursive: true });
+  await writeFile(writableBackupPath, writableBackupRaw, "utf8");
+  await writeFile(`${writableBackupPath}.v1.bak`, writableBackupRaw, "utf8");
+  assert.notEqual((await stat(`${writableBackupPath}.v1.bak`)).mode & 0o222, 0);
+  await assert.rejects(store(writableBackupPath).list(), (error) =>
+    error instanceof ReviewBatchStoreError && error.message.includes("read-only"),
+  );
+  assert.equal(await readRaw(writableBackupPath), writableBackupRaw);
+  assert.equal(await readRaw(`${writableBackupPath}.v1.bak`), writableBackupRaw);
+
 
   // -------------------------------------------------------------------------
-  // 2. create writes a strict version-1 envelope and the batch is durable
+  // 2. create writes a strict version-2 envelope and the batch is durable
   //    across instances; queries filter by project and by activity.
   // -------------------------------------------------------------------------
   assert.deepStrictEqual(await fresh.create(batch("batch-1")), batch("batch-1"));
@@ -142,6 +178,58 @@ try {
   assert.deepStrictEqual(await fresh.findActiveForAgent("agent-batch-1"), batch("batch-1"));
   assert.strictEqual(await fresh.findActiveForAgent("agent-nobody"), null);
   assert.deepStrictEqual(await tempFiles(storePath), []);
+  const identityStore = store(join(root, "message-identity", "review-batches.json"));
+  const identityDelivery: NonNullable<ReviewBatch["delivery"]> = {
+    messageId: "review-deck-batch:message-1",
+    phase: "prepared",
+    attempts: 0,
+    updatedAt: ISO,
+  };
+  const identityBatch = batch("message-1", { delivery: identityDelivery });
+  await identityStore.create(identityBatch);
+  await assert.rejects(
+    identityStore.create(batch("message-2", {
+      workspaceId: "workspace-2",
+      agentId: "agent-2",
+      commentIds: ["comment-2"],
+      delivery: { ...identityDelivery },
+    })),
+    (error) => error instanceof ReviewBatchStoreError && error.message.includes("message id"),
+  );
+  await assert.rejects(
+    identityStore.update("message-1", (current) => current.delivery
+      ? { ...current, delivery: { ...current.delivery, messageId: "review-deck-batch:changed" } }
+      : current),
+    (error) => error instanceof ReviewBatchStoreError && error.message.includes("cannot change"),
+  );
+  const duplicateMessagePath = join(root, "duplicate-message-id", "review-batches.json");
+  const duplicateMessageBatchA = batch("duplicate-message-a", {
+    status: "failed",
+    completedAt: LATER,
+    outcomes: { "comment-duplicate-message-a": "unresolved" },
+    delivery: identityDelivery,
+  });
+  const duplicateMessageBatchB = batch("duplicate-message-b", {
+    workspaceId: "workspace-2",
+    agentId: "agent-2",
+    commentIds: ["comment-duplicate-message-b"],
+    status: "failed",
+    completedAt: LATER,
+    outcomes: { "comment-duplicate-message-b": "unresolved" },
+    delivery: { ...identityDelivery, attempts: 2 },
+  });
+  const duplicateMessageRaw = `${JSON.stringify({
+    version: REVIEW_BATCH_VERSION,
+    batches: [duplicateMessageBatchA, duplicateMessageBatchB],
+  })}\n`;
+  await mkdir(dirname(duplicateMessagePath), { recursive: true });
+  await writeFile(duplicateMessagePath, duplicateMessageRaw, "utf8");
+  await assert.rejects(store(duplicateMessagePath).list(), (error) =>
+    error instanceof ReviewBatchStoreError && error.message.includes("repeats message id"),
+  );
+  assert.equal(await readRaw(duplicateMessagePath), duplicateMessageRaw);
+  assert.deepStrictEqual(await identityStore.list(), [identityBatch], "message identity is unique and immutable");
+
 
   // -------------------------------------------------------------------------
   // 3. create validates before touching the file: an invalid batch neither
@@ -362,6 +450,8 @@ try {
     JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), submittedAt: "not-a-date" }] }),
     JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), commentIds: [] }] }),
     JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [batch("dup"), batch("dup", { agentId: "agent-dup-2" })] }),
+    JSON.stringify({ version: 1, batches: [{ ...batch("legacy-invalid"), futureField: true }] }),
+    JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), delivery: { messageId: "", phase: "unknown", attempts: 0, updatedAt: ISO } }] }),
   ];
   for (const document of damagedDocuments) {
     await writeFile(damagedPath, document, "utf8");
@@ -387,6 +477,11 @@ try {
     );
     assert.deepStrictEqual(await tempFiles(damagedPath), []);
   }
+  await assert.rejects(
+    readRaw(`${damagedPath}.v1.bak`),
+    (error) => (error as NodeJS.ErrnoException).code === "ENOENT",
+    "invalid v1 data must not create a backup or migrate",
+  );
 
   // 8b. A store path that is not a file is an error, not an empty store.
   await assert.rejects(store(root).list(), (error) => error instanceof ReviewBatchStoreError);

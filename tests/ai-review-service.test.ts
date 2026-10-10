@@ -827,6 +827,7 @@ async function run(): Promise<void> {
       workspacePendingCommentCount: 1,
       workspaceStaleCommentCount: 2,
       activeBatchCount: 1,
+      deliveryUnknownBatchCount: 1,
       runningAiReviewCount: 1,
       unreadAiFindingCount: 3,
     };

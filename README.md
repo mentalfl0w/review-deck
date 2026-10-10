@@ -56,7 +56,7 @@ flowchart TB
 
 ## Architecture
 
-Review Deck is a Paseo **0.10.0+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, the typed RPC contract file, and the server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v1 store at `~/.paseo/review-deck/review-batches.json`; transient AI Review run metadata uses a strict v1 store at `~/.paseo/review-deck/runs.json`; AI review results use a separate bounded cache at `~/.paseo/review-deck/ai-review-cache.json` (30-day TTL, 256-entry cap). Run metadata never stores prompts, patches, or review text. Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.10.0+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, typed RPC contracts, and server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v2 envelope at `~/.paseo/review-deck/review-batches.json`. A valid v1 ReviewBatch store migrates on first read only after its exact bytes are preserved in a non-overwritable read-only `.v1.bak` file; malformed data or a conflicting backup fails closed. Transient AI Review run metadata uses a strict v1 store at `~/.paseo/review-deck/runs.json`; AI review results use a separate bounded cache at `~/.paseo/review-deck/ai-review-cache.json` (30-day TTL, 256-entry cap). Run metadata never stores prompts, patches, or review text. Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -93,7 +93,7 @@ flowchart LR
     Agents["Paseo Agents"]
     Repo[("workspace repo")]
     State[("reviews.json · v2")]
-    Batches[("review-batches.json · v1")]
+    Batches[("review-batches.json · v2")]
 
     BatchStore --> Batches
     ClientEntry --> Panel
@@ -128,15 +128,15 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 3. **Browse and select the change.** Work through the changed files; each file shows its hunks with the exact diff next to the change details. Click a line number to select it; Shift-click extends a range on desktop, while compact layouts use two taps.
 4. **Leave a comment.** Save a comment against the selected line range, or leave the selection empty to keep the hunk-level anchor.
 5. **Watch the queue.** The project comments queue at the top summarizes all saved comments for the current project.
-6. **Submit workspace batches.** The queue groups comments by workspace. An Agent-launched Review Deck preselects that Agent; otherwise one eligible Agent is selected automatically. If several are eligible, choose one explicitly. Workspaces with no eligible Agent stay queued.
-7. **Track outcomes.** Review Deck keeps comments queued after submission, then removes only comments with an explicit `COMPLETED` outcome. `STALE`, `FAILED`, and `UNRESOLVED` comments remain available for another run. Each Agent timeline row updates in place and links back to Review Deck.
+6. **Submit workspace batches.** The queue groups comments by workspace. An Agent-launched Review Deck preselects that Agent; otherwise one freshly verified idle Agent bound to the exact workspace is selected. Running or initializing Agents remain visible but cannot receive comment batches. Workspaces without an eligible Agent stay queued.
+7. **Track outcomes and delivery.** Comments remain queued until the matching Agent turn reports explicit `COMPLETED` outcomes. Each send has a stable message id; an ambiguous send remains claimed and is never retried automatically. A confirmed duplicate-risk action can release a stranded claim for a user-confirmed retry.
 8. **Tune the defaults.** Under **Settings → Plugins → Review defaults**, choose the panel language (Auto / 中文 / English) and the default diff layout (Auto / Unified / Split); these host-scoped settings apply everywhere Review Deck opens.
 9. **Run a verification command.** Review the structured executable and arguments, then confirm. Review Deck opens an interactive terminal in the current workspace; inspect its output in Paseo. v2.0 does not mark pass/fail automatically.
 10. **Preview the project.** On Electron, open **More → Browser Preview**, set the project's HTTP(S) URL, then choose **Open Preview**. The URL is saved per project on the current Host.
 
 ## Limitations
 
-- **Unfinished comments remain queued.** Review Deck removes only comments the Agent explicitly marks `COMPLETED` in the Batch's matching turn. Stale, failed, unresolved, missing-turn, mismatched-turn, malformed, duplicate, or multi-section outcomes stay pending. Draft/submitted batches get a two-minute startup grace; a successful queue refresh after that window releases the batch only when its Agent is still idle or unavailable. A transient status lookup failure keeps the claim. An observed turn that has stopped, or an `agent.archived` event, releases it immediately as unresolved. A late outcome from the same turn can still update the batch. The Agent's claim is not independent verification, so review the resulting diff before accepting it.
+- **Unfinished comments remain queued.** Only an explicit `COMPLETED` outcome from the matching Batch turn clears a comment; missing, malformed, duplicate, conflicting, stale, ambiguous, or mismatched-turn outcomes remain pending. Review Deck persists a send intent and stable message id before dispatch. A successful `send()` acknowledgment or exact timeline message proves delivery, not completion. The SDK exposes no stable rejection discriminator, so every `send()` failure is conservatively treated as unknown and never retried automatically. Timeline evidence can recover delivery; `unknown` or `accepted` batches without a proven Turn retain their claims across restarts. Active v1 batches without delivery identity are never auto-linked, failed, or released by Turn/Archive events; explicit release is required and may duplicate work. Only a prepared batch with no persisted send attempt gets a two-minute grace, released after a successful refresh shows the Agent is not running or initializing. A proven Turn can be released as unresolved after it stops; Archive events resolve only new batches whose delivery state proves they are not in flight. Status/timeline lookup failure or a null Agent snapshot keeps the claim. The Agent's claim is not independent verification, so review the resulting diff before accepting it.
 - **AI Review recovery is bounded.** After reload, a running review resumes only when its labeled child still matches the stored parent/workspace and is not archived. Runs past the one-hour metadata TTL, missing children, archived children, or prompt/schema-version mismatches are abandoned. The UI's active poll loop has a separate five-minute wait cap. `runs.json` stores metadata only; review content stays in the Agent timeline or optional cache.
 - **Workspace routing is fail-closed.** A batch is bound to one workspace and one Agent in that workspace. Legacy comments without `workspaceId` are assigned only when a complete project workspace list proves their cwd has exactly one owner; ambiguous or unavailable ownership leaves them unassigned. If no eligible Agent exists, Review Deck keeps comments queued and never creates an Agent automatically.
 - **Timeline rows are status records, not review content.** Batch rows update by stable id; AI-review rows report status, finding/high-risk counts, and usage. Neither timeline payload includes comment ids, text, paths, cwd, patches, or full findings.
@@ -152,7 +152,8 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 ## Safety controls
 
 - **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
-- **Re-anchoring is advisory and fail-closed.** Unique exact/content/context matches can follow comments; stale or ambiguous anchors are never guessed and require an explicit user re-anchor. Reject/revert still verify the current target and hunk fingerprints independently.
+- **Re-anchoring and batch preflight are fail-closed.** Unique exact/content/context matches may follow comments; stale or ambiguous anchors are never guessed. Before submission, Review Deck snapshots the current target and resolves every selected comment through the AnchorEngine; a changed selection, stale/ambiguous anchor, or workspace identity fails the whole batch. Unique relocations update only the prompt payload. The Agent must still verify the current fingerprint before editing because Git can change after preflight. Reject/revert independently verify current target and hunk fingerprints.
+- **ReviewBatch downgrade safety.** The v2 store preserves a v1 backup at `~/.paseo/review-deck/review-batches.json.v1.bak`. Stop the plugin before restoring this backup over `review-batches.json` to downgrade; do not copy a v1 backup over a store that has since accepted new batches.
 
 ## Installation
 

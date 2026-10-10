@@ -84,6 +84,9 @@ export function ReviewHeaderPopover({
           {summary.projectStaleCommentCount > 0 ? (
             <Text style={styles.warning}>{t("reviewEntryStaleComments", { count: summary.projectStaleCommentCount })}</Text>
           ) : null}
+          {summary.deliveryUnknownBatchCount > 0 ? (
+            <Text style={styles.warning}>{t("reviewEntryDeliveryUnknown", { count: summary.deliveryUnknownBatchCount })}</Text>
+          ) : null}
           {summary.runningAiReviewCount > 0 ? (
             <Text style={styles.status}>{t("reviewEntryRunningAi", { count: summary.runningAiReviewCount })}</Text>
           ) : null}

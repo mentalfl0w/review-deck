@@ -3,13 +3,14 @@ import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import {
   listProjectReviewComments,
   processProjectReview,
+  releaseUnknownReviewBatch,
   type ProcessProjectReviewResult,
   type ProjectReviewComment,
   type ProjectReviewSummary,
   type ReviewScope,
 } from "../../shared/review";
 import type { AgentEntry } from "../tools";
-import { groupProjectReviewComments, type WorkspaceDirectoryOwner } from "../project-review-workspaces";
+import { canSubmitProjectReviewGroup, groupProjectReviewComments, type WorkspaceDirectoryOwner } from "../project-review-workspaces";
 import { getReviewCountStore } from "../review-count-store";
 import { getReviewEntryStatusStore } from "../review-entry-status-store";
 import type { TFunc } from "../i18n";
@@ -32,6 +33,7 @@ export function useProjectComments(params: {
   const paseo = usePaseo();
   const listProjectCommentsRpc = useRpc(listProjectReviewComments);
   const processProjectCommentsRpc = useRpc(processProjectReview);
+  const releaseUnknownReviewBatchRpc = useRpc(releaseUnknownReviewBatch);
   const [selectedProcessAgentsByWorkspace, setSelectedProcessAgentsByWorkspace] = useState<Record<string, string>>({});
   const [projectComments, setProjectComments] = useState<ProjectReviewSummary | null>(null);
   const [projectCommentsLoading, setProjectCommentsLoading] = useState(false);
@@ -149,9 +151,8 @@ export function useProjectComments(params: {
     if (projectComments.commentCount === 0) return;
 
     const assignments = workspaceGroups.flatMap((group) => {
-      if (!group.workspaceId || group.activeBatch || !group.selectedAgentId) return [];
       const agent = group.eligibleAgents.find((candidate) => candidate.id === group.selectedAgentId);
-      if (!agent?.cwd) return [];
+      if (!canSubmitProjectReviewGroup(group) || !agent?.cwd) return [];
       return [{ group, agent }];
     });
     if (assignments.length === 0) return;
@@ -182,7 +183,7 @@ export function useProjectComments(params: {
       setProcessResult(submitted.length > 0 ? submitted : null);
       setProcessError(failures.length > 0 ? failures.join("\n") : null);
       const pendingWorkspaceCount = workspaceGroups.filter((group) =>
-        !group.activeBatch && (!group.workspaceId || !group.selectedAgentId),
+        !group.activeBatch && !canSubmitProjectReviewGroup(group),
       ).length;
       setProjectNotice(
         pendingWorkspaceCount > 0
@@ -199,15 +200,29 @@ export function useProjectComments(params: {
     setQueueOpen(true);
     void refreshProjectComments();
   }, [refreshProjectComments]);
+  const releaseUnknownBatch = useCallback(async (input: { workspaceId: string; batchId: string }) => {
+    if (!effectiveProjectId) return;
+    setProcessError(null);
+    try {
+      await releaseUnknownReviewBatchRpc({
+        projectId: effectiveProjectId,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        confirmDuplicateRisk: true,
+      });
+      setProjectNotice(t("reviewBatchClaimReleased"));
+      await refreshProjectComments();
+    } catch (error) {
+      setProcessError(error instanceof Error ? error.message : String(error));
+    }
+  }, [effectiveProjectId, refreshProjectComments, releaseUnknownReviewBatchRpc, t]);
 
   const canProcessProject = Boolean(effectiveProjectId) &&
     projectComments !== null &&
     projectComments.projectId === effectiveProjectId &&
     !projectCommentsLoading &&
     projectComments.commentCount > 0 &&
-    workspaceGroups.some((group) =>
-      Boolean(group.workspaceId && group.selectedAgentId && !group.activeBatch),
-    ) &&
+    workspaceGroups.some(canSubmitProjectReviewGroup) &&
     !processingProject;
   const commentsByTarget = useMemo(() => {
     const targets = new Map<string, {
@@ -250,6 +265,7 @@ export function useProjectComments(params: {
     refreshProjectComments,
     processProject,
     openProjectQueue,
+    releaseUnknownBatch,
     canProcessProject,
     commentsByTarget,
   };

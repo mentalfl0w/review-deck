@@ -36,6 +36,7 @@ export function createReviewEntryStatusStore(): ReviewEntryStatusStore {
     left.workspacePendingCommentCount === right.workspacePendingCommentCount &&
     left.workspaceStaleCommentCount === right.workspaceStaleCommentCount &&
     left.activeBatchCount === right.activeBatchCount &&
+    left.deliveryUnknownBatchCount === right.deliveryUnknownBatchCount &&
     left.runningAiReviewCount === right.runningAiReviewCount &&
     left.unreadAiFindingCount === right.unreadAiFindingCount;
 

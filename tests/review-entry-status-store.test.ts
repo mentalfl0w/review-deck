@@ -20,6 +20,7 @@ const status = (workspaceId: string, overrides: Partial<ReviewWorkspaceIndicator
   workspacePendingCommentCount: 0,
   workspaceStaleCommentCount: 0,
   activeBatchCount: 0,
+  deliveryUnknownBatchCount: 0,
   runningAiReviewCount: 0,
   unreadAiFindingCount: 0,
   ...overrides,
@@ -62,6 +63,10 @@ async function run(): Promise<void> {
   previousFetch.resolve(status("ws-1", { runningAiReviewCount: 9 }));
   await previousRequest;
   assert.equal(store.getStatus("ws-1")?.runningAiReviewCount, 1, "a prior plugin binding cannot publish into the new one");
+  const revisionBeforeUnknown = store.getSnapshot().revision;
+  store.setStatus("ws-1", status("ws-1", { runningAiReviewCount: 1, deliveryUnknownBatchCount: 1 }));
+  assert.equal(store.getStatus("ws-1")?.deliveryUnknownBatchCount, 1);
+  assert.equal(store.getSnapshot().revision, revisionBeforeUnknown + 1, "delivery state changes republish the metadata used by Pills and Header");
 
   const beforeFailure = store.getStatus("ws-1");
   store.bindFetcher(async () => { throw new Error("temporary RPC failure"); });

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
 import type { ProcessProjectReviewResult, ProjectReviewSummary } from "../../shared/review";
 import { anchorLocationText } from "../lineRange";
@@ -15,6 +16,7 @@ import {
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
 import { ActionButton, DropdownSelect, HoverTooltip } from "./ui";
+import { isAgentIdleForReviewDispatch } from "../agent-registry";
 
 /** Project queue with per-workspace Agent selection and batch status. */
 export function QueueModal({
@@ -37,6 +39,7 @@ export function QueueModal({
   canProcessProject,
   processingProject,
   onProcess,
+  onReleaseUnknownBatch,
   processResult,
   processError,
   projectNotice,
@@ -60,10 +63,13 @@ export function QueueModal({
   canProcessProject: boolean;
   processingProject: boolean;
   onProcess: () => void;
+  onReleaseUnknownBatch: (input: { workspaceId: string; batchId: string }) => Promise<void>;
   processResult: ProcessProjectReviewResult[] | null;
   processError: string | null;
   projectNotice: string | null;
 }) {
+  const [confirmReleaseBatchId, setConfirmReleaseBatchId] = useState<string | null>(null);
+  const [releasingBatchId, setReleasingBatchId] = useState<string | null>(null);
   const groupsWithPendingComments = workspaceGroups.filter((group) =>
     group.comments.length > 0 && !group.activeBatch,
   );
@@ -72,8 +78,14 @@ export function QueueModal({
   const needsWorkspaceAgentSelection = groupsWithPendingComments.some((group) =>
     group.eligibleAgents.length > 1 && !group.selectedAgentId,
   );
+  const noIdleWorkspaceAgent = groupsWithPendingComments.length > 0 &&
+    groupsWithPendingComments.every((group) => !group.eligibleAgents.some((agent) => isAgentIdleForReviewDispatch(agent.status)));
+  const hasBusySelectedAgent = groupsWithPendingComments.some((group) => {
+    const selected = group.eligibleAgents.find((agent) => agent.id === group.selectedAgentId);
+    return selected !== undefined && !isAgentIdleForReviewDispatch(selected.status);
+  });
   const agentLabel = (agent: ProjectReviewWorkspaceGroup["eligibleAgents"][number]) =>
-    `${agent.title ?? agent.id} · ${agent.provider ?? "?"} / ${agent.model ?? t("noAgentModel")}`;
+    `${agent.title ?? agent.id} · ${agent.provider ?? "?"} / ${agent.model ?? t("noAgentModel")} · ${isAgentIdleForReviewDispatch(agent.status) ? t("agentIdle") : t("agentBusy")}`;
   const batchStatusMessage = (batch: ProcessProjectReviewResult): string => {
     const count = batch.commentIds.length;
     if (batch.status === "running") return t("reviewBatchRunning", { count });
@@ -85,6 +97,16 @@ export function QueueModal({
     }
     if (batch.status === "failed") return t("reviewBatchFailed", { count });
     return t("reviewBatchSubmitted", { count });
+  };
+  const activeBatchStatusMessage = (batch: NonNullable<ProjectReviewWorkspaceGroup["activeBatch"]>): string => {
+    const count = batch.commentIds.length;
+    if (!batch.delivery) return t("reviewBatchLegacyDeliveryUnknown");
+    if (batch.delivery.phase === "sending") return t("reviewBatchDeliverySending");
+    if (batch.delivery.phase === "unknown") return t("reviewBatchDeliveryUnknown");
+    if (batch.delivery.phase === "prepared") return t("reviewBatchDraft", { count });
+    if (batch.delivery.phase === "rejected") return t("reviewBatchFailed", { count });
+    if (batch.status === "running") return t("reviewBatchRunning", { count });
+    return t("reviewBatchAcceptedWaiting");
   };
   return (
     <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
@@ -188,6 +210,17 @@ export function QueueModal({
                   label: agentLabel(agent),
                 }));
                 const selectedAgent = group.eligibleAgents.find((agent) => agent.id === group.selectedAgentId);
+                const hasIdleAgent = group.eligibleAgents.some((agent) => isAgentIdleForReviewDispatch(agent.status));
+                const activeBatch = group.activeBatch;
+                const workspaceId = group.workspaceId;
+                const ambiguousDelivery = activeBatch !== null && (
+                  !activeBatch.delivery ||
+                  activeBatch.delivery.phase === "sending" ||
+                  activeBatch.delivery.phase === "unknown" ||
+                  activeBatch.delivery.phase === "accepted"
+                );
+                const confirmingRelease = activeBatch?.id === confirmReleaseBatchId;
+                const releasing = activeBatch?.id === releasingBatchId;
                 return (
                   <View key={group.key} style={styles.queueGroup}>
                     <Text selectable numberOfLines={2} ellipsizeMode="middle" style={styles.routeFile}>
@@ -199,17 +232,47 @@ export function QueueModal({
                     <Text style={styles.routeMeta}>
                       {t("projectWorkspaceCommentCount", { count: group.comments.length })}
                     </Text>
-                    {group.activeBatch ? (
-                      <Text style={styles.muted}>
-                        {t(
-                          group.activeBatch.status === "draft"
-                            ? "reviewBatchDraft"
-                            : group.activeBatch.status === "running"
-                              ? "reviewBatchRunning"
-                              : "reviewBatchSubmitted",
-                          { count: group.activeBatch.commentIds.length },
-                        )}
-                      </Text>
+                    {activeBatch ? (
+                      <View style={styles.group}>
+                        <Text style={styles.muted}>{activeBatchStatusMessage(activeBatch)}</Text>
+                        {ambiguousDelivery && workspaceId ? (
+                          <View style={styles.group}>
+                            <Text style={styles.scopeDesc}>{t("reviewBatchDuplicateRiskHint")}</Text>
+                            <ActionButton
+                              variant={confirmingRelease ? "danger" : "secondary"}
+                              disabled={processingProject || releasing}
+                              label={releasing
+                                ? t("reviewBatchReleasingClaim")
+                                : confirmingRelease
+                                  ? t("reviewBatchConfirmReleaseClaim")
+                                  : t("reviewBatchReleaseClaim")}
+                              tooltip={t("reviewBatchDuplicateRiskHint")}
+                              onPress={() => {
+                                if (!activeBatch || releasing) return;
+                                if (!confirmingRelease) {
+                                  setConfirmReleaseBatchId(activeBatch.id);
+                                  return;
+                                }
+                                setConfirmReleaseBatchId(null);
+                                setReleasingBatchId(activeBatch.id);
+                                void onReleaseUnknownBatch({ batchId: activeBatch.id, workspaceId })
+                                  .finally(() => setReleasingBatchId(null));
+                              }}
+                              theme={theme}
+                              layout={layout}
+                            />
+                            {confirmingRelease ? (
+                              <ActionButton
+                                variant="ghost"
+                                label={t("reviewBatchCancelRelease")}
+                                onPress={() => setConfirmReleaseBatchId(null)}
+                                theme={theme}
+                                layout={layout}
+                              />
+                            ) : null}
+                          </View>
+                        ) : null}
+                      </View>
                     ) : group.eligibleAgents.length === 0 ? (
                       <Text style={styles.muted}>{t("processProjectNoWorkspaceAgentHint")}</Text>
                     ) : group.eligibleAgents.length === 1 ? (
@@ -230,6 +293,10 @@ export function QueueModal({
                         layout={layout}
                       />
                     )}
+                    {group.eligibleAgents.length > 0 &&
+                    (!hasIdleAgent || (selectedAgent && !isAgentIdleForReviewDispatch(selectedAgent.status))) ? (
+                      <Text style={styles.scopeDesc}>{t("agentBusyDispatchHint")}</Text>
+                    ) : null}
                   </View>
                 );
               })}
@@ -249,7 +316,9 @@ export function QueueModal({
                           ? t("processProjectNoAgentHint")
                           : needsWorkspaceAgentSelection
                             ? t("processProjectChooseWorkspaceAgentHint")
-                            : t("processProjectHint")
+                            : !canProcessProject && (noIdleWorkspaceAgent || hasBusySelectedAgent)
+                              ? t("agentBusyDispatchHint")
+                              : t("processProjectHint")
                 }
                 onPress={onProcess}
                 theme={theme}

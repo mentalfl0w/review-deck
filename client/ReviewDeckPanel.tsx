@@ -622,6 +622,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
         canProcessProject={commentsApi.canProcessProject}
         processingProject={commentsApi.processingProject}
         onProcess={() => void commentsApi.processProject()}
+        onReleaseUnknownBatch={commentsApi.releaseUnknownBatch}
         processResult={commentsApi.processResult}
         processError={commentsApi.processError}
         projectNotice={commentsApi.projectNotice}

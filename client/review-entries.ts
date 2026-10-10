@@ -9,7 +9,7 @@ import type {
   PluginHeaderButtonContribution,
 } from "@getpaseo/plugin/client";
 import type { ReviewWorkspaceIndicators } from "../shared/review-activity";
-import { openOwnedEntries, USABLE_AGENT_STATUSES, type AgentRegistry, type OwnedEntriesGateOptions } from "./agent-registry";
+import { isAgentIdleForReviewDispatch, openOwnedEntries, USABLE_AGENT_STATUSES, type AgentRegistry, type OwnedEntriesGateOptions } from "./agent-registry";
 import type { ReviewCountStore } from "./review-count-store";
 import { createReviewEntryStatusStore, type ReviewEntryStatusStore } from "./review-entry-status-store";
 import type { StringKey } from "./i18n";
@@ -137,7 +137,7 @@ function canSubmitPendingComments(
   target: PillMenuTarget,
   hasSubmitAction: boolean,
 ): boolean {
-  return (target.agentStatus === "idle" || target.agentStatus === "running") &&
+  return isAgentIdleForReviewDispatch(target.agentStatus) &&
     target.workspaceCwd !== null &&
     !target.archiving &&
     status !== null &&
@@ -161,7 +161,7 @@ function pillMenuSignature(
   target: PillMenuTarget,
   hasSubmitAction: boolean,
 ): string {
-  return `${canRunTargetedReview(status, target)}:${canSubmitPendingComments(status, target, hasSubmitAction)}`;
+  return `${canRunTargetedReview(status, target)}:${canSubmitPendingComments(status, target, hasSubmitAction)}:${status?.deliveryUnknownBatchCount ?? 0}`;
 }
 
 function pillMenuBehavior(
@@ -205,14 +205,30 @@ function pillMenuBehavior(
     },
     {
       id: "submit-pending-comments",
-      labelKey: "reviewEntrySubmitComments",
+      labelKey: !isAgentIdleForReviewDispatch(target.agentStatus)
+        ? "reviewEntrySubmitCommentsBusy"
+        : (status?.deliveryUnknownBatchCount ?? 0) > 0
+          ? "reviewEntrySubmitCommentsUnknown"
+          : "reviewEntrySubmitComments",
       icon: "Send",
       disabled: !canSubmitPendingComments(status, target, Boolean(submitPendingComments)),
       separatorBefore: true,
       onPress: async () => {
         if (!submitPendingComments) throw new Error("Workspace comment submission is unavailable.");
-        await submitPendingComments({ workspaceId: target.workspaceId, agentId: target.agentId });
-        await refreshStatus(target.workspaceId);
+        let submissionFailed = false;
+        let submissionError: unknown;
+        try {
+          await submitPendingComments({ workspaceId: target.workspaceId, agentId: target.agentId });
+        } catch (error) {
+          submissionFailed = true;
+          submissionError = error;
+        }
+        try {
+          await refreshStatus(target.workspaceId);
+        } catch (error) {
+          if (!submissionFailed) throw error;
+        }
+        if (submissionFailed) throw submissionError;
       },
     },
   ];

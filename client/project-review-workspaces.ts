@@ -1,6 +1,7 @@
 import type { ProjectReviewComment } from "../shared/review";
 import type { ActiveReviewBatch } from "../shared/review-batch";
 import type { AgentEntry, ProjectReviewWorkspaceGroup } from "./tools";
+import { isAgentIdleForReviewDispatch } from "./agent-registry";
 
 function normalizeWorkspaceCwd(value: string | null | undefined): string | null {
   if (!value) return null;
@@ -9,6 +10,14 @@ function normalizeWorkspaceCwd(value: string | null | undefined): string | null 
   return normalized.replace(/\/+$/, "");
 }
 export type WorkspaceDirectoryOwner = { workspaceId: string; directory: string };
+
+/** Whether the currently selected workspace Agent can receive this queue batch. */
+export function canSubmitProjectReviewGroup(group: ProjectReviewWorkspaceGroup): boolean {
+  if (!group.workspaceId || group.activeBatch || !group.selectedAgentId) return false;
+  const agent = group.eligibleAgents.find((candidate) => candidate.id === group.selectedAgentId);
+  if (!agent?.cwd) return false;
+  return isAgentIdleForReviewDispatch(agent.status);
+}
 
 /** Group project comments by recorded workspace. Legacy rows without a
  * workspaceId are assigned only when the full project workspace list proves

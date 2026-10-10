@@ -266,6 +266,7 @@ function workspaceIndicators(
     workspacePendingCommentCount: 0,
     workspaceStaleCommentCount: 0,
     activeBatchCount: 0,
+    deliveryUnknownBatchCount: 0,
     runningAiReviewCount: 0,
     unreadAiFindingCount: 0,
     ...overrides,
@@ -930,7 +931,7 @@ async function main() {
     const registry = createAgentRegistry({ retryDelaysMs: [] });
     registry.bind(fake.paseo);
     const agentsSubscription = fake.agents.boot(0, agentsPayload([
-      agentEntry("agent-a", { workspaceId: "ws-1" }),
+      agentEntry("agent-a", { workspaceId: "ws-1", status: "running" }),
     ]));
     await flush();
 
@@ -963,8 +964,21 @@ async function main() {
     const runItem = () => host.menuItem("review-pill-agent-a", "run-targeted-ai-review");
     const submitItem = () => host.menuItem("review-pill-agent-a", "submit-pending-comments");
     assert.equal(runItem().disabled, false);
-    assert.equal(submitItem().disabled, false);
+    assert.equal(submitItem().disabled, true, "a running Agent remains visible but cannot receive review comments");
+    assert.equal(submitItem().labelKey, "reviewEntrySubmitCommentsBusy");
     await host.selectMenuItem("review-pill-agent-a", "run-targeted-ai-review");
+    assert.deepEqual(submitted, [], "the busy submit action is not dispatched");
+    agentsSubscription.emitUpdate({
+      type: "agent_update",
+      payload: {
+        subscriptionId: "fake-sub",
+        kind: "upsert",
+        agent: agentEntry("agent-a", { workspaceId: "ws-1", status: "idle" }).agent,
+      },
+    });
+    await flush();
+    assert.equal(submitItem().disabled, false, "the submit action enables when the same Agent becomes idle");
+    assert.equal(submitItem().labelKey, "reviewEntrySubmitComments");
     await host.selectMenuItem("review-pill-agent-a", "submit-pending-comments");
     assert.deepEqual(host.opened, [
       { workspaceId: "ws-1", action: "targeted", preferredAgentId: "agent-a" },
@@ -975,6 +989,7 @@ async function main() {
       projectStaleCommentCount: 2,
       workspaceStaleCommentCount: 1,
       activeBatchCount: 1,
+      deliveryUnknownBatchCount: 1,
       runningAiReviewCount: 1,
       unreadAiFindingCount: 4,
     }));
@@ -982,6 +997,7 @@ async function main() {
     assert.equal(host.live.get("review-header-ws-1")?.contribution.button.label, "Review ⚠ 2", "stale status outranks unread findings");
     assert.equal(runItem().disabled, true);
     assert.equal(submitItem().disabled, true);
+    assert.equal(submitItem().labelKey, "reviewEntrySubmitCommentsUnknown", "an idle Agent still cannot be submitted to while delivery is unknown");
 
     statuses.setStatus("ws-1", workspaceIndicators("ws-1", "proj-1", { unreadAiFindingCount: 4 }));
     await flush();

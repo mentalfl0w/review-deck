@@ -49,7 +49,7 @@ export function useAgents(params: { selectedWorkspaceId: string; reviewCwd: stri
 
   // Workspace-scoped agents for the single-hunk flows.
   const agents = useMemo(() => workspaceScoped
-    .map(({ id, provider, model, title }): AgentInfo => ({ id, provider, model, title })),
+    .map(({ id, provider, model, title, status }): AgentInfo => ({ id, provider, model, title, status })),
   [workspaceScoped]);
   // The project queue needs eligible Agents from every workspace in the project.
   const projectAgents = useMemo(() => snapshot.agents

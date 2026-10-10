@@ -10,6 +10,7 @@ export type AgentInfo = {
   provider?: string;
   model?: string | null;
   title?: string | null;
+  status?: string;
 };
 export type AgentFeedbackState = {
   phase: "idle" | "sending" | "sent" | "error";

@@ -102,12 +102,17 @@ export type AgentRegistry = {
   readonly stopped: boolean;
 };
 
-/** Statuses an agent must be in to accept review actions. */
+/** Statuses kept visible in review surfaces; message dispatch has a stricter idle-only gate. */
 export const USABLE_AGENT_STATUSES: Record<string, true> = {
   idle: true,
   running: true,
   initializing: true,
 };
+
+/** A Review Deck message may only be sent after the Agent is confirmed idle. */
+export function isAgentIdleForReviewDispatch(status: string | null | undefined): boolean {
+  return status === "idle";
+}
 
 /** Normalize a cwd for comparison: strip trailing separators (both platforms). */
 function normalizeCwd(value: string | null | undefined): string | null {

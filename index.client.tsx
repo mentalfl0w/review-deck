@@ -21,7 +21,7 @@ import { ReviewHeaderPopover } from "./client/components/ReviewHeaderPopover";
 import { ReviewPillMenu } from "./client/components/ReviewPillMenu";
 import { ReviewHandoffTimelineItem } from "./client/components/ReviewHandoffTimelineItem";
 import { groupProjectReviewComments, type WorkspaceDirectoryOwner } from "./client/project-review-workspaces";
-import { getAgentRegistry, USABLE_AGENT_STATUSES } from "./client/agent-registry";
+import { getAgentRegistry, isAgentIdleForReviewDispatch } from "./client/agent-registry";
 import { getReviewCountStore } from "./client/review-count-store";
 import { getReviewEntryStatusStore } from "./client/review-entry-status-store";
 import { registerReviewEntries } from "./client/review-entries";
@@ -211,7 +211,7 @@ export default function contribute(client: PluginClientContext) {
     if (!group || group.comments.length === 0) return;
     if (group.activeBatch) throw new Error("This workspace already has an active ReviewBatch.");
     const agent = group.eligibleAgents.find((candidate) => candidate.id === agentId);
-    if (!agent || agent.archived || group.selectedAgentId !== agentId || USABLE_AGENT_STATUSES[agent.status ?? ""] !== true) {
+    if (!agent || agent.archived || group.selectedAgentId !== agentId || !isAgentIdleForReviewDispatch(agent.status)) {
       throw new Error("The selected Agent is no longer eligible in this workspace.");
     }
     if (!agent.cwd) throw new Error("The selected Agent has no workspace directory.");

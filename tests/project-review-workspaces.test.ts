@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createRequire, registerHooks } from "node:module";
 import { extname } from "node:path";
-import type { groupProjectReviewComments as GroupProjectReviewComments } from "../client/project-review-workspaces";
+import type {
+  canSubmitProjectReviewGroup as CanSubmitProjectReviewGroup,
+  groupProjectReviewComments as GroupProjectReviewComments,
+} from "../client/project-review-workspaces";
 import type { AgentEntry } from "../client/tools";
 import type { ProjectReviewComment } from "../shared/review";
 import type { ActiveReviewBatch } from "../shared/review-batch";
@@ -17,8 +20,10 @@ registerHooks({
 const requireFromRepo = createRequire(import.meta.url);
 const loadedProjectWorkspaceModule = requireFromRepo("../client/project-review-workspaces.ts") as {
   groupProjectReviewComments: typeof GroupProjectReviewComments;
+  canSubmitProjectReviewGroup: typeof CanSubmitProjectReviewGroup;
 };
 const groupProjectReviewComments = loadedProjectWorkspaceModule.groupProjectReviewComments;
+const canSubmitProjectReviewGroup = loadedProjectWorkspaceModule.canSubmitProjectReviewGroup;
 
 const comment = (id: string, cwd: string, workspaceId?: string): ProjectReviewComment => ({
   id,
@@ -171,4 +176,22 @@ assert.equal(noAgent[0]?.workspaceId, "workspace-orphan");
 assert.deepEqual(noAgent[0]?.eligibleAgents, []);
 assert.equal(noAgent[0]?.comments[0]?.id, "orphan", "comments without an eligible Agent stay in the queue group");
 
+const runningGroup = groupProjectReviewComments({
+  comments: [comment("busy-comment", "/repo/worktree-a", "workspace-a")],
+  batches: [],
+  agents: [{ ...agent("agent-running", "workspace-a", "/repo/worktree-a"), status: "running" }],
+  workspaceDirectoryOwners,
+  selectedAgentByWorkspace: {},
+});
+assert.equal(runningGroup[0]?.selectedAgentId, "agent-running", "busy Agents stay visible in the workspace queue");
+assert.equal(canSubmitProjectReviewGroup(runningGroup[0]!), false, "a running Agent cannot receive the queue batch");
+
+const idleGroup = groupProjectReviewComments({
+  comments: [comment("idle-comment", "/repo/worktree-a", "workspace-a")],
+  batches: [],
+  agents: [agent("agent-idle", "workspace-a", "/repo/worktree-a")],
+  workspaceDirectoryOwners,
+  selectedAgentByWorkspace: {},
+});
+assert.equal(canSubmitProjectReviewGroup(idleGroup[0]!), true, "an idle Agent can receive the queue batch");
 console.log("Project workspace batch grouping: all assertions passed");

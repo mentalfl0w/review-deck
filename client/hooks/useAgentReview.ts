@@ -17,6 +17,7 @@ import {
   type ReviewSnapshot,
 } from "../../shared/review";
 import type { AgentFeedbackMap, FileCommentEntry, ReviewFile, SelectedHunk } from "../tools";
+import { isAgentIdleForReviewDispatch } from "../agent-registry";
 import type { TFunc } from "../i18n";
 
 /** Total cap for polling a started read-only review before surfacing an error. */
@@ -109,6 +110,22 @@ export function useAgentReview(params: {
     analysisRunRef.current += 1;
     return analysisRunRef.current;
   }, []);
+  const assertReviewAgentCanReceiveMessage = useCallback(async (agentId: string) => {
+    const refreshed = await paseo.agents.ref(agentId).refresh().catch(() => null);
+    const agent = refreshed?.agent;
+    if (
+      !agent ||
+      agent.id !== agentId ||
+      agent.workspaceId !== workspaceId ||
+      agent.cwd !== reviewCwd ||
+      agent.archivedAt
+    ) {
+      throw new Error(t("agentReviewDispatchUnavailable"));
+    }
+    if (!isAgentIdleForReviewDispatch(agent.status)) {
+      throw new Error(t("agentBusyDispatchHint"));
+    }
+  }, [paseo.agents, reviewCwd, t, workspaceId]);
   const explainSelected = useCallback(async () => {
     if (!reviewCwd || !selected) return;
     const run = beginAnalysisRun();
@@ -318,6 +335,7 @@ export function useAgentReview(params: {
     ].join("\n");
     setAgentFeedback((current) => ({ ...current, [agentId]: { phase: "sending" } }));
     try {
+      await assertReviewAgentCanReceiveMessage(agentId);
       await paseo.agents.ref(agentId).send(prompt);
       setAgentFeedback((current) => ({ ...current, [agentId]: { phase: "sent" } }));
       // The comment was handed to the agent's workflow: remove it from Review
@@ -330,7 +348,7 @@ export function useAgentReview(params: {
         [agentId]: { phase: "error", message: error instanceof Error ? error.message : String(error) },
       }));
     }
-  }, [clearHunkComment, commentBody, paseo.agents, refreshProjectComments, reviewCwd, selected, snapshot]);
+  }, [assertReviewAgentCanReceiveMessage, clearHunkComment, commentBody, paseo.agents, refreshProjectComments, reviewCwd, selected, snapshot]);
 
   /**
    * File-scoped revision driven by the file comment: sends the current file
@@ -362,6 +380,7 @@ export function useAgentReview(params: {
     ].join("\n");
     setFileReviseFeedback((current) => ({ ...current, [agentId]: { phase: "sending" } }));
     try {
+      await assertReviewAgentCanReceiveMessage(agentId);
       await paseo.agents.ref(agentId).send(prompt);
       setFileReviseFeedback((current) => ({ ...current, [agentId]: { phase: "sent" } }));
       // The file comment was handed to the agent's workflow: remove the sent
@@ -375,7 +394,7 @@ export function useAgentReview(params: {
         [agentId]: { phase: "error", message: error instanceof Error ? error.message : String(error) },
       }));
     }
-  }, [activeSavedComment, clearHunkComment, commentBody, paseo.agents, refreshProjectComments, reviewCwd, selectedFile, snapshot]);
+  }, [activeSavedComment, assertReviewAgentCanReceiveMessage, clearHunkComment, commentBody, paseo.agents, refreshProjectComments, reviewCwd, selectedFile, snapshot]);
 
   // Everything analysis-related that a hunk switch discards. Called by the
   // panel's composed selectHunk; the findings disclosure stays expanded.

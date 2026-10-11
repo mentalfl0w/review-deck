@@ -1,7 +1,11 @@
-import type { ReviewLocale, ReviewSnapshot } from "../../shared/review";
-import { canonicalJson, sha256 } from "../util/crypto";
+import type { ReviewLocale, ReviewScope, ReviewSnapshot } from "../../shared/review";
+import { canonicalJson, hunkContentId, sha256 } from "../util/crypto";
 import { detectFindings } from "./FindingDetector";
 import { functionHintForHunk, languageFromPath } from "../lang/languages";
+export type DiffFindingIdentityContext = {
+  scope?: ReviewScope;
+  worktreePath?: string;
+};
 
  export type Hunk = ReviewSnapshot["files"][number]["hunks"][number];
 export function hunkFingerprint(
@@ -110,10 +114,15 @@ function filePathFromDiffHeader(line: string): { oldPath?: string; path: string 
  * target fingerprint plus the hunk's own content.
  */
 export class DiffParser {
-  parse(raw: string, targetFingerprint: string, locale: ReviewLocale = "en"): ReviewSnapshot["files"] {
+  parse(
+    raw: string,
+    targetFingerprint: string,
+    locale: ReviewLocale = "en",
+    identity: DiffFindingIdentityContext = {},
+  ): ReviewSnapshot["files"] {
     const files: ReviewSnapshot["files"] = [];
     const lines = raw.split("\n");
-    let current: { path: string; oldPath?: string; prefix: string[]; hunks: Hunk[] } | null = null;
+    let current: { path: string; oldPath?: string; prefix: string[]; hunks: Hunk[]; findingContentOccurrences: Map<string, number> } | null = null;
     let hunkHeader: string | null = null;
     let hunkLines: string[] = [];
 
@@ -126,6 +135,9 @@ export class DiffParser {
       const id = `H-${fingerprint.slice(0, 10)}`;
       const language = languageFromPath(current.path);
       const functionHint = functionHintForHunk(hunkHeader, hunkLines);
+      const anchorFingerprint = hunkContentId(current.path, patch);
+      const duplicateOrdinal = current.findingContentOccurrences.get(anchorFingerprint) ?? 0;
+      current.findingContentOccurrences.set(anchorFingerprint, duplicateOrdinal + 1);
       current.hunks.push({
         id,
         fingerprint,
@@ -134,7 +146,12 @@ export class DiffParser {
         header: hunkHeader,
         patch,
         lines: [...hunkLines],
-        findings: detectFindings(hunkLines, locale),
+        findings: detectFindings(hunkLines, locale, {
+          filePath: current.path,
+          anchorFingerprint,
+          duplicateOrdinal,
+          ...identity,
+        }),
         ...(functionHint ? { functionHint } : {}),
         ...(language ? { language } : {}),
       });
@@ -155,7 +172,7 @@ export class DiffParser {
       const fileHeader = filePathFromDiffHeader(line);
       if (fileHeader) {
         flushFile();
-        current = { path: fileHeader.path, oldPath: fileHeader.oldPath, prefix: [line], hunks: [] };
+        current = { path: fileHeader.path, oldPath: fileHeader.oldPath, prefix: [line], hunks: [], findingContentOccurrences: new Map() };
         continue;
       }
       if (!current) continue;

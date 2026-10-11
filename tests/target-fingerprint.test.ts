@@ -50,7 +50,7 @@ import {
   type ReviewSnapshot,
 } from "../shared/review";
 import { ReviewService } from "../server/ReviewService";
-import { DiffParser } from "../server/diff/DiffParser";
+import { DiffParser, type DiffFindingIdentityContext } from "../server/diff/DiffParser";
 import { StateStore, type StateEntry } from "../server/persistence/StateStore";
 
 const SNAPSHOT_RPC = "review-deck.snapshot";
@@ -60,9 +60,14 @@ const STATE_RPC = "review-deck.state";
 /** Counts parses so the test can prove the fingerprint probe never reaches the parser. */
 class CountingDiffParser extends DiffParser {
   parseCalls = 0;
-  override parse(raw: string, targetFingerprint: string, locale: ReviewLocale = "en") {
+  override parse(
+    raw: string,
+    targetFingerprint: string,
+    locale: ReviewLocale = "en",
+    identity?: DiffFindingIdentityContext,
+  ) {
     this.parseCalls += 1;
-    return super.parse(raw, targetFingerprint, locale);
+    return super.parse(raw, targetFingerprint, locale, identity);
   }
 }
 

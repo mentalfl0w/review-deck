@@ -256,6 +256,11 @@ export const verificationCommandSchema = z
   });
 export type VerificationCommand = z.infer<typeof verificationCommandSchema>;
 
+export const findingSourceSchema = z.enum(["deterministic_rule", "ai_review", "human", "verification_run"]);
+export type FindingSource = z.infer<typeof findingSourceSchema>;
+export const actionableFindingAnchorStatusSchema = z.enum(["resolved", "ambiguous", "stale", "unavailable"]);
+export type ActionableFindingAnchorStatus = z.infer<typeof actionableFindingAnchorStatusSchema>;
+
 export const reviewFindingSchema = z.object({
   id: z.string(),
   category: z.string(),
@@ -264,6 +269,10 @@ export const reviewFindingSchema = z.object({
   summary: z.string(),
   detail: z.string(),
   suggestedCheck: z.string().optional(),
+  source: findingSourceSchema.optional(),
+  originId: z.string().min(1).optional(),
+  sourceVersion: z.number().int().positive().optional(),
+  anchorFingerprint: z.string().min(1).optional(),
 });
 export const structuredReviewFindingSchema = z.object({
   hunkId: z.string().min(1).optional(),
@@ -286,6 +295,29 @@ export const structuredReviewResultSchema = z.object({
   summary: z.string().optional(),
 }).strict();
 export type StructuredReviewResult = z.infer<typeof structuredReviewResultSchema>;
+export const actionableReviewFindingSchema = z.object({
+  id: z.string().min(1),
+  source: z.literal("ai_review"),
+  reviewRunId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  sourceVersion: z.number().int().positive(),
+  scope: reviewScopeSchema,
+  targetFingerprint: z.string().min(1),
+  sourceInputFingerprint: z.string().min(1),
+  filePath: z.string().min(1),
+  hunkId: z.string().min(1).optional(),
+  severity: severitySchema,
+  evidenceKind: evidenceKindSchema,
+  category: z.string().min(1),
+  summary: z.string().min(1),
+  detail: z.string().min(1),
+  suggestedCheck: z.string().optional(),
+  verificationCommand: verificationCommandSchema.optional(),
+  verificationCommandHash: z.string().min(1).optional(),
+  anchorStatus: actionableFindingAnchorStatusSchema,
+}).strict();
+export type ActionableReviewFinding = z.infer<typeof actionableReviewFindingSchema>;
 
 export const reviewHunkSchema = z.object({
   id: z.string(),
@@ -408,6 +440,7 @@ export const explainHunkAiResultSchema = explainHunkResultSchema.extend({
   mode: z.literal("hunk").optional(),
   reviewPreset: aiReviewBudgetPresetSchema.optional(),
   usage: aiReviewUsageSchema.optional(),
+  findings: z.array(actionableReviewFindingSchema).optional(),
 });
 export type ExplainHunkAiResult = z.infer<typeof explainHunkAiResultSchema>;
 
@@ -421,6 +454,7 @@ export const pollAiReviewResultSchema = z.object({
   status: aiReviewStatusSchema,
   review: z.string(),
   sections: reviewSectionsSchema,
+  findings: z.array(actionableReviewFindingSchema).optional(),
   provider: z.string(),
   model: z.string(),
   thinkingOptionId: z.string().nullable().optional(),
@@ -637,6 +671,9 @@ export const projectReviewCommentSchema = z.object({
   savedAt: z.string(),
   anchor: reviewAnchorSchema.optional(),
   anchorState: anchorStateSchema.optional(),
+  findingSource: z.enum(["deterministic_rule", "ai_review"]).optional(),
+  sourceFindingId: z.string().min(1).optional(),
+  sourceReviewRunId: z.string().min(1).optional(),
 });
 export type ProjectReviewComment = z.infer<typeof projectReviewCommentSchema>;
 
@@ -665,6 +702,35 @@ export const getProjectReviewCommentCount = defineRpc({
   name: "review-deck.project-review-comment-count",
   input: z.object({ projectId: z.string().min(1) }),
   output: z.object({ commentCount: z.number().int().nonnegative() }),
+});
+export const promoteFindingToQueue = defineRpc({
+  name: "review-deck.promote-finding-to-queue",
+  input: z.discriminatedUnion("source", [
+    z.object({
+      source: z.literal("deterministic_rule"),
+      findingId: z.string().min(1),
+      workspaceId: z.string().min(1),
+      request: reviewRequestSchema,
+      expectedTargetFingerprint: z.string().min(1),
+      comment: z.string().trim().min(1).max(20_000),
+      confirmed: z.literal(true),
+    }).strict(),
+    z.object({
+      source: z.literal("ai_review"),
+      findingId: z.string().min(1),
+      reviewRunId: z.string().min(1),
+      agentId: z.string().min(1),
+      workspaceId: z.string().min(1),
+      expectedTargetFingerprint: z.string().min(1),
+      comment: z.string().trim().min(1).max(20_000),
+      confirmed: z.literal(true),
+    }).strict(),
+  ]),
+  output: z.object({
+    status: z.enum(["queued", "already_queued"]),
+    commentId: z.string().min(1),
+    targetFingerprint: z.string().min(1),
+  }).strict(),
 });
 
 // Submit one workspace's selected comments as a persisted ReviewBatch. Comments
@@ -840,3 +906,193 @@ export const listVerificationRuns = defineRpc({
   }).strict(),
   output: listVerificationRunsResultSchema,
 });
+// ---------------------------------------------------------------------------
+// Captured Verification Process (v2.1)
+//
+// This is separate from the interactive Terminal contract above. The process
+// mode records only the OS-observed exit state and a bounded transient output
+// tail; it never turns that state into an automatic code-review verdict.
+// ---------------------------------------------------------------------------
+
+export const processVerificationStatusSchema = z.enum([
+  "pending",
+  "running",
+  "exited",
+  "timed_out",
+  "canceled",
+  "abandoned",
+  "error",
+]);
+export type ProcessVerificationStatus = z.infer<typeof processVerificationStatusSchema>;
+
+export const processVerificationErrorCodeSchema = z.enum(["spawn_failed", "process_killed"]);
+export type ProcessVerificationErrorCode = z.infer<typeof processVerificationErrorCodeSchema>;
+
+export const processVerificationOutcomeSchema = z.enum([
+  "exit_0",
+  "exit_nonzero",
+  "timeout",
+  "canceled",
+  "unknown",
+]);
+export type ProcessVerificationOutcome = z.infer<typeof processVerificationOutcomeSchema>;
+
+export const processVerificationHumanDecisionSchema = z.enum(["accepted", "rejected"]);
+export type ProcessVerificationHumanDecision = z.infer<typeof processVerificationHumanDecisionSchema>;
+
+export const PROCESS_OUTPUT_TAIL_MAX_BYTES = 32 * 1024;
+export const PROCESS_OUTPUT_TAIL_MAX_LINES = 200;
+export const processOutputTailSchema = z.array(z.string().max(PROCESS_OUTPUT_TAIL_MAX_BYTES))
+  .max(PROCESS_OUTPUT_TAIL_MAX_LINES)
+  .superRefine((lines, context) => {
+    if (lines.reduce((total, line) => total + line.length, 0) > PROCESS_OUTPUT_TAIL_MAX_BYTES) {
+      context.addIssue({ code: "custom", message: "The captured output tail exceeds its byte bound." });
+    }
+  });
+
+export const reviewVerificationEvidenceSchema = z.object({
+  id: z.string().min(1),
+  source: z.literal("verification_run"),
+  runId: z.string().min(1),
+  reviewRunId: z.string().min(1).optional(),
+  workspaceId: z.string().min(1),
+  targetFingerprint: z.string().min(1),
+  observedTargetFingerprint: z.string().min(1).optional(),
+  targetChanged: z.boolean(),
+  commandHash: z.string().min(1),
+  observedAt: z.iso.datetime(),
+  outcome: processVerificationOutcomeSchema,
+  exitCode: z.number().int().optional(),
+  signal: z.string().min(1).optional(),
+  linkedFindingId: z.string().min(1).optional(),
+  humanDecision: processVerificationHumanDecisionSchema.optional(),
+  decisionAt: z.iso.datetime().optional(),
+}).strict().superRefine((evidence, context) => {
+  if ((evidence.humanDecision === undefined) !== (evidence.decisionAt === undefined)) {
+    context.addIssue({ code: "custom", path: ["humanDecision"], message: "A human decision and its timestamp must be recorded together." });
+  }
+  if (evidence.outcome === "exit_0" && evidence.exitCode !== 0) {
+    context.addIssue({ code: "custom", path: ["exitCode"], message: "exit_0 evidence requires an observed zero exit code." });
+  }
+  if (evidence.outcome === "exit_nonzero" && (evidence.exitCode === undefined || evidence.exitCode === 0)) {
+    context.addIssue({ code: "custom", path: ["exitCode"], message: "exit_nonzero evidence requires an observed non-zero exit code." });
+  }
+  if (
+    evidence.observedTargetFingerprint !== undefined &&
+    evidence.observedTargetFingerprint !== evidence.targetFingerprint &&
+    !evidence.targetChanged
+  ) {
+    context.addIssue({ code: "custom", path: ["targetChanged"], message: "A different observed target fingerprint must be marked stale." });
+  }
+});
+export type ReviewVerificationEvidence = z.infer<typeof reviewVerificationEvidenceSchema>;
+
+export const processVerificationResultSchema = z.object({
+  runId: z.string().min(1),
+  reviewRunId: z.string().min(1).optional(),
+  status: processVerificationStatusSchema,
+  workspaceId: z.string().min(1),
+  projectId: z.string().min(1),
+  targetFingerprint: z.string().min(1),
+  observedTargetFingerprint: z.string().min(1).optional(),
+  findingId: z.string().min(1).optional(),
+  commandHash: z.string().min(1),
+  commandPreview: z.string().min(1),
+  startedAt: z.iso.datetime().optional(),
+  completedAt: z.iso.datetime().optional(),
+  exitCode: z.number().int().optional(),
+  signal: z.string().min(1).optional(),
+  errorCode: processVerificationErrorCodeSchema.optional(),
+  /** Bounded, transient process output; never written to the run store. */
+  outputTail: processOutputTailSchema.optional(),
+  outputTruncated: z.boolean().optional(),
+  targetChanged: z.boolean(),
+  evidence: reviewVerificationEvidenceSchema,
+}).strict().superRefine((result, context) => {
+  if (result.workspaceId !== result.evidence.workspaceId) {
+    context.addIssue({ code: "custom", path: ["evidence", "workspaceId"], message: "Evidence must belong to the same workspace as its run." });
+  }
+  if (result.targetFingerprint !== result.evidence.targetFingerprint) {
+    context.addIssue({ code: "custom", path: ["evidence", "targetFingerprint"], message: "Evidence must preserve the run's original target fingerprint." });
+  }
+  if (result.observedTargetFingerprint !== result.evidence.observedTargetFingerprint) {
+    context.addIssue({ code: "custom", path: ["evidence", "observedTargetFingerprint"], message: "Evidence and run must report the same observed target fingerprint." });
+  }
+  if (result.targetChanged !== result.evidence.targetChanged) {
+    context.addIssue({ code: "custom", path: ["evidence", "targetChanged"], message: "Evidence and run must agree on target staleness." });
+  }
+  if (result.commandHash !== result.evidence.commandHash) {
+    context.addIssue({ code: "custom", path: ["evidence", "commandHash"], message: "Evidence must preserve the exact command identity." });
+  }
+  if (result.reviewRunId !== result.evidence.reviewRunId) {
+    context.addIssue({ code: "custom", path: ["evidence", "reviewRunId"], message: "Evidence must preserve the source ReviewRun identity." });
+  }
+  if (result.findingId !== result.evidence.linkedFindingId) {
+    context.addIssue({ code: "custom", path: ["evidence", "linkedFindingId"], message: "Evidence must preserve the source Finding identity." });
+  }
+});
+export type ProcessVerificationResult = z.infer<typeof processVerificationResultSchema>;
+
+export const startCapturedVerificationInputSchema = z.object({
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  reviewRunId: z.string().min(1),
+  findingId: z.string().min(1),
+  expectedTargetFingerprint: z.string().min(1),
+  expectedCommandHash: z.string().min(1),
+  confirmed: z.literal(true),
+}).strict();
+export type StartCapturedVerificationInput = z.infer<typeof startCapturedVerificationInputSchema>;
+export const startCapturedVerification = defineRpc({
+  name: "review-deck.start-captured-verification",
+  input: startCapturedVerificationInputSchema,
+  output: processVerificationResultSchema,
+});
+
+export const pollCapturedVerificationInputSchema = z.object({
+  runId: z.string().min(1),
+  workspaceId: z.string().min(1),
+}).strict();
+export type PollCapturedVerificationInput = z.infer<typeof pollCapturedVerificationInputSchema>;
+export const pollCapturedVerification = defineRpc({
+  name: "review-deck.poll-captured-verification",
+  input: pollCapturedVerificationInputSchema,
+  output: processVerificationResultSchema,
+});
+
+export const cancelCapturedVerification = defineRpc({
+  name: "review-deck.cancel-captured-verification",
+  input: pollCapturedVerificationInputSchema,
+  output: processVerificationResultSchema,
+});
+
+export const listCapturedVerificationsInputSchema = z.object({
+  workspaceId: z.string().min(1),
+}).strict();
+export type ListCapturedVerificationsInput = z.infer<typeof listCapturedVerificationsInputSchema>;
+export const listCapturedVerificationsResultSchema = z.object({
+  runs: z.array(processVerificationResultSchema),
+  targetChanged: z.boolean(),
+  supported: z.boolean(),
+}).strict();
+export type ListCapturedVerificationsResult = z.infer<typeof listCapturedVerificationsResultSchema>;
+export const listCapturedVerifications = defineRpc({
+  name: "review-deck.list-captured-verifications",
+  input: listCapturedVerificationsInputSchema,
+  output: listCapturedVerificationsResultSchema,
+});
+
+export const decideCapturedVerificationEvidenceInputSchema = z.object({
+  runId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  expectedTargetFingerprint: z.string().min(1),
+  decision: processVerificationHumanDecisionSchema,
+  confirmed: z.literal(true),
+}).strict();
+export type DecideCapturedVerificationEvidenceInput = z.infer<typeof decideCapturedVerificationEvidenceInputSchema>;
+export const decideCapturedVerificationEvidence = defineRpc({
+  name: "review-deck.decide-captured-verification-evidence",
+  input: decideCapturedVerificationEvidenceInputSchema,
+  output: processVerificationResultSchema,
+});
+

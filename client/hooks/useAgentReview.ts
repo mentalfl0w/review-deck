@@ -7,11 +7,13 @@ import {
   pollAiReview,
   startExplainHunkAi,
   startRunReview,
+  type ActionableReviewFinding,
   type ExplainHunkAiResult,
   type ExplainHunkResult,
   type PollAiReviewResult,
   type ReviewLocale,
   type AiReviewDepth,
+  type ReviewRequest,
   type ReviewScope,
   type ReviewSections,
   type ReviewSnapshot,
@@ -87,6 +89,7 @@ export function useAgentReview(params: {
   const [aiExplainBusy, setAiExplainBusy] = useState<string | null>(null);
   const [agentReview, setAgentReview] = useState<string | null>(null);
   const [agentSections, setAgentSections] = useState<ReviewSections | null>(null);
+  const [agentReviewFindings, setAgentReviewFindings] = useState<ActionableReviewFinding[] | undefined>(undefined);
   const [agentReviewMeta, setAgentReviewMeta] = useState<AiReviewDisplayMetadata | null>(null);
   const [agentReviewBusy, setAgentReviewBusy] = useState(false);
   const [agentFeedback, setAgentFeedback] = useState<AgentFeedbackMap>({});
@@ -199,7 +202,6 @@ export function useAgentReview(params: {
       const result = await pollAiReviewRpc({ requestId, workspaceId: boundWorkspaceId, agentId: boundAgentId });
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       if (result.status !== "running") {
-        // Narrowed here: this is the only place the non-running invariant is known.
         apply(result as SettledPollResult);
         return;
       }
@@ -216,16 +218,19 @@ export function useAgentReview(params: {
     if (!reviewCwd || !selected) return;
     const run = beginAnalysisRun();
     const requestedLocale = localeRef.current;
+    const reviewRequest: ReviewRequest = {
+      cwd: reviewCwd,
+      scope,
+      locale: requestedLocale,
+      ...(scope === "commits" ? { baseRef, headRef } : {}),
+      ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
+    };
     setActionError(null);
     setAiExplainBusy(agentId);
     try {
       const { requestId } = await startExplainHunkAiRpc({
-        cwd: reviewCwd,
+        ...reviewRequest,
         workspaceId,
-        scope,
-        locale: requestedLocale,
-        ...(scope === "commits" ? { baseRef, headRef } : {}),
-        ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
         hunkId: selected.id,
         agentId,
       });
@@ -243,6 +248,7 @@ export function useAgentReview(params: {
           ...(result.mode === "hunk" ? { mode: "hunk" as const } : {}),
           usage: result.usage,
           reviewPreset: result.reviewPreset,
+          ...(result.findings ? { findings: result.findings } : {}),
         });
         setFindingsOpen(true);
         setStale(false);
@@ -264,26 +270,31 @@ export function useAgentReview(params: {
     const requestedLocale = localeRef.current;
     const selectedFilePath = requestFilePath?.trim() ?? "";
     const targetPath = selectedFilePath || filePath.trim();
+    const reviewRequest: ReviewRequest = {
+      cwd: reviewCwd,
+      scope,
+      locale: requestedLocale,
+      ...(scope === "commits" ? { baseRef, headRef } : {}),
+      ...(targetPath ? { filePath: targetPath } : {}),
+    };
     setActionError(null);
     setAgentReview(null);
     setAgentSections(null);
     setAgentReviewMeta(null);
+    setAgentReviewFindings(undefined);
     setAgentReviewBusy(true);
     try {
       const { requestId } = await startRunReviewRpc({
-        cwd: reviewCwd,
-        workspaceId,
-        scope,
+        ...reviewRequest,
         reviewMode: selectedFilePath ? "file" : "target",
-        locale: requestedLocale,
-        ...(scope === "commits" ? { baseRef, headRef } : {}),
-        ...(targetPath ? { filePath: targetPath } : {}),
         ...(reviewDepthOverride ? { reviewDepthOverride } : {}),
         agentId,
+        workspaceId,
       });
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       await pollUntilDone(requestId, run, requestedLocale, workspaceId, agentId, (result) => {
         setAgentReview(result.review);
+        setAgentReviewFindings(result.findings);
         setAgentSections(result.sections);
         setAgentReviewMeta({
           provider: result.provider,
@@ -408,6 +419,7 @@ export function useAgentReview(params: {
     setAgentReview(null);
     setAgentSections(null);
     setAgentReviewMeta(null);
+    setAgentReviewFindings(undefined);
     setAgentReviewBusy(false);
     setStale(false);
     setAgentFeedback({});
@@ -423,6 +435,7 @@ export function useAgentReview(params: {
     agentReview,
     agentSections,
     agentReviewMeta,
+    agentReviewFindings,
     agentReviewBusy,
     agentFeedback,
     fileReviseFeedback,

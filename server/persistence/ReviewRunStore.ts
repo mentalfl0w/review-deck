@@ -10,6 +10,7 @@ import {
   aiReviewPermissionModeSchema,
   aiReviewResultSourceSchema,
   reviewLocaleSchema,
+  reviewScopeSchema,
 } from "../../shared/review";
 import { createMutex, type Mutex } from "../util/mutex";
 
@@ -91,6 +92,14 @@ export const reviewRunSchema = z
     reviewPreset: aiReviewBudgetPresetSchema.optional(),
     cacheEnabled: z.boolean(),
     inputFingerprint: z.string().min(1).optional(),
+    /** The reviewed target identity only; no request content or patch is stored. */
+    targetFingerprint: z.string().min(1).optional(),
+    /** Request identity only; never includes the workspace cwd or review content. */
+    scope: reviewScopeSchema.optional(),
+    baseRef: z.string().min(1).optional(),
+    headRef: z.string().min(1).optional(),
+    filePath: z.string().min(1).optional(),
+    hunkId: z.string().min(1).optional(),
     // Recovery compares these against the running build, so a float, a string,
     // or 0 (which no prompt/schema pair uses) is a damaged record.
     promptVersion: z.number().int().positive(),

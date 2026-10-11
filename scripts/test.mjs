@@ -30,6 +30,8 @@ await run(process.execPath, ["--experimental-strip-types", "tests/review-entry-s
 await run(process.execPath, ["--experimental-strip-types", "tests/state-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/line-range-selection.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-prompt.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/finding-rules.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/finding-identity.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/ai-review-cache.test.ts"]);
 await run(process.execPath, [tsc, "-p", "tests/tsconfig.git-runner.json"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-git-runner-tests/tests/git-runner.test.js"]);
@@ -37,6 +39,8 @@ await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-s
 await run(process.execPath, ["--experimental-strip-types", "tests/review-run-store.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/structured-review.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/verification-terminal.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/verification-process-core.test.ts"]);
+await run(process.execPath, ["--experimental-strip-types", "tests/verification-process-service.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/review-batch-prompt.test.ts"]);
 await run(process.execPath, ["--experimental-strip-types", "tests/project-review-workspaces.test.ts"]);
 await run(process.execPath, [tsc, "-p", "tests/tsconfig.target-fingerprint.json"]);

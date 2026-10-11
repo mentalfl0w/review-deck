@@ -177,6 +177,9 @@ export function QueueModal({
                             <View key={comment.id} style={styles.queueComment}>
                               <Text selectable numberOfLines={4} style={styles.body}>{comment.comment}</Text>
                               <View style={styles.savedMetaRow}>
+                                <Text style={styles.routeMeta}>
+                                  {t(comment.findingSource === "deterministic_rule" ? "findingSourceRule" : comment.findingSource === "ai_review" ? "findingSourceAi" : "findingSourceHuman")}
+                                </Text>
                                 {comment.anchor ? (
                                   <Text selectable numberOfLines={1} ellipsizeMode="middle" style={styles.anchorMeta}>
                                     {anchorLocationText(t, comment.anchor, comment.hunkHeader)}

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import type {
+  ActionableReviewFinding,
   ExplainHunkAiResult,
   ExplainHunkResult,
   LineRangeSelection,
@@ -32,7 +33,8 @@ import {
 import { viewModeKeys } from "../tools";
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
-import { ActionButton, Segmented, SeverityBadge, StringGroup } from "./ui";
+import { ActionButton, FindingGroup, Segmented, SeverityBadge, StringGroup } from "./ui";
+import type { CapturedVerificationUi, FindingGroupEntry, FindingPromotionResult } from "./ui";
 import { HunkCard } from "./HunkCard";
 import { FileView } from "./FileView";
 import { CommentSheet } from "./CommentSheet";
@@ -42,7 +44,7 @@ import { VerificationCommands } from "./VerificationCommands";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentFindings, onPromoteFinding, capturedVerification, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -84,6 +86,9 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   aiExplanation: ExplainHunkAiResult | null;
   agentReview: string | null;
   agentSections: ReviewSections | null;
+  agentFindings: ActionableReviewFinding[] | undefined;
+  onPromoteFinding?: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
+  capturedVerification?: CapturedVerificationUi;
   verificationRuns: Readonly<Record<string, PollVerificationRunResult>>;
   verificationEnabled: boolean;
   onRunVerification: (suggestion: ReviewVerificationSuggestion) => Promise<void>;
@@ -155,6 +160,7 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   );
   const selectedLineRange = lineSelectionRange(lineSelection);
   const selectionLabel = selectedLineRange ? lineSelectionLocationText(t, selectedLineRange) : null;
+  const visibleAgentFindings = agentFindings?.filter((finding) => finding.filePath === selectedFile.path) ?? [];
   const reanchorTo = (issue: ReviewAnchorIssue, candidate: ReviewAnchor | null) => {
     // No candidate: the manual path, anchored to what the user selected in the
     // diff right now (the card only offers it for the same file).
@@ -316,6 +322,9 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             onLineTap={onLineTap}
             onClearSelection={onClearLineSelection}
             onCommentSelection={onCommentLineSelection}
+            onPromoteFinding={onPromoteFinding}
+            promotionEnabled={verificationEnabled}
+            capturedVerification={capturedVerification}
           />
         )}
 
@@ -329,6 +338,7 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             {agentReviewMeta ? <AiReviewMeta details={agentReviewMeta} showUsage={showAiReviewUsage} t={t} styles={styles} /> : null}
             {agentSections && (
               agentSections.summary ||
+              agentFindings !== undefined ||
               agentSections.verifiedFacts.length > 0 ||
               agentSections.aiInference.length > 0 ||
               agentSections.humanVerificationRecommended.length > 0 ||
@@ -336,9 +346,21 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             ) ? (
               <>
                 {agentSections.summary ? <Text selectable style={styles.scopeDesc}>{agentSections.summary}</Text> : null}
-                <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
-                <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
-                <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
+                {agentFindings !== undefined ? (
+                  visibleAgentFindings.length > 0 ? (
+                    <>
+                      <FindingGroup label={t("findingsVerified")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "verified_fact")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
+                      <FindingGroup label={t("findingsInference")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "ai_inference")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
+                      <FindingGroup label={t("findingsHuman")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "human_verification_recommended")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
+                    </>
+                  ) : <Text style={styles.muted}>{t("noFindings")}</Text>
+                ) : (
+                  <>
+                    <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
+                    <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
+                    <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
+                  </>
+                )}
                 <VerificationCommands
                   theme={theme}
                   layout={layout}

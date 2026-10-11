@@ -53,6 +53,7 @@ async function run(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "review-deck-ai-review-"));
   let cachePath: string | undefined;
   let runStorePath: string | undefined;
+  let reviewStatePath: string | undefined;
   const activityPaths: string[] = [];
   try {
     git(root, "init", "-q");
@@ -255,10 +256,14 @@ async function run(): Promise<void> {
     const runsFilePath = join(tmpdir(), `review-deck-ai-runs-${randomUUID()}.json`);
     runStorePath = runsFilePath;
     const runStore = new ReviewRunStore(runsFilePath);
+    const reviewStateFilePath = join(tmpdir(), `review-deck-ai-state-${randomUUID()}.json`);
+    reviewStatePath = reviewStateFilePath;
+    const reviewStateStore = new StateStore(reviewStateFilePath);
     const createService = () => new ReviewService({
       settings: settings as unknown as ReviewDeckSettingsHandle,
       aiReviewCacheStore: cacheStore,
       reviewRunStore: runStore,
+      store: reviewStateStore,
     });
     const service = createService();
     const pollWith = (targetService: ReviewService, requestId: string) => targetService.pollAiReview({
@@ -1069,11 +1074,112 @@ async function run(): Promise<void> {
     assert.ok(cachedStamp?.completedAt, "a cache hit gets its completion time on the first poll");
     assert.equal(cachedStamp?.findingCount, 3);
     assert.equal(cachedStamp?.highRiskFindingCount, 0);
+    // Finding IDs are server-validated against the current target. Promotion is
+    // idempotent and respects the existing one-comment-per-Hunk invariant.
+    parentWorkspaceId = "workspace-1";
+    parentProvider = "parent-provider";
+    parentAvailableModes = [{ id: "plan", label: "Plan", description: "Read-only review" }];
+    workspaceRecord = { id: "workspace-1", projectId: "project-1", workspaceDirectory: root };
+    workspaceListEntries = [{ id: "workspace-1", workspaceDirectory: root }];
+    failWorkspaceList = false;
+    workspaceListPageHasMore = false;
+    currentSettings = {
+      ...currentSettings,
+      reviewerStrategy: "custom",
+      reviewerProvider: "review-provider",
+      reviewerModel: "review-model",
+      aiReviewCacheEnabled: false,
+    };
+    providerEntries = [{
+      provider: "review-provider",
+      label: "Review Provider",
+      enabled: true,
+      status: "ready",
+      models: [{
+        provider: "review-provider",
+        id: "review-model",
+        label: "Review Model",
+        isSelectable: true,
+        defaultThinkingOptionId: "balanced",
+        thinkingOptions: [{ id: "balanced", label: "Balanced" }, { id: "deep", label: "Deep" }],
+      }],
+      modes: [{ id: "plan", label: "Plan", description: "Read-only review" }],
+    }];
+    const promotionSnapshot = await service.createSnapshot(fileInput);
+    const promotionHunk = promotionSnapshot.files.find((file) => file.path === "a.ts")?.hunks[0];
+    assert.ok(promotionHunk);
+    responseQueue.push(JSON.stringify({
+      summary: "Review summary",
+      findings: [{
+        hunkId: promotionHunk.id,
+        filePath: "a.ts",
+        severity: "high",
+        evidenceKind: "ai_inference",
+        category: "behavior",
+        summary: "The edited export may break a caller.",
+        detail: "The new public declaration changes the API surface.",
+      }],
+    }));
+    const promotionStart = await service.startRunReview(fileInput, context);
+    const promotionPoll = await poll(promotionStart.requestId);
+    assert.equal(promotionPoll.status, "idle");
+    assert.equal(promotionPoll.findings?.length, 1);
+    const actionable = promotionPoll.findings?.[0];
+    assert.ok(actionable);
+    assert.equal(actionable.anchorStatus, "resolved");
+    assert.equal(actionable.targetFingerprint, promotionSnapshot.targetFingerprint);
+    const aiPromotionInput = {
+      source: "ai_review" as const,
+      findingId: actionable.id,
+      reviewRunId: promotionStart.requestId,
+      agentId: "parent-agent",
+      workspaceId: "workspace-1",
+      expectedTargetFingerprint: actionable.targetFingerprint,
+      comment: "Human-edited queue comment.",
+      confirmed: true as const,
+    };
+    const promoted = await service.promoteFindingToQueue(aiPromotionInput, context);
+    assert.equal(promoted.status, "queued");
+    const promotedEntry = Object.values(await reviewStateStore.load()).flat().find((entry) => entry.id === promoted.commentId);
+    assert.equal(promotedEntry?.comment, "Human-edited queue comment.");
+    assert.equal(promotedEntry?.findingSource, "ai_review");
+    assert.equal(promotedEntry?.sourceFindingId, actionable.id);
+    assert.equal(promotedEntry?.sourceReviewRunId, promotionStart.requestId);
+
+    const repeatedPromotion = await service.promoteFindingToQueue(aiPromotionInput, context);
+    assert.equal(repeatedPromotion.status, "already_queued");
+    assert.equal(repeatedPromotion.commentId, promoted.commentId);
+
+    const ruleFinding = promotionHunk.findings.find((finding) => finding.source === "deterministic_rule");
+    assert.ok(ruleFinding);
+    const conflictingPromotion = await service.promoteFindingToQueue({
+      source: "deterministic_rule",
+      findingId: ruleFinding.id,
+      workspaceId: "workspace-1",
+      request: { cwd: root, scope: "working", filePath: "a.ts", locale: "en" },
+      expectedTargetFingerprint: promotionSnapshot.targetFingerprint,
+      comment: "This must not overwrite the AI comment.",
+      confirmed: true,
+    }, context);
+    assert.equal(conflictingPromotion.status, "already_queued");
+    assert.equal(conflictingPromotion.commentId, promoted.commentId);
+    assert.equal((await reviewStateStore.load())[promotionSnapshot.targetFingerprint]?.find((entry) => entry.id === promoted.commentId)?.comment, "Human-edited queue comment.");
+
+    await writeFile(join(root, "a.ts"), "export const stable = 1;\\nexport const AI_REVIEW_PATCH_SENTINEL = 2;\\nexport const changedAgain = 3;\\n");
+    const stalePoll = await poll(promotionStart.requestId);
+    assert.equal(stalePoll.findings?.[0]?.anchorStatus, "stale");
+    await assert.rejects(
+      service.promoteFindingToQueue(aiPromotionInput, context),
+      /stale|target changed/i,
+      "a Finding cannot be promoted after its target changes",
+    );
+    assert.equal(Object.values(await reviewStateStore.load()).flat().filter((entry) => entry.decision === "commented").length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
     if (cachePath) await rm(cachePath, { force: true });
     if (runStorePath) await rm(runStorePath, { force: true });
     for (const path of activityPaths) await rm(path, { force: true });
+    if (reviewStatePath) await rm(reviewStatePath, { force: true });
   }
 }
 

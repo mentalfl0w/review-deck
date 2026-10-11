@@ -14,6 +14,7 @@ import { useReviewActions } from "./hooks/useReviewActions";
 import { useAgentReview } from "./hooks/useAgentReview";
 import { useFileView } from "./hooks/useFileView";
 import { useVerification } from "./hooks/useVerification";
+import { useProcessVerification } from "./hooks/useProcessVerification";
 import { ContextBar } from "./components/ContextBar";
 import { FileNavigator } from "./components/FileNavigator";
 import { FileDetail } from "./components/FileDetail";
@@ -171,6 +172,12 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     enabled: Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale),
     onError: setActionError,
     onTargetChanged: snapshotApi.setStale,
+  });
+  const processVerificationApi = useProcessVerification({
+    workspaceId: scopeApi.selectedWorkspaceId,
+    targetFingerprint: snapshotApi.snapshot?.targetFingerprint ?? null,
+    enabled: Boolean(scopeApi.selectedWorkspaceId),
+    onError: setActionError,
   });
   useEffect(() => {
     if (!snapshotApi.snapshot) return;
@@ -472,6 +479,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
       aiExplanation={agentApi.aiExplanation}
       agentReview={agentApi.agentReview}
       agentSections={agentApi.agentSections}
+      agentFindings={agentApi.agentReviewFindings}
+      capturedVerification={processVerificationApi}
+      onPromoteFinding={actionsApi.promoteFinding}
       agentReviewMeta={agentApi.agentReviewMeta}
       agentReviewBusy={agentApi.agentReviewBusy}
       verificationRuns={verificationApi.runs}

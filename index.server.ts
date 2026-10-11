@@ -16,7 +16,12 @@ import {
   listProjectReviewComments,
   listReviewStates,
   pollAiReview,
+  promoteFindingToQueue,
   pollVerificationRun,
+  cancelCapturedVerification,
+  decideCapturedVerificationEvidence,
+  listCapturedVerifications,
+  pollCapturedVerification,
   listVerificationRuns,
   processProjectReview,
   releaseUnknownReviewBatch,
@@ -25,6 +30,7 @@ import {
   startExplainHunkAi,
   startRunReview,
   startVerificationRun,
+  startCapturedVerification,
 } from "./shared/review";
 import { reviewDeckSettings } from "./shared/review-settings";
 import {
@@ -51,9 +57,15 @@ export default function contribute(server: PluginServerContext) {
   server.handle(startExplainHunkAi, async (input, context) => reviewService.startExplainHunkAi(input, context));
   server.handle(startRunReview, async (input, context) => reviewService.startRunReview(input, context));
   server.handle(pollAiReview, async (input, context) => reviewService.pollAiReview(input, context));
+  server.handle(promoteFindingToQueue, async (input, context) => reviewService.promoteFindingToQueue(input, context));
   server.handle(startVerificationRun, async (input, context) => reviewService.startVerificationRun(input, context));
   server.handle(pollVerificationRun, async (input, context) => reviewService.pollVerificationRun(input, context));
   server.handle(listVerificationRuns, async (input, context) => reviewService.listVerificationRuns(input, context));
+  server.handle(startCapturedVerification, async (input, context) => reviewService.startCapturedVerification(input, context));
+  server.handle(pollCapturedVerification, async (input, context) => reviewService.pollCapturedVerification(input, context));
+  server.handle(cancelCapturedVerification, async (input, context) => reviewService.cancelCapturedVerification(input, context));
+  server.handle(listCapturedVerifications, async (input, context) => reviewService.listCapturedVerifications(input, context));
+  server.handle(decideCapturedVerificationEvidence, async (input, context) => reviewService.decideCapturedVerificationEvidence(input, context));
   server.handle(clearAiReviewCache, async () => ({
     cleared: await reviewService.clearAiReviewCache(),
   }));

@@ -3,6 +3,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { PluginHandlerContext, PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type {
+  ActionableReviewFinding,
   AiReviewDepth,
   AiReviewBudgetPreset,
   AiReviewMode,
@@ -10,12 +11,17 @@ import type {
   AiReviewResultSource,
   AiReviewUsage,
   AnchorState,
+  DecideCapturedVerificationEvidenceInput,
   ExplainHunkResult,
   LineRangeSelection,
+  ListCapturedVerificationsInput,
+  ListCapturedVerificationsResult,
   PollAiReviewResult,
+  PollCapturedVerificationInput,
   PollVerificationRunResult,
   ListVerificationRunsResult,
   ProcessProjectReviewResult,
+  ProcessVerificationResult,
   ProjectReviewComment,
   ProjectReviewSummary,
   ReviewAnchor,
@@ -28,7 +34,9 @@ import type {
   ReviewStateCurrentHunk,
   ReviewStateDecision,
   ReviewStateResult,
+  StartCapturedVerificationInput,
   StartVerificationRunResult,
+  StructuredReviewFinding,
   FileViewRow,
 } from "../shared/review";
 import { aiReviewPresetDefaultDepth } from "../shared/review";
@@ -92,6 +100,9 @@ import {
   reviewSectionsFromMarkdown,
 } from "./structured-review";
 import { VerificationRunStore } from "./persistence/VerificationRunStore";
+import { ProcessVerificationStore } from "./persistence/ProcessVerificationStore";
+import { ProcessRunner } from "./verification/ProcessRunner";
+import { ProcessVerificationService, PROCESS_VERIFICATION_TTL_MS } from "./verification/ProcessVerificationService";
 import {
   VerificationService,
   type ListVerificationRunsInput,
@@ -109,6 +120,8 @@ export interface ReviewServiceDependencies {
   reviewBatchStore?: ReviewBatchStore;
   reviewRunStore?: ReviewRunStore;
   verificationRunStore?: VerificationRunStore;
+  processVerificationStore?: ProcessVerificationStore;
+  processRunner?: ProcessRunner;
   diffParser?: DiffParser;
   repoMutexes?: RepoMutexRegistry;
   gitFactory?: (cwd: string) => GitRunner;
@@ -190,7 +203,8 @@ type TransientReviewChildHandle = {
 };
 type TransientReviewEntry = {
   handle: TransientReviewChildHandle | null;
-  cachedResult?: Pick<AiReviewCacheEntry, "review" | "sections" | "usage">;
+  cachedResult?: Pick<AiReviewCacheEntry, "review" | "sections" | "usage" | "structuredFindings">;
+  structuredFindings?: StructuredReviewFinding[];
   locale: ReviewLocale | undefined;
   provider: string;
   model: string | null;
@@ -206,7 +220,10 @@ type TransientReviewEntry = {
   cacheKey: string;
   inputFingerprint: string;
   thinkingOptionId: string | null;
+  targetFingerprint?: string;
+  reviewRequest?: ReviewRunRequestMetadata;
 };
+type ReviewRunRequestMetadata = Pick<ReviewRequest, "scope" | "baseRef" | "headRef" | "filePath"> & { hunkId?: string };
 type ReviewRunRecoveryResult =
   | { kind: "restored"; entry: TransientReviewEntry }
   | { kind: "retry"; run: ReviewRun }
@@ -374,6 +391,7 @@ export class ReviewService {
   private readonly sendingReviewBatchIds = new Set<string>();
   private readonly reviewRunStore: ReviewRunStore;
   private readonly verifications: VerificationService;
+  private readonly processVerifications: ProcessVerificationService;
   private readonly reviewBatchTimelineMutex = createMutex();
   private readonly diffParser: DiffParser;
   private readonly repoMutexes: RepoMutexRegistry;
@@ -439,6 +457,8 @@ export class ReviewService {
       ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
       cacheEnabled: entry.cacheEnabled,
       inputFingerprint: entry.inputFingerprint,
+      ...(entry.targetFingerprint ? { targetFingerprint: entry.targetFingerprint } : {}),
+      ...(entry.reviewRequest ?? {}),
       promptVersion: AI_REVIEW_PROMPT_VERSION,
       schemaVersion: AI_REVIEW_SCHEMA_VERSION,
     };
@@ -466,6 +486,16 @@ export class ReviewService {
       cacheEnabled: run.cacheEnabled,
       cacheKey: run.cacheKey,
       inputFingerprint: run.inputFingerprint,
+      ...(run.targetFingerprint ? { targetFingerprint: run.targetFingerprint } : {}),
+      ...(run.scope !== undefined ? {
+        reviewRequest: {
+          scope: run.scope,
+          ...(run.baseRef ? { baseRef: run.baseRef } : {}),
+          ...(run.headRef ? { headRef: run.headRef } : {}),
+          ...(run.filePath ? { filePath: run.filePath } : {}),
+          ...(run.hunkId ? { hunkId: run.hunkId } : {}),
+        },
+      } : {}),
       thinkingOptionId: run.thinkingOptionId,
     };
   }
@@ -531,6 +561,7 @@ export class ReviewService {
         review: cached.review,
         sections: cached.sections,
         usage: cached.usage,
+        ...(cached.structuredFindings ? { structuredFindings: cached.structuredFindings } : {}),
       });
       this.transientReviewAgents.set(run.requestId, entry);
       return { kind: "restored", entry };
@@ -557,6 +588,7 @@ export class ReviewService {
             review: cached.review,
             sections: cached.sections,
             usage: cached.usage,
+            ...(cached.structuredFindings ? { structuredFindings: cached.structuredFindings } : {}),
           });
           this.transientReviewAgents.set(run.requestId, entry);
           return { kind: "restored", entry };
@@ -662,6 +694,14 @@ export class ReviewService {
       sameDirectory: (left, right) => this.directoriesMatch(left, right),
       workspaceIdentity: (workspaceId, context) => this.resolveWorkspaceIdentity(workspaceId, context),
     });
+    this.processVerifications = new ProcessVerificationService({
+      store: dependencies.processVerificationStore,
+      runner: dependencies.processRunner,
+      reviewedTarget: (request) => this.verificationTarget(request),
+      sameDirectory: (left, right) => this.directoriesMatch(left, right),
+      workspaceIdentity: (workspaceId, context) => this.resolveWorkspaceIdentity(workspaceId, context),
+      trustedFinding: (input, context) => this.resolveTrustedAiFinding(input, context),
+    });
   }
 
   /**
@@ -711,10 +751,49 @@ export class ReviewService {
   ): Promise<ListVerificationRunsResult> {
     return this.verifications.list(input, context);
   }
+  async startCapturedVerification(
+    input: StartCapturedVerificationInput,
+    context: PluginHandlerContext,
+  ): Promise<ProcessVerificationResult> {
+    return this.processVerifications.start(input, context);
+  }
+
+  async pollCapturedVerification(
+    input: PollCapturedVerificationInput,
+    context: PluginHandlerContext,
+  ): Promise<ProcessVerificationResult> {
+    return this.processVerifications.poll(input, context);
+  }
+
+  async cancelCapturedVerification(
+    input: PollCapturedVerificationInput,
+    context: PluginHandlerContext,
+  ): Promise<ProcessVerificationResult> {
+    return this.processVerifications.cancel(input, context);
+  }
+
+  async listCapturedVerifications(
+    input: ListCapturedVerificationsInput,
+    context: PluginHandlerContext,
+  ): Promise<ListCapturedVerificationsResult> {
+    return this.processVerifications.list(input, context);
+  }
+
+  async decideCapturedVerificationEvidence(
+    input: DecideCapturedVerificationEvidenceInput,
+    context: PluginHandlerContext,
+  ): Promise<ProcessVerificationResult> {
+    return this.processVerifications.decide(input, context);
+  }
 
   async createSnapshot(request: ReviewRequest): Promise<ReviewSnapshot> {
     const { target, targetFingerprint, untracked } = await this.fingerprintTarget(request);
-    const files = this.diffParser.parse(await this.diffFor(request, target, untracked), targetFingerprint, request.locale ?? "en");
+    const files = this.diffParser.parse(
+      await this.diffFor(request, target, untracked),
+      targetFingerprint,
+      request.locale ?? "en",
+      { scope: request.scope, worktreePath: target.worktreePath },
+    );
     const totalHunks = files.reduce((total, file) => total + file.hunks.length, 0);
     const priorityHunks = files.reduce(
       (total, file) => total + file.hunks.filter((hunk) => hunk.findings.some((finding) => severityRank(finding.severity) >= 4)).length,
@@ -957,6 +1036,11 @@ export class ReviewService {
       // A damaged verification store is left as it is; maintenance keeps going.
       console.error("[Review Deck] Could not prune verification runs.", error);
     }
+    try {
+      await this.processVerifications.prune(PROCESS_VERIFICATION_TTL_MS);
+    } catch (error) {
+      console.error("[Review Deck] Could not prune captured verification runs.", error);
+    }
     return removed;
   }
 
@@ -974,11 +1058,12 @@ export class ReviewService {
   }
 
   /**
-   * Refuse new verification runs before the plugin daemon session closes. The
-   * workspace terminals themselves stay open for the user to inspect or close.
+   * Stop new verification work before the plugin daemon session closes; the
+   * interactive Terminal remains workspace-owned and the captured runner
+   * terminates its own process groups.
    */
   async dispose(): Promise<void> {
-    await this.verifications.stop();
+    await Promise.all([this.verifications.stop(), this.processVerifications.stop()]);
   }
 
   /**
@@ -1051,6 +1136,13 @@ export class ReviewService {
         this.removeSupersededComment(file, input, input.supersedes);
       }
       const entries = file[input.targetFingerprint] ?? [];
+      const previousComment = input.decision === "commented"
+        ? entries.find((entry) =>
+          entry.hunkId === input.hunkId &&
+          entry.decision === "commented" &&
+          Boolean(entry.comment?.trim()),
+        )
+        : undefined;
       const next = entries.filter((entry) => entry.hunkId !== input.hunkId);
       next.push({
         id: randomUUID(),
@@ -1068,6 +1160,9 @@ export class ReviewService {
         contentId,
         anchor,
         anchorState: "exact",
+        ...(previousComment?.findingSource ? { findingSource: previousComment.findingSource } : {}),
+        ...(previousComment?.sourceFindingId ? { sourceFindingId: previousComment.sourceFindingId } : {}),
+        ...(previousComment?.sourceReviewRunId ? { sourceReviewRunId: previousComment.sourceReviewRunId } : {}),
         ...(input.projectName ? { projectName: input.projectName } : {}),
         ...(input.projectRootPath ? { projectRootPath: input.projectRootPath } : {}),
         ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
@@ -1080,6 +1175,198 @@ export class ReviewService {
       return savedAt;
     });
   }
+  async promoteFindingToQueue(
+    input:
+      | {
+          source: "deterministic_rule";
+          findingId: string;
+          workspaceId: string;
+          request: ReviewRequest;
+          expectedTargetFingerprint: string;
+          comment: string;
+          confirmed: true;
+        }
+      | {
+          source: "ai_review";
+          findingId: string;
+          reviewRunId: string;
+          agentId: string;
+          workspaceId: string;
+          expectedTargetFingerprint: string;
+          comment: string;
+          confirmed: true;
+        },
+    context: PluginHandlerContext,
+  ): Promise<{ status: "queued" | "already_queued"; commentId: string; targetFingerprint: string }> {
+    const identity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
+    let request: ReviewRequest;
+    let run: ReviewRun | null = null;
+    if (input.source === "deterministic_rule") {
+      if (!(await this.directoriesMatch(identity.directory, input.request.cwd))) {
+        throw new Error(`Review request directory does not belong to workspace ${input.workspaceId}.`);
+      }
+      request = { ...input.request, cwd: identity.directory };
+    } else {
+      run = await this.reviewRunStore.get(input.reviewRunId);
+      if (
+        !run ||
+        run.status !== "completed" ||
+        run.workspaceId !== identity.workspaceId ||
+        run.parentAgentId !== input.agentId ||
+        run.targetFingerprint !== input.expectedTargetFingerprint ||
+        !run.inputFingerprint ||
+        run.scope === undefined
+      ) {
+        throw new Error("The AI finding no longer matches a completed review in this workspace and target.");
+      }
+      request = {
+        cwd: identity.directory,
+        scope: run.scope,
+        ...(run.baseRef ? { baseRef: run.baseRef } : {}),
+        ...(run.headRef ? { headRef: run.headRef } : {}),
+        ...(run.filePath ? { filePath: run.filePath } : {}),
+      };
+    }
+    const snapshot = await this.createSnapshot(request);
+    if (snapshot.targetFingerprint !== input.expectedTargetFingerprint) {
+      throw new Error("The finding is stale because the reviewed target changed. Refresh Review Deck and review it again.");
+    }
+
+    let hunkId: string;
+    if (input.source === "deterministic_rule") {
+      const matches = snapshot.files.flatMap((file) =>
+        file.hunks.flatMap((hunk) =>
+          hunk.findings
+            .filter((finding) => finding.id === input.findingId && finding.source === "deterministic_rule")
+            .map(() => hunk.id),
+        ),
+      );
+      if (matches.length !== 1) {
+        throw new Error(matches.length > 1
+          ? "This rule finding has more than one matching anchor. Choose a specific hunk and refresh."
+          : "This rule finding is no longer present in the current target.");
+      }
+      hunkId = matches[0]!;
+    } else {
+      let entry = this.transientReviewAgents.get(input.reviewRunId);
+      if (!entry) {
+        const recovery = await this.restoreTransientReviewEntry(
+          { requestId: input.reviewRunId, workspaceId: identity.workspaceId, agentId: input.agentId },
+          context,
+        );
+        if (recovery.kind === "restored") entry = recovery.entry;
+      }
+      let structuredFindings = entry?.structuredFindings ?? entry?.cachedResult?.structuredFindings;
+      if (!entry || !structuredFindings) {
+        const result = await this.pollAiReview({
+          requestId: input.reviewRunId,
+          workspaceId: identity.workspaceId,
+          agentId: input.agentId,
+        }, context);
+        entry = this.transientReviewAgents.get(input.reviewRunId);
+        structuredFindings = entry?.structuredFindings ?? entry?.cachedResult?.structuredFindings;
+        if (result.status !== "idle" || !structuredFindings) {
+          throw new Error("This review has no validated structured finding to add. Markdown-only results cannot be promoted.");
+        }
+      }
+      if (
+        !entry ||
+        entry.targetFingerprint !== snapshot.targetFingerprint ||
+        entry.inputFingerprint !== run?.inputFingerprint
+      ) {
+        throw new Error("The AI finding no longer matches its stored review input and target.");
+      }
+      const actionable = await this.actionableAiFindings(
+        input.reviewRunId,
+        entry,
+        structuredFindings,
+        context,
+      );
+      const finding = actionable?.find((candidate) => candidate.id === input.findingId);
+      if (!finding) throw new Error("The AI finding is not part of this review run.");
+      if (finding.anchorStatus !== "resolved" || !finding.hunkId) {
+        throw new Error(finding.anchorStatus === "ambiguous"
+          ? "The AI finding has an ambiguous anchor. Re-anchor it manually before adding it to the queue."
+          : finding.anchorStatus === "stale"
+            ? "The AI finding is stale. Refresh the review before adding it to the queue."
+            : "The AI finding has no usable hunk anchor and cannot be added automatically.");
+      }
+      hunkId = finding.hunkId;
+    }
+
+    const target = await this.resolveReviewTarget(request);
+    return this.repoMutexes.run(target.gitDir, async () => {
+      const current = await this.createSnapshot(request);
+      if (current.targetFingerprint !== snapshot.targetFingerprint) {
+        throw new Error("The finding became stale before it could be queued. Refresh Review Deck and review it again.");
+      }
+      const hunk = current.files.flatMap((file) => file.hunks).find((candidate) => candidate.id === hunkId);
+      if (!hunk) throw new Error("The finding anchor is no longer present in the current target.");
+      return this.store.runExclusive(async () => {
+        const state = await this.store.load();
+        const sourceReviewRunId = input.source === "ai_review" ? input.reviewRunId : undefined;
+        const existingFinding = Object.values(state).flat().find((entry) =>
+          entry.findingSource === input.source &&
+          entry.sourceFindingId === input.findingId &&
+          entry.projectId === identity.projectId &&
+          entry.workspaceId === identity.workspaceId &&
+          entry.cwd === identity.directory &&
+          entry.scope === request.scope &&
+          entry.targetFingerprint === current.targetFingerprint,
+        );
+        if (existingFinding?.id) {
+          return { status: "already_queued" as const, commentId: existingFinding.id, targetFingerprint: current.targetFingerprint };
+        }
+        const entries = state[current.targetFingerprint] ?? [];
+        const occupied = entries.find((entry) =>
+          entry.hunkId === hunk.id &&
+          entry.decision === "commented" &&
+          Boolean(entry.comment?.trim()),
+        );
+        if (occupied?.id) {
+          return { status: "already_queued" as const, commentId: occupied.id, targetFingerprint: current.targetFingerprint };
+        }
+        const savedAt = new Date().toISOString();
+        const contentId = hunkContentId(hunk.filePath, hunk.patch);
+        const commentId = randomUUID();
+        const next = entries.filter((entry) => entry.hunkId !== hunk.id);
+        next.push({
+          id: commentId,
+          projectId: identity.projectId,
+          workspaceId: identity.workspaceId,
+          targetFingerprint: current.targetFingerprint,
+          hunkId: hunk.id,
+          hunkFingerprint: hunk.fingerprint,
+          contentId,
+          filePath: hunk.filePath,
+          hunkHeader: hunk.header,
+          hunkPatch: hunk.patch,
+          cwd: identity.directory,
+          scope: request.scope,
+          ...(request.baseRef ? { baseRef: request.baseRef } : {}),
+          ...(request.headRef ? { headRef: request.headRef } : {}),
+          decision: "commented",
+          comment: input.comment.trim(),
+          anchor: {
+            kind: "hunk",
+            filePath: hunk.filePath,
+            hunkId: hunk.id,
+            hunkFingerprint: hunk.fingerprint,
+            contentId,
+          },
+          anchorState: "exact",
+          findingSource: input.source,
+          sourceFindingId: input.findingId,
+          ...(sourceReviewRunId ? { sourceReviewRunId } : {}),
+          savedAt,
+        });
+        state[current.targetFingerprint] = next;
+        await this.store.save(state);
+        return { status: "queued" as const, commentId, targetFingerprint: current.targetFingerprint };
+      });
+    });
+  }
+
 
   /**
    * Remove exactly the comment a re-anchor supersedes. The source is the entry
@@ -1952,6 +2239,9 @@ export class ReviewService {
       comment.savedAt,
       comment.anchor ?? null,
       comment.anchorState ?? null,
+      comment.findingSource ?? null,
+      comment.sourceFindingId ?? null,
+      comment.sourceReviewRunId ?? null,
     ]);
   }
 
@@ -2770,6 +3060,12 @@ export class ReviewService {
       settings,
       context,
     );
+    const reviewRequest: ReviewRunRequestMetadata = {
+      scope: input.scope,
+      ...(input.baseRef ? { baseRef: input.baseRef } : {}),
+      ...(input.headRef ? { headRef: input.headRef } : {}),
+      ...(input.filePath ? { filePath: input.filePath } : {}),
+    };
     return {
       requestId: await this.startAiReviewRequest({
         snapshot,
@@ -2779,6 +3075,7 @@ export class ReviewService {
         agentId: input.agentId,
         workspaceId: input.workspaceId,
         locale: input.locale,
+        reviewRequest,
       }, context),
     };
   }
@@ -2843,6 +3140,7 @@ export class ReviewService {
       agentId: string;
       workspaceId: string;
       locale: ReviewLocale | undefined;
+      reviewRequest: ReviewRunRequestMetadata;
     },
     context: PluginHandlerContext,
   ): Promise<string> {
@@ -2887,7 +3185,12 @@ export class ReviewService {
         const requestId = randomUUID();
         const entry: TransientReviewEntry = {
           handle: null,
-          cachedResult: { review: cached.review, sections: cached.sections, usage: cached.usage },
+          cachedResult: {
+            review: cached.review,
+            sections: cached.sections,
+            usage: cached.usage,
+            ...(cached.structuredFindings ? { structuredFindings: cached.structuredFindings } : {}),
+          },
           locale: input.locale,
           provider: reviewer.provider,
           model: reviewer.model,
@@ -2902,6 +3205,8 @@ export class ReviewService {
           cacheEnabled: true,
           cacheKey,
           inputFingerprint: prompt.inputFingerprint,
+          targetFingerprint: input.snapshot.targetFingerprint,
+          reviewRequest: input.reviewRequest,
           thinkingOptionId: reviewer.thinkingOptionId,
         };
         await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "completed"));
@@ -2923,6 +3228,8 @@ export class ReviewService {
       cacheEnabled: settings.aiReviewCacheEnabled,
       cacheKey,
       inputFingerprint: prompt.inputFingerprint,
+      targetFingerprint: input.snapshot.targetFingerprint,
+      reviewRequest: input.reviewRequest,
     }, context);
   }
 
@@ -3134,6 +3441,8 @@ export class ReviewService {
       cacheEnabled: boolean;
       cacheKey: string;
       inputFingerprint: string;
+      targetFingerprint: string;
+      reviewRequest: ReviewRunRequestMetadata;
     },
     context: PluginHandlerContext,
   ): Promise<string> {
@@ -3155,6 +3464,8 @@ export class ReviewService {
       cacheEnabled: input.cacheEnabled,
       cacheKey: input.cacheKey,
       inputFingerprint: input.inputFingerprint,
+      targetFingerprint: input.targetFingerprint,
+      reviewRequest: input.reviewRequest,
       thinkingOptionId: input.reviewer.thinkingOptionId,
     };
     await this.reviewRunStore.create(this.toReviewRun(requestId, entry, null, "running"));
@@ -3341,6 +3652,158 @@ export class ReviewService {
       console.error(`review-deck: could not update the timeline row for AI review ${input.requestId}`, error);
     }
   }
+  private async actionableAiFindings(
+    reviewRunId: string,
+    entry: TransientReviewEntry,
+    structuredFindings: readonly StructuredReviewFinding[],
+    context: PluginHandlerContext,
+  ): Promise<ActionableReviewFinding[] | undefined> {
+    const targetFingerprint = entry.targetFingerprint;
+    const sourceInputFingerprint = entry.inputFingerprint;
+    const requestMetadata = entry.reviewRequest;
+    if (!targetFingerprint || !sourceInputFingerprint || !requestMetadata) return undefined;
+    let snapshot: ReviewSnapshot | null = null;
+    try {
+      const identity = await this.resolveWorkspaceIdentity(entry.workspaceId, context);
+      snapshot = await this.createSnapshot({ cwd: identity.directory, ...requestMetadata });
+    } catch {
+      snapshot = null;
+    }
+    const targetMatches = snapshot?.targetFingerprint === targetFingerprint;
+    return structuredFindings.map((finding) => {
+      const files = snapshot?.files.filter((file) => file.path === finding.filePath) ?? [];
+      const file = files.length === 1 ? files[0] : undefined;
+      let hunkId = finding.hunkId;
+      let anchorStatus: ActionableReviewFinding["anchorStatus"] = "unavailable";
+      if (!snapshot) {
+        anchorStatus = "unavailable";
+      } else if (!targetMatches) {
+        anchorStatus = "stale";
+      } else if (!file) {
+        anchorStatus = files.length > 1 ? "ambiguous" : "unavailable";
+      } else if (hunkId) {
+        const matches = file.hunks.filter((hunk) => hunk.id === hunkId);
+        anchorStatus = matches.length === 1 ? "resolved" : matches.length > 1 ? "ambiguous" : "unavailable";
+      } else if (file.hunks.length === 1) {
+        hunkId = file.hunks[0]!.id;
+        anchorStatus = "resolved";
+      } else {
+        anchorStatus = file.hunks.length > 1 ? "ambiguous" : "unavailable";
+      }
+      const verificationCommandHash = finding.verificationCommand
+        ? sha256(canonicalJson({
+          executable: finding.verificationCommand.executable,
+          args: finding.verificationCommand.args,
+        }))
+        : undefined;
+      const normalizedMatch = canonicalJson({
+        category: finding.category,
+        severity: finding.severity,
+        evidenceKind: finding.evidenceKind,
+        summary: finding.summary.trim().replace(/\s+/g, " ").toLowerCase(),
+        detail: finding.detail.trim().replace(/\s+/g, " ").toLowerCase(),
+        verificationCommandHash: verificationCommandHash ?? null,
+      });
+      const sourceVersion = AI_REVIEW_SCHEMA_VERSION;
+      return {
+        id: `AF-${sha256(canonicalJson({
+          source: "ai_review",
+          reviewRunId,
+          sourceVersion,
+          sourceInputFingerprint,
+          filePath: finding.filePath,
+          hunkId: finding.hunkId ?? null,
+          normalizedMatch,
+        })).slice(0, 20)}`,
+        source: "ai_review",
+        reviewRunId,
+        workspaceId: entry.workspaceId,
+        agentId: entry.agentId,
+        sourceVersion,
+        scope: requestMetadata.scope,
+        targetFingerprint,
+        sourceInputFingerprint,
+        filePath: finding.filePath,
+        ...(hunkId ? { hunkId } : {}),
+        severity: finding.severity,
+        evidenceKind: finding.evidenceKind,
+        category: finding.category,
+        summary: finding.summary,
+        detail: finding.detail,
+        ...(finding.suggestedCheck !== undefined ? { suggestedCheck: finding.suggestedCheck } : {}),
+        ...(finding.verificationCommand ? { verificationCommand: finding.verificationCommand } : {}),
+        ...(verificationCommandHash ? { verificationCommandHash } : {}),
+        anchorStatus,
+      };
+    });
+  }
+  private async resolveTrustedAiFinding(
+    input: {
+      workspaceId: string;
+      agentId: string;
+      reviewRunId: string;
+      findingId: string;
+      expectedTargetFingerprint: string;
+    },
+    context: PluginHandlerContext,
+  ): Promise<{ finding: ActionableReviewFinding; request: ReviewRunRequestMetadata } | null> {
+    const run = await this.reviewRunStore.get(input.reviewRunId);
+    if (
+      !run ||
+      run.status !== "completed" ||
+      run.workspaceId !== input.workspaceId ||
+      run.parentAgentId !== input.agentId ||
+      run.targetFingerprint !== input.expectedTargetFingerprint ||
+      !run.inputFingerprint ||
+      run.scope === undefined
+    ) return null;
+
+    let entry = this.transientReviewAgents.get(input.reviewRunId);
+    if (!entry) {
+      const recovery = await this.restoreTransientReviewEntry({
+        requestId: input.reviewRunId,
+        workspaceId: input.workspaceId,
+        agentId: input.agentId,
+      }, context);
+      if (recovery.kind === "restored") entry = recovery.entry;
+    }
+    let structuredFindings = entry?.structuredFindings ?? entry?.cachedResult?.structuredFindings;
+    if (!entry || !structuredFindings) {
+      const result = await this.pollAiReview({
+        requestId: input.reviewRunId,
+        workspaceId: input.workspaceId,
+        agentId: input.agentId,
+      }, context);
+      entry = this.transientReviewAgents.get(input.reviewRunId);
+      structuredFindings = entry?.structuredFindings ?? entry?.cachedResult?.structuredFindings;
+      if (result.status !== "idle" || !structuredFindings) return null;
+    }
+    if (
+      !entry ||
+      entry.workspaceId !== input.workspaceId ||
+      entry.agentId !== input.agentId ||
+      entry.targetFingerprint !== run.targetFingerprint ||
+      entry.inputFingerprint !== run.inputFingerprint ||
+      !entry.reviewRequest ||
+      entry.reviewRequest.scope !== run.scope ||
+      entry.reviewRequest.baseRef !== run.baseRef ||
+      entry.reviewRequest.headRef !== run.headRef ||
+      entry.reviewRequest.filePath !== run.filePath ||
+      entry.reviewRequest.hunkId !== run.hunkId
+    ) return null;
+
+    const findings = await this.actionableAiFindings(input.reviewRunId, entry, structuredFindings, context);
+    const finding = findings?.find((candidate) => candidate.id === input.findingId);
+    if (
+      !finding ||
+      finding.anchorStatus !== "resolved" ||
+      !finding.verificationCommand ||
+      !finding.verificationCommandHash
+    ) return null;
+    return { finding, request: entry.reviewRequest };
+  }
+
+
 
   /**
    * Polls a one-shot reviewer. Cache hits use the same request capability and
@@ -3430,10 +3893,19 @@ export class ReviewService {
         completedAt: stored?.completedAt ?? completedAt,
         ...findingCounts,
       }, context);
+      const findings = entry.cachedResult.structuredFindings
+        ? await this.actionableAiFindings(
+          input.requestId,
+          entry,
+          entry.cachedResult.structuredFindings,
+          context,
+        )
+        : undefined;
       return {
         status: "idle",
         review: entry.cachedResult.review,
         sections: entry.cachedResult.sections,
+        ...(findings !== undefined ? { findings } : {}),
         provider: entry.provider,
         model: entry.model ?? "unknown",
         thinkingOptionId: entry.thinkingOptionId,
@@ -3521,6 +3993,7 @@ export class ReviewService {
       ? parseStructuredReviewResult(assistantText)
       : null;
     const normalizedStructured = structured ? normalizeStructuredReviewResult(structured) : null;
+    entry.structuredFindings = structured?.findings;
     const review = normalizedStructured?.review ??
       assistantText ??
       result.error ??
@@ -3541,6 +4014,7 @@ export class ReviewService {
           sections,
           ...(entry.depth ? { depth: entry.depth } : {}),
           ...(usage ? { usage } : {}),
+          ...(structured ? { structuredFindings: structured.findings } : {}),
         });
       } catch {
         // A successful review remains usable even when the optional cache is unavailable.
@@ -3573,6 +4047,7 @@ export class ReviewService {
         review,
         sections,
         ...(usage ? { usage } : {}),
+        ...(structured ? { structuredFindings: structured.findings } : {}),
       };
     } else {
       this.transientReviewAgents.delete(input.requestId);
@@ -3589,6 +4064,16 @@ export class ReviewService {
       mode: entry.mode,
       ...(entry.depth ? { depth: entry.depth } : {}),
       ...(entry.reviewPreset ? { reviewPreset: entry.reviewPreset } : {}),
+      ...(structured
+        ? {
+          findings: await this.actionableAiFindings(
+            input.requestId,
+            entry,
+            structured.findings,
+            context,
+          ) ?? [],
+        }
+        : {}),
       ...(usage ? { usage } : {}),
     };
   }
@@ -3622,6 +4107,13 @@ export class ReviewService {
       settings,
       context,
     );
+    const reviewRequest: ReviewRunRequestMetadata = {
+      scope: input.scope,
+      ...(input.baseRef ? { baseRef: input.baseRef } : {}),
+      ...(input.headRef ? { headRef: input.headRef } : {}),
+      ...(input.filePath ? { filePath: input.filePath } : {}),
+      hunkId: input.hunkId,
+    };
     return {
       requestId: await this.startAiReviewRequest({
         snapshot,
@@ -3631,6 +4123,7 @@ export class ReviewService {
         agentId: input.agentId,
         workspaceId: input.workspaceId,
         locale: input.locale,
+        reviewRequest,
       }, context),
     };
   }
@@ -3898,6 +4391,9 @@ export class ReviewService {
       savedAt: source.savedAt,
       ...(source.anchor ? { anchor: source.anchor } : {}),
       ...(source.anchorState ? { anchorState: source.anchorState } : {}),
+      ...(source.findingSource ? { findingSource: source.findingSource } : {}),
+      ...(source.sourceFindingId ? { sourceFindingId: source.sourceFindingId } : {}),
+      ...(source.sourceReviewRunId ? { sourceReviewRunId: source.sourceReviewRunId } : {}),
     };
   }
 

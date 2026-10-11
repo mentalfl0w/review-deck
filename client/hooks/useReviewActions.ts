@@ -7,16 +7,20 @@ import {
   clearReviewState,
   hunkDecision,
   listReviewStates,
+  promoteFindingToQueue,
   rejectHunk,
   revertFile,
+  type ActionableReviewFinding,
   type LineRangeSelection,
   type ReviewAnchorIssue,
+  type ReviewRequest,
   type ReviewScope,
   type ReviewSnapshot,
   type ReviewStateResult,
 } from "../../shared/review";
 import type {
   FileCommentDraft,
+  Finding,
   ProjectIdentity,
   ReviewDecision,
   ReviewFile,
@@ -91,6 +95,7 @@ export function useReviewActions(params: {
   const listStatesRpc = useRpc(listReviewStates);
   const clearAllRpc = useRpc(clearAllReviewStates);
   const revertFileRpc = useRpc(revertFile);
+  const promoteFindingRpc = useRpc(promoteFindingToQueue);
   const [revertNotice, setRevertNotice] = useState<string | null>(null);
   const [reanchorBusyIssueId, setReanchorBusyIssueId] = useState<string | null>(null);
   const [reanchorNotice, setReanchorNotice] = useState<string | null>(null);
@@ -176,6 +181,54 @@ export function useReviewActions(params: {
       setActionError(error instanceof Error ? error.message : String(error));
     }
   }, [baseRef, decisionRpc, effectiveProjectId, headRef, projectIdentity, refresh, refreshProjectComments, reviewCwd, scope, selected, selectedFileComments, selectedWorkspaceId, snapshot]);
+  const promoteFinding = useCallback(async (
+    finding: Finding | ActionableReviewFinding,
+    comment: string,
+  ) => {
+    if (!reviewCwd || !snapshot) throw new Error("Refresh Review Deck before adding this finding to the queue.");
+    let result;
+    if (
+      finding.source === "ai_review" &&
+      "reviewRunId" in finding &&
+      "agentId" in finding &&
+      "anchorStatus" in finding
+    ) {
+      if (finding.anchorStatus !== "resolved") {
+        throw new Error("This AI finding has no current, unambiguous anchor.");
+      }
+      result = await promoteFindingRpc({
+        source: "ai_review",
+        findingId: finding.id,
+        reviewRunId: finding.reviewRunId,
+        agentId: finding.agentId,
+        workspaceId: selectedWorkspaceId,
+        expectedTargetFingerprint: finding.targetFingerprint,
+        comment,
+        confirmed: true,
+      });
+    } else if (finding.source === "deterministic_rule") {
+      const request: ReviewRequest = {
+        cwd: reviewCwd,
+        scope,
+        ...(scope === "commits" ? { baseRef, headRef } : {}),
+        ...(filePath.trim() ? { filePath: filePath.trim() } : {}),
+      };
+      result = await promoteFindingRpc({
+        source: "deterministic_rule",
+        findingId: finding.id,
+        workspaceId: selectedWorkspaceId,
+        request,
+        expectedTargetFingerprint: snapshot.targetFingerprint,
+        comment,
+        confirmed: true,
+      });
+    } else {
+      throw new Error("Only current Rule or AI findings can be added to the queue.");
+    }
+    void refresh();
+    void refreshProjectComments();
+    return result;
+  }, [baseRef, filePath, headRef, promoteFindingRpc, refresh, refreshProjectComments, reviewCwd, scope, selectedWorkspaceId, snapshot]);
 
   /** File-level review: one decision record per hunk of the selected file so
    * the navigator's all-hunks-reviewed grouping flips immediately. Hunks that
@@ -562,6 +615,7 @@ export function useReviewActions(params: {
     commentAnchorMoveArmed,
     currentHunkHasComment,
     markReviewed,
+    promoteFinding,
     markFileReviewed,
     revertFileReview,
     revertNotice,

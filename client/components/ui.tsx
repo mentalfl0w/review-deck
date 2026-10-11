@@ -1,5 +1,11 @@
 import { Children, cloneElement, useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactElement, type ReactNode, type RefObject } from "react";
-import { Modal, Pressable, ScrollView, Text, View, type ViewStyle } from "react-native";
+import { Modal, Pressable, ScrollView, Text, TextInput, View, type ViewStyle } from "react-native";
+import {
+  formatVerificationCommand,
+  type ActionableReviewFinding,
+  type ProcessVerificationHumanDecision,
+  type ProcessVerificationResult,
+} from "../../shared/review";
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
 import { severityColor, withAlpha, type Finding, type PanelLayout, type PanelTheme, type Severity } from "../tools";
@@ -682,27 +688,363 @@ export function StringGroup({ label, items, t, styles }: {
   );
 }
 
-export function FindingGroup({ label, findings, t, theme, styles }: {
-  label: string;
-  findings: Finding[];
+export type FindingGroupEntry = Finding | ActionableReviewFinding;
+export type FindingPromotionResult = { status: "queued" | "already_queued" };
+
+function FindingPromotionButton({ finding, t, theme, layout, styles, disabled, onPromote }: {
+  finding: FindingGroupEntry;
   t: TFunc;
   theme: PanelTheme;
+  layout: PanelLayout;
   styles: PanelStyles;
+  disabled: boolean;
+  onPromote: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const initialComment = [
+    finding.summary,
+    finding.detail,
+    ...(finding.suggestedCheck ? [t("checkSuggestion", { check: finding.suggestedCheck })] : []),
+  ].join("\n\n");
+  const submit = async () => {
+    if (busy || !comment.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await onPromote(finding, comment.trim());
+      setNotice(t(result.status === "queued" ? "findingQueued" : "findingAlreadyQueued"));
+      setOpen(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <ActionButton
+        variant="ghost"
+        label={t("findingAddToQueue")}
+        tooltip={t("findingAddToQueueHint")}
+        disabled={disabled}
+        onPress={() => {
+          setComment(initialComment);
+          setNotice(null);
+          setError(null);
+          setOpen(true);
+        }}
+        theme={theme}
+        layout={layout}
+      />
+      {notice ? <Text style={styles.muted}>{notice}</Text> : null}
+      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+        <Pressable style={styles.centeredModalWrap} onPress={() => setOpen(false)}>
+          <Pressable onPress={(event) => event.stopPropagation()} style={styles.centeredModal}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>{t("findingPromotionTitle")}</Text>
+              <Pressable accessibilityRole="button" onPress={() => setOpen(false)} style={styles.topButton}>
+                <Text style={styles.topButtonText}>{t("cancel")}</Text>
+              </Pressable>
+            </View>
+            <View style={styles.modalBody}>
+              <Text style={styles.scopeDesc}>{t("findingPromotionHint")}</Text>
+              <TextInput
+                value={comment}
+                onChangeText={setComment}
+                multiline
+                editable={!busy}
+                accessibilityLabel={t("findingPromotionTitle")}
+                placeholder={t("commentPlaceholder")}
+                placeholderTextColor={theme.colors.foregroundMuted}
+                style={[styles.input, styles.commentInput]}
+              />
+              {error ? <Text style={styles.errorText}>{error}</Text> : null}
+              <View style={styles.actionRow}>
+                <ActionButton
+                  variant="ghost"
+                  label={t("cancel")}
+                  tooltip={t("cancel")}
+                  disabled={busy}
+                  onPress={() => setOpen(false)}
+                  theme={theme}
+                  layout={layout}
+                />
+                <ActionButton
+                  variant="primary"
+                  label={busy ? t("findingPromotionSaving") : t("findingPromotionConfirm")}
+                  tooltip={t("findingPromotionHint")}
+                  disabled={busy || !comment.trim()}
+                  onPress={() => void submit()}
+                  theme={theme}
+                  layout={layout}
+                />
+              </View>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </>
+  );
+}
+export type CapturedVerificationUi = {
+  runs: Readonly<Record<string, ProcessVerificationResult>>;
+  supported: boolean | null;
+  start(finding: ActionableReviewFinding): Promise<ProcessVerificationResult>;
+  refresh(runId: string): Promise<ProcessVerificationResult>;
+  cancel(runId: string): Promise<ProcessVerificationResult>;
+  decide(runId: string, decision: ProcessVerificationHumanDecision): Promise<ProcessVerificationResult>;
+};
+
+function CapturedProcessButton({ finding, controls, t, theme, layout, styles, disabled }: {
+  finding: ActionableReviewFinding;
+  controls: CapturedVerificationUi;
+  t: TFunc;
+  theme: PanelTheme;
+  layout: PanelLayout;
+  styles: PanelStyles;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const run = controls.runs[finding.id];
+  const command = finding.verificationCommand;
+  if (!command || !finding.verificationCommandHash) return null;
+  const commandPreview = formatVerificationCommand(command);
+  const pending = run?.status === "pending" || run?.status === "running";
+  const outcomeKey = run?.evidence.outcome === "exit_0"
+    ? "verificationCapturedExitZero"
+    : run?.evidence.outcome === "exit_nonzero"
+      ? "verificationCapturedExitNonzero"
+      : run?.evidence.outcome === "timeout"
+        ? "verificationCapturedTimeout"
+        : run?.evidence.outcome === "canceled"
+          ? "verificationCapturedCanceled"
+          : "verificationCapturedUnknown";
+  const statusKey = run?.status === "pending"
+    ? "verificationCapturedPending"
+    : run?.status === "running"
+      ? "verificationCapturedRunning"
+      : run?.status === "exited"
+        ? outcomeKey
+        : run?.status === "timed_out"
+          ? "verificationCapturedTimeout"
+          : run?.status === "canceled"
+            ? "verificationCapturedCanceled"
+            : run?.status === "abandoned"
+              ? "verificationCapturedAbandoned"
+              : run?.status === "error"
+                ? "verificationCapturedError"
+                : null;
+  const perform = async (action: () => Promise<ProcessVerificationResult>) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await action();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <View style={styles.analysisBlock}>
+      {controls.supported === true ? (
+        <ActionButton
+          variant="secondary"
+          label={t("verificationCapturedRun")}
+          tooltip={t("verificationCapturedConfirmHint")}
+          disabled={disabled || busy || pending}
+          onPress={() => {
+            setError(null);
+            setOpen(true);
+          }}
+          theme={theme}
+          layout={layout}
+        />
+      ) : (
+        <Text style={styles.muted}>{t(controls.supported === false ? "verificationCapturedUnsupported" : "verificationCapturedCheckingHost")}</Text>
+      )}
+      {run && statusKey ? (
+        <View style={styles.modalSection}>
+          <Text style={styles.groupLabel}>{t("findingSourceExecuted")}</Text>
+          <Text selectable style={[styles.routeMeta, { writingDirection: "ltr", textAlign: "left" }]}>{run.commandPreview}</Text>
+          <Text style={run.targetChanged ? styles.analysisStaleText : styles.muted}>
+            {run.targetChanged ? t("verificationCapturedStale") : t(statusKey, {
+              exitCode: run.exitCode ?? "",
+              signal: run.signal ?? "",
+            })}
+          </Text>
+          {run.observedTargetFingerprint ? (
+            <Text style={styles.muted}>{t("verificationCapturedObservedTarget", { target: run.observedTargetFingerprint.slice(0, 12) })}</Text>
+          ) : null}
+          {run.outputTail?.length ? <Text selectable style={styles.rawReview}>{run.outputTail.join("\n")}</Text> : null}
+          {run.outputTruncated ? <Text style={styles.muted}>{t("verificationCapturedOutputTruncated")}</Text> : null}
+          {!run.outputTail && run.status !== "running" && run.status !== "pending"
+            ? <Text style={styles.muted}>{t("verificationCapturedOutputNotRetained")}</Text>
+            : null}
+          {run.evidence.humanDecision ? (
+            <Text style={styles.muted}>{t(run.evidence.humanDecision === "accepted" ? "verificationCapturedHumanAccepted" : "verificationCapturedHumanRejected")}</Text>
+          ) : null}
+          <View style={styles.actionRow}>
+            <ActionButton
+              variant="ghost"
+              label={t("verificationCapturedRefresh")}
+              tooltip={t("verificationCapturedRefresh")}
+              disabled={busy}
+              onPress={() => void perform(() => controls.refresh(run.runId))}
+              theme={theme}
+              layout={layout}
+            />
+            {pending ? (
+              <ActionButton
+                variant="danger"
+                label={t("verificationCapturedCancel")}
+                tooltip={t("verificationCapturedCancel")}
+                disabled={busy}
+                onPress={() => void perform(() => controls.cancel(run.runId))}
+                theme={theme}
+                layout={layout}
+              />
+            ) : null}
+            {!pending && run.status !== "abandoned" && !run.targetChanged && !run.evidence.humanDecision ? (
+              <>
+                <ActionButton
+                  variant="secondary"
+                  label={t("verificationCapturedAccept")}
+                  tooltip={t("verificationCapturedHumanDecisionHint")}
+                  disabled={busy}
+                  onPress={() => void perform(() => controls.decide(run.runId, "accepted"))}
+                  theme={theme}
+                  layout={layout}
+                />
+                <ActionButton
+                  variant="ghost"
+                  label={t("verificationCapturedReject")}
+                  tooltip={t("verificationCapturedHumanDecisionHint")}
+                  disabled={busy}
+                  onPress={() => void perform(() => controls.decide(run.runId, "rejected"))}
+                  theme={theme}
+                  layout={layout}
+                />
+              </>
+            ) : null}
+          </View>
+        </View>
+      ) : null}
+      {error ? <Text style={styles.errorText}>{error}</Text> : null}
+      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+        <Pressable style={styles.centeredModalWrap} onPress={() => setOpen(false)}>
+          <Pressable onPress={(event) => event.stopPropagation()} style={styles.centeredModal}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>{t("verificationCapturedConfirmTitle")}</Text>
+              <Pressable accessibilityRole="button" onPress={() => setOpen(false)} style={styles.topButton}>
+                <Text style={styles.topButtonText}>{t("cancel")}</Text>
+              </Pressable>
+            </View>
+            <View style={styles.modalBody}>
+              <Text style={styles.scopeDesc}>{t("verificationCapturedConfirmHint")}</Text>
+              <Text selectable style={styles.routeMeta}>{t("verificationCapturedWorkspace", { workspaceId: finding.workspaceId })}</Text>
+              <Text selectable style={styles.routeMeta}>{t("verificationCapturedTarget", { target: finding.targetFingerprint.slice(0, 12) })}</Text>
+              <Text selectable style={styles.routeMeta}>{finding.filePath}{finding.hunkId ? ` · ${finding.hunkId}` : ""}</Text>
+              <Text selectable style={[styles.rawReview, { writingDirection: "ltr", textAlign: "left" }]}>{commandPreview}</Text>
+              <Text style={styles.errorText}>{t("verificationCapturedRisk")}</Text>
+              {error ? <Text style={styles.errorText}>{error}</Text> : null}
+              <View style={styles.actionRow}>
+                <ActionButton
+                  variant="ghost"
+                  label={t("cancel")}
+                  tooltip={t("cancel")}
+                  disabled={busy}
+                  onPress={() => setOpen(false)}
+                  theme={theme}
+                  layout={layout}
+                />
+                <ActionButton
+                  variant="primary"
+                  label={busy ? t("verificationCapturedStarting") : t("verificationCapturedConfirmRun")}
+                  tooltip={t("verificationCapturedConfirmHint")}
+                  disabled={busy || disabled}
+                  onPress={() => void perform(async () => {
+                    const started = await controls.start(finding);
+                    setOpen(false);
+                    return started;
+                  })}
+                  theme={theme}
+                  layout={layout}
+                />
+              </View>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
+  );
+}
+
+
+export function FindingGroup({ label, findings, t, theme, layout, styles, onPromote, promotionEnabled = true, capturedVerification }: {
+  label: string;
+  findings: readonly FindingGroupEntry[];
+  t: TFunc;
+  theme: PanelTheme;
+  layout: PanelLayout;
+  styles: PanelStyles;
+  onPromote?: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
+  promotionEnabled?: boolean;
+  capturedVerification?: CapturedVerificationUi;
 }) {
   if (findings.length === 0) return null;
   return (
     <View style={styles.group}>
       <Text style={styles.groupLabel}>{label}</Text>
-      {findings.map((finding) => (
-        <View key={finding.id} style={styles.bulletRow}>
-          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: severityColor(finding.severity, theme), marginTop: 6 }} />
-          <View style={styles.bulletContent}>
-            <Text style={[styles.body, { fontWeight: "600" }]}>{finding.summary}</Text>
-            <Text style={styles.muted}>{finding.detail}</Text>
-            {finding.suggestedCheck ? <Text style={styles.muted}>{t("checkSuggestion", { check: finding.suggestedCheck })}</Text> : null}
+      {findings.map((finding) => {
+        const aiFinding = finding.source === "ai_review" && "reviewRunId" in finding;
+        const anchorStatus = "anchorStatus" in finding ? finding.anchorStatus : undefined;
+        const actionableAiFinding = aiFinding ? finding as ActionableReviewFinding : undefined;
+        const anchorReady = !aiFinding || anchorStatus === "resolved";
+        const promotable = finding.source === "deterministic_rule" || (aiFinding && anchorReady);
+        return (
+          <View key={finding.id} style={styles.bulletRow}>
+            <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: severityColor(finding.severity, theme), marginTop: 6 }} />
+            <View style={styles.bulletContent}>
+              <Text style={[styles.body, { fontWeight: "600" }]}>{finding.summary}</Text>
+              <Text style={styles.muted}>{finding.detail}</Text>
+              {finding.suggestedCheck ? <Text style={styles.muted}>{t("checkSuggestion", { check: finding.suggestedCheck })}</Text> : null}
+              {onPromote && promotable ? (
+                <FindingPromotionButton
+                  finding={finding}
+                  t={t}
+                  theme={theme}
+                  layout={layout}
+                  styles={styles}
+                  disabled={!promotionEnabled || !anchorReady}
+                  onPromote={onPromote}
+                />
+              ) : null}
+              {onPromote && aiFinding && !anchorReady ? (
+                <Text style={styles.muted}>{t(anchorStatus === "ambiguous" ? "findingAnchorAmbiguous" : anchorStatus === "stale" ? "findingAnchorStale" : "findingAnchorUnavailable")}</Text>
+              ) : null}
+              {actionableAiFinding?.verificationCommand && capturedVerification ? (
+                <CapturedProcessButton
+                  finding={actionableAiFinding}
+                  controls={capturedVerification}
+                  t={t}
+                  theme={theme}
+                  layout={layout}
+                  styles={styles}
+                  disabled={!promotionEnabled || !anchorReady}
+                />
+              ) : null}
+            </View>
           </View>
-        </View>
-      ))}
+        );
+      })}
     </View>
   );
 }

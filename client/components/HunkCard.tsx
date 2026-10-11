@@ -23,6 +23,7 @@ import {
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
 import { ActionButton, FindingGroup, HoverTooltip, Segmented, StringGroup } from "./ui";
+import type { CapturedVerificationUi, FindingGroupEntry, FindingPromotionResult } from "./ui";
 import { DiffView } from "./DiffView";
 import { FileView } from "./FileView";
 import { lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
@@ -30,7 +31,7 @@ import { AiReviewMeta } from "./AiReviewMeta";
 
 /** A single change block: navigation, diff mode, review/reject/explain
  * actions, the diff or file-context body and the findings disclosure. */
-export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, showAiReviewUsage, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection }: {
+export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, showAiReviewUsage, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection, onPromoteFinding, capturedVerification, promotionEnabled }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -66,6 +67,9 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   onLineTap: (side: LineSide, line: number) => void;
   onClearSelection: () => void;
   onCommentSelection: () => void;
+  onPromoteFinding?: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
+  capturedVerification?: CapturedVerificationUi;
+  promotionEnabled: boolean;
 }) {
   const selectedHeader = hunkHeaderParts(hunk.header);
   const selectedHunkIndex = file.hunks.findIndex((candidate) => candidate.id === hunk.id);
@@ -78,7 +82,8 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   const unifiedRows = useMemo(() => deriveUnifiedRows(selectedPairs), [selectedPairs]);
   const effectiveDiffMode: DiffMode = layout.compact ? "unified" : diffMode;
   const selectedFindings = hunk.findings;
-  const verifiedFindings = selectedFindings.filter((finding) => finding.evidenceKind === "verified_fact");
+  const ruleFindings = selectedFindings.filter((finding) => finding.source === "deterministic_rule");
+  const verifiedFindings = selectedFindings.filter((finding) => finding.source !== "deterministic_rule" && finding.evidenceKind === "verified_fact");
   const inferenceFindings = selectedFindings.filter((finding) => finding.evidenceKind === "ai_inference");
   const humanFindings = selectedFindings.filter((finding) => finding.evidenceKind === "human_verification_recommended");
   // The submit-ready range of the live selection: null while the user has
@@ -258,15 +263,16 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
               <Text style={styles.muted}>{t("noFindings")}</Text>
             ) : (
               <>
-                <FindingGroup label={t("findingsVerified")} findings={verifiedFindings} t={t} theme={theme} styles={styles} />
-                <FindingGroup label={t("findingsInference")} findings={inferenceFindings} t={t} theme={theme} styles={styles} />
-                <FindingGroup label={t("findingsHuman")} findings={humanFindings} t={t} theme={theme} styles={styles} />
+                <FindingGroup label={t("findingsRuleSignals")} findings={ruleFindings} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={promotionEnabled && !analysisStale} />
+                <FindingGroup label={t("findingsVerified")} findings={verifiedFindings} t={t} theme={theme} layout={layout} styles={styles} />
+                <FindingGroup label={t("findingsInference")} findings={inferenceFindings} t={t} theme={theme} layout={layout} styles={styles} />
+                <FindingGroup label={t("findingsHuman")} findings={humanFindings} t={t} theme={theme} layout={layout} styles={styles} />
               </>
             )}
             {explanation ? (
               <View style={styles.analysisBlock}>
                 <Text style={styles.label}>{t("ruleAnalysisLabel")}</Text>
-                <StringGroup label={t("findingsVerified")} items={explanation.verifiedFacts} t={t} styles={styles} />
+                <StringGroup label={t("ruleAnalysisFacts")} items={explanation.verifiedFacts} t={t} styles={styles} />
                 <StringGroup label={t("findingsUnproven")} items={explanation.aiInference} t={t} styles={styles} />
                 <StringGroup label={t("findingsHuman")} items={explanation.humanVerificationRecommended} t={t} styles={styles} />
                 {explanation.verifiedFacts.length === 0 && explanation.aiInference.length === 0 && explanation.humanVerificationRecommended.length === 0 ? (
@@ -279,9 +285,19 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
                 <Text style={styles.label}>{t("aiReviewLabel", { provider: aiExplanation.provider, model: aiExplanation.model })}</Text>
                 <AiReviewMeta details={aiExplanation} showUsage={showAiReviewUsage} t={t} styles={styles} />
                 {aiExplanation.summary ? <Text selectable style={styles.scopeDesc}>{aiExplanation.summary}</Text> : null}
-                <StringGroup label={t("findingsVerified")} items={aiExplanation.verifiedFacts} t={t} styles={styles} />
-                <StringGroup label={t("findingsInference")} items={aiExplanation.aiInference} t={t} styles={styles} />
-                <StringGroup label={t("findingsHuman")} items={aiExplanation.humanVerificationRecommended} t={t} styles={styles} />
+                {aiExplanation.findings !== undefined ? (
+                  <>
+                    <FindingGroup label={t("findingsVerified")} findings={aiExplanation.findings.filter((finding) => finding.evidenceKind === "verified_fact")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={promotionEnabled && aiExplanation.status === "idle" && !analysisStale} capturedVerification={capturedVerification} />
+                    <FindingGroup label={t("findingsInference")} findings={aiExplanation.findings.filter((finding) => finding.evidenceKind === "ai_inference")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={promotionEnabled && aiExplanation.status === "idle" && !analysisStale} capturedVerification={capturedVerification} />
+                    <FindingGroup label={t("findingsHuman")} findings={aiExplanation.findings.filter((finding) => finding.evidenceKind === "human_verification_recommended")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={promotionEnabled && aiExplanation.status === "idle" && !analysisStale} capturedVerification={capturedVerification} />
+                  </>
+                ) : (
+                  <>
+                    <StringGroup label={t("findingsVerified")} items={aiExplanation.verifiedFacts} t={t} styles={styles} />
+                    <StringGroup label={t("findingsInference")} items={aiExplanation.aiInference} t={t} styles={styles} />
+                    <StringGroup label={t("findingsHuman")} items={aiExplanation.humanVerificationRecommended} t={t} styles={styles} />
+                  </>
+                )}
                 {!aiExplanation.summary &&
                 aiExplanation.verifiedFacts.length === 0 &&
                 aiExplanation.aiInference.length === 0 &&

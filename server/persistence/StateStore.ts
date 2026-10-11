@@ -9,6 +9,7 @@ import {
   reviewAnchorSchema,
   reviewScopeSchema,
   type AnchorState,
+  type FindingSource,
   type ReviewAnchor,
   type ReviewScope,
 } from "../../shared/review";
@@ -37,6 +38,9 @@ export type StateEntry = {
   anchor?: ReviewAnchor;
   /** Anchor status of the last resolution against a live target (v1.3). */
   anchorState?: AnchorState;
+  findingSource?: Extract<FindingSource, "deterministic_rule" | "ai_review">;
+  sourceFindingId?: string;
+  sourceReviewRunId?: string;
 };
 
 export type StateFile = Record<string, StateEntry[]>;
@@ -93,6 +97,9 @@ const stateEntrySchema = z
     headRef: z.string().min(1).optional(),
     anchor: reviewAnchorSchema.optional(),
     anchorState: anchorStateSchema.optional(),
+    findingSource: z.enum(["deterministic_rule", "ai_review"]).optional(),
+    sourceFindingId: z.string().min(1).optional(),
+    sourceReviewRunId: z.string().min(1).optional(),
   })
   .loose();
 

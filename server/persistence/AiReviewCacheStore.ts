@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { link, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -8,10 +9,12 @@ import {
   aiReviewModeSchema,
   aiReviewUsageSchema,
   reviewSectionsSchema,
+  structuredReviewFindingSchema,
   type AiReviewDepth,
   type AiReviewMode,
   type AiReviewUsage,
   type ReviewSections,
+  type StructuredReviewFinding,
 } from "../../shared/review";
 import { createMutex, type Mutex } from "../util/mutex";
 
@@ -34,6 +37,7 @@ export type AiReviewCacheEntry = {
   inputFingerprint: string;
   review: string;
   sections: ReviewSections;
+  structuredFindings?: StructuredReviewFinding[];
   depth?: AiReviewDepth;
   usage?: AiReviewUsage;
   createdAt: string;
@@ -47,7 +51,8 @@ export type AiReviewCacheEntryInput = Omit<AiReviewCacheEntry, "createdAt" | "la
 export type AiReviewCacheFile = Record<string, AiReviewCacheEntry>;
 
 /** Envelope version written to disk. */
-export const AI_REVIEW_CACHE_VERSION = 1;
+export const AI_REVIEW_CACHE_VERSION = 2;
+const LEGACY_AI_REVIEW_CACHE_VERSION = 1;
 
 export type AiReviewCacheEnvelope = {
   version: typeof AI_REVIEW_CACHE_VERSION;
@@ -114,6 +119,7 @@ const cacheEntrySchema = z
     inputFingerprint: z.string(),
     review: z.string(),
     sections: reviewSectionsSchema,
+    structuredFindings: z.array(structuredReviewFindingSchema).optional(),
     depth: aiReviewDepthSchema.optional(),
     usage: aiReviewUsageSchema.optional(),
     createdAt: timestampSchema,
@@ -122,6 +128,9 @@ const cacheEntrySchema = z
   .loose();
 
 const cacheFileSchema = z.record(z.string(), cacheEntrySchema);
+const legacyCacheEnvelopeSchema = z
+  .object({ version: z.literal(LEGACY_AI_REVIEW_CACHE_VERSION), entries: cacheFileSchema })
+  .loose();
 const cacheEnvelopeSchema = z
   .object({ version: z.literal(AI_REVIEW_CACHE_VERSION), entries: cacheFileSchema })
   .loose();
@@ -132,17 +141,13 @@ const cacheVersionMarkerSchema = z.object({ version: z.number() });
  * Persistence for cached AI reviews: one JSON file holding every cached review
  * under its caller-computed key.
  *
- * The file is a validated version-1 envelope (`{ version: 1, entries }`); a
- * document that is not valid JSON, declares another version, or fails entry
- * validation raises `AiReviewCacheStoreError` and is left untouched, so a
- * damaged cache is visible instead of being quietly reset. Reads that do find a
- * valid store stay inside one critical section per operation, which makes the
- * read-modify-write cycle atomic within the process; the actual write goes to a
- * temp file that is renamed into place, so a crash can never leave a truncated
- * cache. Retention is a 30-day sliding TTL plus a 256-entry LRU cap: a hit
- * refreshes `lastUsedAt`, and a `put` that overflows the cap drops the entries
- * used longest ago. The storage path, clock, TTL, and cap are constructor
- * injected so tests can drive them deterministically.
+ * The current store is a validated version-2 envelope (`{ version: 2, entries }`).
+ * Valid v1 entries are backed up byte-for-byte to a non-overwritable read-only
+ * `.v1.bak` before atomic migration. Damaged and future-version files remain
+ * untouched. Reads and read-modify-write operations stay inside one critical
+ * section per operation; writes use a same-directory temporary file plus
+ * rename. Retention is a 30-day sliding TTL plus a 256-entry LRU cap.
+ * The storage path, clock, TTL, and cap are constructor-injected for tests.
  */
 export class AiReviewCacheStore {
   private readonly storagePath: string;
@@ -251,11 +256,13 @@ export class AiReviewCacheStore {
         cause: error,
       });
     }
-    return this.parse(raw);
+    const parsed = this.parse(raw);
+    if (parsed.version === AI_REVIEW_CACHE_VERSION) return parsed.entries;
+    return this.migrateLegacy(raw, parsed.entries);
   }
 
   /** Parse and validate a cache document; throws without touching the file. */
-  private parse(raw: string): AiReviewCacheFile {
+  private parse(raw: string): { version: number; entries: AiReviewCacheFile } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -265,27 +272,39 @@ export class AiReviewCacheStore {
         { cause: error },
       );
     }
-    // An empty or whitespace-only file is malformed JSON (JSON.parse already
-    // rejected the truly empty case); only ENOENT means "nothing cached yet".
     const marked = cacheVersionMarkerSchema.safeParse(parsed);
     if (!marked.success) {
       throw new AiReviewCacheStoreError(
         `AI review cache at ${this.storagePath} is not a version ${AI_REVIEW_CACHE_VERSION} store; the file was left untouched.`,
       );
     }
-    if (marked.data.version !== AI_REVIEW_CACHE_VERSION) {
+    let version: number;
+    let entries: AiReviewCacheFile;
+    if (marked.data.version === LEGACY_AI_REVIEW_CACHE_VERSION) {
+      const legacy = legacyCacheEnvelopeSchema.safeParse(parsed);
+      if (!legacy.success) {
+        throw new AiReviewCacheStoreError(
+          `AI review cache at ${this.storagePath} has an invalid version ${LEGACY_AI_REVIEW_CACHE_VERSION} envelope; the file was left untouched.`,
+          { cause: legacy.error },
+        );
+      }
+      version = LEGACY_AI_REVIEW_CACHE_VERSION;
+      entries = legacy.data.entries as AiReviewCacheFile;
+    } else if (marked.data.version === AI_REVIEW_CACHE_VERSION) {
+      const current = cacheEnvelopeSchema.safeParse(parsed);
+      if (!current.success) {
+        throw new AiReviewCacheStoreError(
+          `AI review cache at ${this.storagePath} has an invalid version ${AI_REVIEW_CACHE_VERSION} envelope; the file was left untouched.`,
+          { cause: current.error },
+        );
+      }
+      version = AI_REVIEW_CACHE_VERSION;
+      entries = current.data.entries as AiReviewCacheFile;
+    } else {
       throw new AiReviewCacheStoreError(
-        `AI review cache at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads version ${AI_REVIEW_CACHE_VERSION} and left the file untouched.`,
+        `AI review cache at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads versions ${LEGACY_AI_REVIEW_CACHE_VERSION} and ${AI_REVIEW_CACHE_VERSION} and left the file untouched.`,
       );
     }
-    const envelope = cacheEnvelopeSchema.safeParse(parsed);
-    if (!envelope.success) {
-      throw new AiReviewCacheStoreError(
-        `AI review cache at ${this.storagePath} has an invalid version ${AI_REVIEW_CACHE_VERSION} envelope; the file was left untouched.`,
-        { cause: envelope.error },
-      );
-    }
-    const entries = envelope.data.entries as AiReviewCacheFile;
     for (const [mapKey, entry] of Object.entries(entries)) {
       if (mapKey !== entry.key) {
         throw new AiReviewCacheStoreError(
@@ -293,9 +312,93 @@ export class AiReviewCacheStore {
         );
       }
     }
+    return { version, entries };
+  }
+
+  private async migrateLegacy(raw: string, entries: AiReviewCacheFile): Promise<AiReviewCacheFile> {
+    let current: string;
+    try {
+      current = await readFile(this.storagePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
+      throw new AiReviewCacheStoreError(`AI review cache at ${this.storagePath} could not be re-read for migration.`, {
+        cause: error,
+      });
+    }
+    if (current !== raw) {
+      const latest = this.parse(current);
+      if (latest.version === AI_REVIEW_CACHE_VERSION) return latest.entries;
+      throw new AiReviewCacheStoreError(
+        `AI review cache at ${this.storagePath} changed during version 1 migration; the file was left untouched.`,
+      );
+    }
+    await this.backupLegacy(raw);
+    let rechecked: string;
+    try {
+      rechecked = await readFile(this.storagePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
+      throw new AiReviewCacheStoreError(`AI review cache at ${this.storagePath} could not be re-read for migration.`, {
+        cause: error,
+      });
+    }
+    if (rechecked !== raw) {
+      const latest = this.parse(rechecked);
+      if (latest.version === AI_REVIEW_CACHE_VERSION) return latest.entries;
+      throw new AiReviewCacheStoreError(
+        `AI review cache at ${this.storagePath} changed during version 1 migration; the file was left untouched.`,
+      );
+    }
+    await this.write(entries);
     return entries;
   }
 
+  /** Create a non-overwritable, read-only copy of the v1 bytes beside the store. */
+  private async backupLegacy(raw: string): Promise<void> {
+    const backupPath = `${this.storagePath}.v1.bak`;
+    if (await this.verifyLegacyBackup(backupPath, raw)) return;
+    const temporary = `${backupPath}.${randomUUID()}.tmp`;
+    try {
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(temporary, raw, { encoding: "utf8", mode: 0o400, flag: "wx" });
+      await link(temporary, backupPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST" && await this.verifyLegacyBackup(backupPath, raw)) {
+        return;
+      }
+      throw new AiReviewCacheStoreError(`Version 1 backup for ${this.storagePath} could not be created.`, { cause: error });
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  }
+
+  private async verifyLegacyBackup(backupPath: string, raw: string): Promise<boolean> {
+    let metadata: Stats;
+    try {
+      metadata = await lstat(backupPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+      throw new AiReviewCacheStoreError(`Version 1 backup for ${this.storagePath} could not be inspected.`, { cause: error });
+    }
+    if (!metadata.isFile() || (metadata.mode & 0o222) !== 0) {
+      throw new AiReviewCacheStoreError(
+        `Version 1 backup for ${this.storagePath} already exists but is not a read-only regular file; migration was refused.`,
+      );
+    }
+    let existing: string;
+    try {
+      existing = await readFile(backupPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+      throw new AiReviewCacheStoreError(`Version 1 backup for ${this.storagePath} could not be read.`, { cause: error });
+    }
+    if (existing !== raw) {
+      throw new AiReviewCacheStoreError(
+        `Version 1 backup for ${this.storagePath} already exists with different contents; migration was refused.`,
+      );
+    }
+    return true;
+  }
 
   /** Write the envelope atomically: temp file in the same directory, renamed. */
   private async write(entries: AiReviewCacheFile): Promise<void> {

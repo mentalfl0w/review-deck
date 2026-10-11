@@ -1,13 +1,7 @@
 /**
- * Persistence contract for the AI review cache (v1.4).
+ * Persistence contract for the AI review cache (v2.1).
  *
- * `ai-review-cache.json` is a validated version-1 envelope
- * (`{ version: 1, entries }`) keyed by the caller-computed cache key. The cache
- * is a pure accelerator — but never a silent one: a document that is not valid
- * JSON, declares another version, or fails entry validation raises
- * AiReviewCacheStoreError and is left byte-identical, so a damaged cache is
- * visible rather than quietly reset. Only an explicit user-driven clear()
- * replaces a damaged file with an empty valid store.
+ * `ai-review-cache.json` is a validated version-2 envelope (`{ version: 2, entries }`). Valid version-1 entries are backed up byte-for-byte to a non-overwritable read-only `.v1.bak` before migration. Damaged and future-version bytes remain untouched.
  *
  * Retention is a 30-day sliding TTL plus a 256-entry LRU cap; both are driven
  * here through the injected clock and an injected cap, and every read/write
@@ -17,7 +11,7 @@
  * Run: node tests/ai-review-cache.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
@@ -99,7 +93,7 @@ try {
   // -------------------------------------------------------------------------
   // 0. Contract constants: default path, 30-day TTL, 256-entry cap.
   // -------------------------------------------------------------------------
-  assert.strictEqual(AI_REVIEW_CACHE_VERSION, 1);
+  assert.strictEqual(AI_REVIEW_CACHE_VERSION, 2);
   assert.strictEqual(DEFAULT_AI_REVIEW_CACHE_TTL_MS, ttl);
   assert.strictEqual(DEFAULT_AI_REVIEW_CACHE_MAX_ENTRIES, 256);
   assert.ok(DEFAULT_AI_REVIEW_CACHE_PATH.endsWith(join("review-deck", "ai-review-cache.json")));
@@ -114,15 +108,62 @@ try {
     (error) => (error as NodeJS.ErrnoException).code === "ENOENT",
   );
 
+  // 1b. A valid v1 cache is backed up byte-for-byte before an atomic v2 migration.
+  const legacyPath = join(root, "legacy", "ai-review-cache.json");
+  await mkdir(dirname(legacyPath), { recursive: true });
+  const legacyCreatedAt = "2026-09-20T03:04:05.000Z";
+  const legacyEntry = {
+    ...entry("legacy-1"),
+    createdAt: legacyCreatedAt,
+    lastUsedAt: legacyCreatedAt,
+  };
+  const legacyRaw = `${JSON.stringify({ version: 1, entries: { "legacy-1": legacyEntry } }, null, 2)}\n`;
+  await writeFile(legacyPath, legacyRaw, "utf8");
+  const legacyHit = await store(legacyPath).get("legacy-1");
+  assert.equal(legacyHit?.review, "review legacy-1", "v1 cache data remains usable");
+  assert.equal(legacyHit?.createdAt, legacyCreatedAt, "migration preserves creation time");
+  assert.equal(legacyHit?.structuredFindings, undefined, "v1 entries gain no fabricated structured findings");
+  assert.equal((await readCache(legacyPath)).version, AI_REVIEW_CACHE_VERSION, "the cache upgrades to v2");
+  const legacyBackupPath = `${legacyPath}.v1.bak`;
+  assert.equal(await readFile(legacyBackupPath, "utf8"), legacyRaw, "the exact v1 bytes are backed up");
+  assert.equal((await stat(legacyBackupPath)).mode & 0o222, 0, "the v1 backup is read-only");
+
+  const backupConflictPath = join(root, "backup-conflict", "ai-review-cache.json");
+  const backupConflictRaw = `${JSON.stringify({ version: 1, entries: { "legacy-conflict": { ...entry("legacy-conflict"), createdAt: legacyCreatedAt, lastUsedAt: legacyCreatedAt } } })}\n`;
+  await mkdir(dirname(backupConflictPath), { recursive: true });
+  await writeFile(backupConflictPath, backupConflictRaw, "utf8");
+  await writeFile(`${backupConflictPath}.v1.bak`, "preserve existing backup", "utf8");
+  await chmod(`${backupConflictPath}.v1.bak`, 0o400);
+  await assert.rejects(store(backupConflictPath).get("legacy-conflict"), AiReviewCacheStoreError);
+  assert.equal(await readFile(backupConflictPath, "utf8"), backupConflictRaw, "a conflicting backup leaves the source unchanged");
+  assert.equal(await readFile(`${backupConflictPath}.v1.bak`, "utf8"), "preserve existing backup");
+
+  const writableBackupPath = join(root, "writable-backup", "ai-review-cache.json");
+  const writableBackupRaw = `${JSON.stringify({ version: 1, entries: { "legacy-writable": { ...entry("legacy-writable"), createdAt: legacyCreatedAt, lastUsedAt: legacyCreatedAt } } })}\n`;
+  await mkdir(dirname(writableBackupPath), { recursive: true });
+  await writeFile(writableBackupPath, writableBackupRaw, "utf8");
+  await writeFile(`${writableBackupPath}.v1.bak`, writableBackupRaw, "utf8");
+  await assert.rejects(store(writableBackupPath).get("legacy-writable"), AiReviewCacheStoreError);
+  assert.equal(await readFile(writableBackupPath, "utf8"), writableBackupRaw, "a writable pre-existing backup refuses migration");
+
   // -------------------------------------------------------------------------
-  // 2. put writes a version-1 envelope; timestamps are stamped by the store,
-  //    and every optional field round-trips.
+  // 2. put writes a version-2 envelope; timestamps are stamped by the store,
+  //    and structured findings and optional fields round-trip.
   // -------------------------------------------------------------------------
   const createdAt = at(Date.parse("2026-01-02T03:04:05.000Z"));
   await fresh.put(
     entry("hunk-1", {
       depth: "full",
       usage: { inputTokens: 1200, outputTokens: 300, cachedTokens: 0, contextTokens: 900 },
+      structuredFindings: [{
+        filePath: "src/cache.ts",
+        hunkId: "H-1",
+        severity: "high",
+        evidenceKind: "ai_inference",
+        category: "cache",
+        summary: "The cache can be stale.",
+        detail: "The finding remains structured and independently anchorable.",
+      }],
     }),
   );
   const stored = await readCache();
@@ -132,6 +173,15 @@ try {
     ...entry("hunk-1", {
       depth: "full",
       usage: { inputTokens: 1200, outputTokens: 300, cachedTokens: 0, contextTokens: 900 },
+      structuredFindings: [{
+        filePath: "src/cache.ts",
+        hunkId: "H-1",
+        severity: "high",
+        evidenceKind: "ai_inference",
+        category: "cache",
+        summary: "The cache can be stale.",
+        detail: "The finding remains structured and independently anchorable.",
+      }],
     }),
     createdAt,
     lastUsedAt: createdAt,

@@ -22,3 +22,29 @@ Scope: V2.0.2 ReviewBatch dispatch, persistence/migration, timeline correlation,
 - `npm publish --access public --dry-run --json` — passed for `@mentalfl0w/review-deck@2.0.4`; the package contains the Registry overview, README image, manifest, and TypeScript source only.
 - `npm view @mentalfl0w/review-deck` returned 404. The scoped version appears unpublished; registry ownership and npm authentication still need confirmation. No package was published.
 Coverage percentages and interactive Paseo Host UI smoke were not measured; the repository has no coverage script and no configured/open Host UI runtime in this worktree.
+
+## Security Review — V2.1.0 Finding and Captured Verification
+
+Date: 2026-10-11  
+Scope: deterministic Finding identity, AI Finding promotion, AI cache migration, ProcessRunner, ProcessVerificationStore, process evidence and human decisions.
+
+### Findings
+
+- **P2 — Concurrent starts could bypass process limits (resolved).** `ProcessVerificationService` now serializes admission, reserves global/workspace capacity before persistent writes, and reuses an existing live run for the same Finding. A concurrent-start regression test is present.
+- **P2 — Interpreter aliases could bypass the exact-name denylist (resolved).** Captured mode uses a positive executable allowlist, rejects nested package-manager interpreter launches, and separately blocks inline evaluator flags. Regression cases cover `nodejs`, `python3.12`, `node -e`, and `yarn node -e`.
+- **P2 — A leader close could cancel process-group SIGKILL escalation (resolved).** `ProcessRunner` now retains escalation until the original process group is observed gone or the confirmation window expires; it never reports an unconfirmed kill as a successful exit. Fake group-liveness and real process-group tests are present.
+- **P2 — The reviewed target could change during metadata persistence before spawn (resolved).** The service rechecks Workspace path and target fingerprint immediately before spawn, refuses stale pending records, and records the observed completion fingerprint.
+- **No remaining actionable findings** in the final read-only security review. No tests, builds, or linters were run by the reviewer.
+
+### Residual risks and controls
+
+- A change-and-restore between target fingerprint observations may evade stale marking. The UI and documentation state that the process is not a sandbox and that exit status is not a fix verdict.
+- POSIX process groups cannot terminate descendants that deliberately escape with `setsid` or an equivalent mechanism. The confirmation UI, README, and Overview disclose this; captured execution is currently enabled only on macOS while Linux/Windows remain fail-closed until platform tests exist.
+- The positive executable policy still runs approved test/build tools under workspace process permissions. Full command, workspace, target, and modification risk are shown before confirmation.
+
+### Verification evidence
+
+- `npm run typecheck` — passed.
+- `npm test` — passed, including real process spawn/cancel, bounded output, target drift, AI Finding promotion, and cache migration.
+- `npm pack --dry-run` — passed for local `@mentalfl0w/review-deck@2.0.4`; no package was published.
+- Paseo Host UI visual smoke — `NOT_TESTED`; no configured/open Host UI runtime was available in this worktree.

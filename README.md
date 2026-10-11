@@ -13,7 +13,7 @@ After an Agent works in a Paseo workspace, the changes are spread across many fi
 - **Feeding back** those comments to an Agent that can act on them
 - **Cleaning up** once the feedback has been handled
 
-Review Deck turns the Git diff into a navigable human-in-the-loop review workspace. It never treats AI output as a substitute for your final decision — AI findings are clearly labeled as inference, and verified facts are presented separately.
+Review Deck never treats AI as the final decision. AI-reported facts and inferences, local Rule signals, human notes, and executed-command evidence are distinct; none automatically resolves a Finding.
 
 ## Main capabilities
 
@@ -28,7 +28,8 @@ Review Deck turns the Git diff into a navigable human-in-the-loop review workspa
 | Review timelines | `review-deck-batch` rows update by stable id from submitted/running to completed/partial/failed. AI-review rows summarize completion, finding/high-risk counts, and token usage. Both contain status metadata only — never findings, comment text/IDs, file paths, patches, or cwd. |
 | Review defaults | Interface language (Auto follows the browser/device preferred language; selecting 中文 or English localizes the settings form, Header status popover, and Pill action labels), diff layout (Auto / Unified / Split), reviewer strategy and Provider / Model / Thinking, cache, token-usage display, and the default Economical / Balanced / Deep preset. Settings are host-scoped under **Settings → Plugins → Review Deck** |
 | AI review & explain | Explain a hunk, review one file, or review the current target. The preset sets risk coverage and default depth; Targeted / Full can override patch context per run. Reviewers use Read-only/Plan where available; Codex falls back to provider options that force a read-only sandbox and on-request approvals. Providers with no documented safe mode (the current Pi catalog exposes none) fail closed. Codex/OpenCode receive Paseo `outputSchema`; other providers use Markdown fallback. Structured findings may include executable + argv verification suggestions; free-form `suggestedCheck` text is never executed. |
-| Verification Terminal | A structured finding can offer a concrete executable and argv. Review Deck shows the exact command, requires confirmation, and opens an interactive terminal in the current workspace. v2.0 displays terminal output but does not infer pass/fail or create `verified_fact`; automated exit-status evidence is deferred to v2.1. If the target or workspace changes while restoring run history, old runs are omitted and the snapshot is marked stale. Workspace-activity probes are coalesced to prevent update bursts from launching duplicate full snapshots. |
+| Finding to Queue | A human can edit a Rule or structured AI Finding into a normal project comment. The server rechecks the current target and unique Hunk anchor; an existing comment is never overwritten |
+| Verification | Interactive Terminal remains separate. Captured mode accepts approved tools after exact-command confirmation; output is a ≤32 KiB memory-only tail. Original/observed fingerprints flag persistent drift, but change-and-restore can evade comparison. POSIX group kill cannot reach escaped descendants. macOS only; Linux/Windows fail closed |
 | Browser Preview | Configure an HTTP(S) preview URL per project and Host in **More**. **Open Preview** uses Paseo's workspace browser where `navigation.openBrowser` is available; it never falls back to an external browser. |
 | Scope | Review the working tree, staged changes, a branch, or specific commits |
 | Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
@@ -56,7 +57,19 @@ flowchart TB
 
 ## Architecture
 
-Review Deck is a Paseo **0.10.0+** plugin using the v0.8 runtime-entry format: two root entries — `index.client.tsx` (client runtime) and `index.server.ts` (server runtime) — separate from the React Native panel, typed RPC contracts, and server-side service layer. Review state lives in a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v2 envelope at `~/.paseo/review-deck/review-batches.json`. A valid v1 ReviewBatch store migrates on first read only after its exact bytes are preserved in a non-overwritable read-only `.v1.bak` file; malformed data or a conflicting backup fails closed. Transient AI Review run metadata uses a strict v1 store at `~/.paseo/review-deck/runs.json`; AI review results use a separate bounded cache at `~/.paseo/review-deck/ai-review-cache.json` (30-day TTL, 256-entry cap). Run metadata never stores prompts, patches, or review text. Git access is centralized behind one runner with fingerprint-checked safety.
+Review Deck is a Paseo **0.10.0+** plugin using the v0.8 runtime-entry format: root `index.client.tsx` and `index.server.ts` entries sit above the React Native panel, typed RPC contracts, and server service layer.
+
+Review state uses a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v2 envelope at `~/.paseo/review-deck/review-batches.json`.
+
+A valid v1 ReviewBatch store migrates only after its exact bytes are preserved in a non-overwritable read-only `.v1.bak`. Damaged data or conflicting backups fail closed.
+
+Transient AI Review run metadata uses a strict v1 store at `~/.paseo/review-deck/runs.json`; it stores target/request identity only, never prompts, patches, or review text.
+
+AI review cache uses a version-2 envelope with v1 byte-preserving migration, a 30-day TTL, and a 256-entry cap.
+
+Captured process metadata lives in a separate strict v1 `process-verification-runs.json` store with a 30-day TTL and 256-run cap. Output is bounded and never persisted.
+
+Git access is centralized behind one runner with fingerprint-checked safety.
 
 ```mermaid
 flowchart LR
@@ -76,16 +89,22 @@ flowchart LR
         Svc["ReviewService"]
         Anchor["AnchorEngine"]
         Git["GitRunner"]
-        Parse["DiffParser · FindingDetector"]
+        Parse["DiffParser · FindingDetector · rules"]
         Store["StateStore"]
         AiCache["AiReviewCacheStore"]
         BatchStore["ReviewBatchStore"]
+        ProcessSvc["ProcessVerificationService"]
+        ProcessRunner["ProcessRunner · direct argv · bounded tail"]
+        ProcessStore["ProcessVerificationStore"]
         Svc --> Anchor
         Svc --> Git
         Svc --> Parse
         Svc --> Store
         Svc --> AiCache
         Svc --> BatchStore
+        Svc --> ProcessSvc
+        ProcessSvc --> ProcessRunner
+        ProcessSvc --> ProcessStore
     end
 
     ClientEntry["index.client.tsx (repo root)<br/>panels · Command Center · /review-deck<br/>timeline · settings · header / composer entries"]

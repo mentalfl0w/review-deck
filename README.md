@@ -1,67 +1,62 @@
 # Review Deck
 
-A **human-in-the-loop review plugin for Paseo**. When an Agent finishes a change in a Paseo workspace (worktree), reviewing the result across many files is awkward — you have to keep viewing diffs, annotate them, feed your feedback back to an Agent, and clean up afterwards. Review Deck turns a Git changeset into a **navigable review workspace**: browse files and hunks, leave comments right next to the exact diff, collect them in a project queue, and route each workspace's comments to an Agent in that same workspace.
+**English** · [中文](README.zh-CN.md)
 
-![Review Deck — human-in-the-loop review workspace for Paseo](images/review-deck.png)
+Review Deck helps you review a Paseo Agent's changes without losing context. Browse each file and Hunk, comment on exact lines, then send the project's comments to the Agent working in that workspace.
 
-## The problem
+![Demo: a changed Hunk with an Agent completion waiting for human acceptance](images/review-deck.png)
 
-After an Agent works in a Paseo workspace, the changes are spread across many files, hunks, and commits. A careful human review means:
+*An Agent's `COMPLETED` report is a prompt to review, not an automatic close.*
 
-- **Seeing** what changed — file by file, hunk by hunk
-- **Annotating** the exact diff with notes and decisions
-- **Feeding back** those comments to an Agent that can act on them
-- **Cleaning up** once the feedback has been handled
+## Review from diff to decision
 
-Review Deck never treats AI as the final decision. AI-reported facts and inferences, local Rule signals, human notes, and executed-command evidence are distinct; none automatically resolves a Finding.
+1. **Browse.** Compare changed files and Hunks with the old and new lines side by side.
+2. **Comment.** Save a note on exact lines or on the whole Hunk.
+3. **Send.** Collect project comments and send each workspace's group to its Agent.
+4. **Re-read.** `COMPLETED` is the Agent's claim, not approval. Inspect the changed Hunk and accept it yourself before the comment leaves the queue.
 
-## Main capabilities
+Rule signals, AI findings, and command output help with the review; none replaces the human decision.
 
-| Capability | What it does |
-|---|---|
-| File-first review UI | Navigate changed files and hunks with the exact diff shown next to the change details; wide layout shows file list and file details side by side, compact layout drills down |
-| Inline comments | Select exact diff lines (click / Shift-click on desktop, two taps in compact layouts) or keep a hunk-level anchor; comments follow safe re-anchors across snapshots |
-| Project comments queue | The top queue aggregates every saved comment for the current project, grouped by workspace, scope, and file |
-| AI processing | Group project comments by workspace and submit each group to an Agent in that workspace. Only explicit `COMPLETED` outcomes remove comments; stale, failed, and unresolved comments stay queued |
-| Agent-targeted Review Deck | Open Review Deck from an Agent's Command Center item, `/review-deck`, or Composer Pill; the Agent is preselected, and all of these open the same workspace-scoped tab |
-| Paseo-native entries | Workspace Header badges prioritize actionable pending comments, then stale/ambiguous comments, then unread AI findings; the native popover shows review progress, queue state, active reviews, and Deck/Queue actions. Agent Composer Pill menus open the Deck or Queue in that same workspace tab, review current changes with AI, or submit that workspace's comments; run/submit actions are gated by workspace, Agent, diff, and batch state. |
-| Review timelines | `review-deck-batch` rows update by stable id from submitted/running to completed/partial/failed. AI-review rows summarize completion, finding/high-risk counts, and token usage. Both contain status metadata only — never findings, comment text/IDs, file paths, patches, or cwd. |
-| Review defaults | Interface language (Auto follows the browser/device preferred language; selecting 中文 or English localizes the settings form, Header status popover, and Pill action labels), diff layout (Auto / Unified / Split), reviewer strategy and Provider / Model / Thinking, cache, token-usage display, and the default Economical / Balanced / Deep preset. Settings are host-scoped under **Settings → Plugins → Review Deck** |
-| AI review & explain | Explain a hunk, review one file, or review the current target. The preset sets risk coverage and default depth; Targeted / Full can override patch context per run. Reviewers use Read-only/Plan where available; Codex falls back to provider options that force a read-only sandbox and on-request approvals. Providers with no documented safe mode (the current Pi catalog exposes none) fail closed. Codex/OpenCode receive Paseo `outputSchema`; other providers use Markdown fallback. Structured findings may include executable + argv verification suggestions; free-form `suggestedCheck` text is never executed. |
-| Finding to Queue | A human can edit a Rule or structured AI Finding into a normal project comment. The server rechecks the current target and unique Hunk anchor; an existing comment is never overwritten |
-| Verification | Interactive Terminal remains separate. Captured mode accepts approved tools after exact-command confirmation; output is a ≤32 KiB memory-only tail. Original/observed fingerprints flag persistent drift, but change-and-restore can evade comparison. POSIX group kill cannot reach escaped descendants. macOS only; Linux/Windows fail closed |
-| Browser Preview | Configure an HTTP(S) preview URL per project and Host in **More**. **Open Preview** uses Paseo's workspace browser where `navigation.openBrowser` is available; it never falls back to an external browser. |
-| Scope | Review the working tree, staged changes, a branch, or specific commits |
-| Safe hunk rejection | Reject a hunk by reversing its patch — only when the workspace still matches the reviewed snapshot, so unrelated work is never overwritten |
-| File-level actions | Mark a whole file reviewed in one tap, ask an Agent to explain a whole file, or revert all of a file's changes at once — comment-anchored hunks are skipped automatically |
-| Bilingual UI | English and 中文 (Chinese) |
+Use the wide two-pane layout on desktop or the file-by-file drill-down on a compact screen.
 
-```mermaid
-flowchart TB
-    A[Open Review Deck] --> B[Choose project / workspace]
-    B --> C[Browse changed files]
-    C --> D[Write one file-level comment per file]
-    D --> E{More files to review?}
-    E -- yes --> C
-    E -- no --> F[Project comments queue]
-    F --> G[Group comments by workspace]
-    G --> H{Eligible Agent in workspace?}
-    H -- yes --> I[Select an Agent for each workspace group]
-    H -- no --> J[Leave comments pending]
-    I --> K[Send one ReviewBatch per workspace]
-    K --> L[Agent reports COMMENT OUTCOMES]
-    L --> M[Remove COMPLETED comments only]
-    L --> N[Keep STALE / FAILED / UNRESOLVED comments]
-    L -.-> O[Update the same timeline row]
-```
+## See it in action
+
+![A saved line comment beside the current checkout diff](images/review-deck-comment.png)
+
+*Keep the file list and exact old/new lines in view while you write a comment.*
+
+![Project review queue with comments from two changed files](images/review-deck-queue.png)
+
+*Comments stay grouped by file. An Agent's `COMPLETED` report remains visible until you review the changed Hunk.*
+
+![Rule analysis for a changed Hunk](images/review-deck-analysis.png)
+
+*Rule analysis separates observed facts, unproven inference, and what a human should verify.*
+
+![Review scope and path filter](images/review-deck-scope.png)
+
+*Review uncommitted or staged changes, branch commits, or a commit comparison; narrow the view by path.*
+
+### More tools
+
+- Review the working tree, staged changes, a branch, or selected commits.
+- Run deterministic Rule checks or ask an Agent to explain a Hunk or review a file.
+- Reject a Hunk only while its reviewed snapshot still matches; mark a whole file reviewed when appropriate.
+- Follow batch and AI-review progress in stable Paseo timeline rows, and open Review Deck from the workspace Header, Command Center, `/review-deck`, or an Agent Composer Pill.
+- Configure language, diff layout, reviewer model, depth preset, and token usage under host-scoped settings.
+- Run a confirmed verification command in the workspace terminal, or open a configured Browser Preview.
+- Use the interface in English or 中文.
+
+<details>
+<summary>Technical architecture and implementation details</summary>
 
 ## Architecture
 
 Review Deck is a Paseo **0.10.0+** plugin using the v0.8 runtime-entry format: root `index.client.tsx` and `index.server.ts` entries sit above the React Native panel, typed RPC contracts, and server service layer.
 
-Review state uses a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v2 envelope at `~/.paseo/review-deck/review-batches.json`.
+Review state uses a versioned v2 envelope at `~/.paseo/review-deck/reviews.json`; ReviewBatch state uses a separate strict v3 envelope at `~/.paseo/review-deck/review-batches.json`.
 
-A valid v1 ReviewBatch store migrates only after its exact bytes are preserved in a non-overwritable read-only `.v1.bak`. Damaged data or conflicting backups fail closed.
+A valid v1 or v2 ReviewBatch store migrates only after its exact bytes are preserved in a non-overwritable read-only `.v1.bak` / `.v2.bak`. Damaged data or conflicting backups fail closed, and migration never invents a dispatch-time baseline: old `COMPLETED` outcomes stay unaccepted until their comment is dispatched again.
 
 Transient AI Review run metadata uses a strict v1 store at `~/.paseo/review-deck/runs.json`; it stores target/request identity only, never prompts, patches, or review text.
 
@@ -112,7 +107,7 @@ flowchart LR
     Agents["Paseo Agents"]
     Repo[("workspace repo")]
     State[("reviews.json · v2")]
-    Batches[("review-batches.json · v2")]
+    Batches[("review-batches.json · v3")]
 
     BatchStore --> Batches
     ClientEntry --> Panel
@@ -140,6 +135,8 @@ flowchart LR
 
 Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 
+</details>
+
 ## Usage
 
 1. **Open the panel.** In a workspace Header, the **Review** button may be icon-only or inside the compact-layout overflow menu. A live Agent's Composer shows a **Review** Pill beside Tasks/Subagents. The Command Center and `/review-deck` also open it. These entry points reuse one Review Deck tab per workspace.
@@ -148,14 +145,14 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 4. **Leave a comment.** Save a comment against the selected line range, or leave the selection empty to keep the hunk-level anchor.
 5. **Watch the queue.** The project comments queue at the top summarizes all saved comments for the current project.
 6. **Submit workspace batches.** The queue groups comments by workspace. An Agent-launched Review Deck preselects that Agent; otherwise one freshly verified idle Agent bound to the exact workspace is selected. Running or initializing Agents remain visible but cannot receive comment batches. Workspaces without an eligible Agent stay queued.
-7. **Track outcomes and delivery.** Comments remain queued until the matching Agent turn reports explicit `COMPLETED` outcomes. Each send has a stable message id; an ambiguous send remains claimed and is never retried automatically. A confirmed duplicate-risk action can release a stranded claim for a user-confirmed retry.
+7. **Track outcomes and delivery.** The matching Agent turn records one outcome per comment, and the queue shows it. A `COMPLETED` outcome never removes the comment by itself: the reviewer opens the change block that was fixed, and **Accept and remove comment** asks the server to re-read Git. The comment is deleted only when the newest owning batch reported `COMPLETED`, the visible target and hunk still match exactly, and the block's own changed lines differ from the dispatch-time baseline recorded during preflight. An unchanged block, an unrelated hunk, an edited or replaced comment, or a superseded batch all fail closed and keep the comment queued. Each send has a stable message id; an ambiguous send remains claimed and is never retried automatically. A confirmed duplicate-risk action can release a stranded claim for a user-confirmed retry.
 8. **Tune the defaults.** Under **Settings → Plugins → Review defaults**, choose the panel language (Auto / 中文 / English) and the default diff layout (Auto / Unified / Split); these host-scoped settings apply everywhere Review Deck opens.
 9. **Run a verification command.** Review the structured executable and arguments, then confirm. Review Deck opens an interactive terminal in the current workspace; inspect its output in Paseo. v2.0 does not mark pass/fail automatically.
 10. **Preview the project.** On Electron, open **More → Browser Preview**, set the project's HTTP(S) URL, then choose **Open Preview**. The URL is saved per project on the current Host.
 
 ## Limitations
 
-- **Unfinished comments remain queued.** Only an explicit `COMPLETED` outcome from the matching Batch turn clears a comment; missing, malformed, duplicate, conflicting, stale, ambiguous, or mismatched-turn outcomes remain pending. Review Deck persists a send intent and stable message id before dispatch. A successful `send()` acknowledgment or exact timeline message proves delivery, not completion. The SDK exposes no stable rejection discriminator, so every `send()` failure is conservatively treated as unknown and never retried automatically. Timeline evidence can recover delivery; `unknown` or `accepted` batches without a proven Turn retain their claims across restarts. Active v1 batches without delivery identity are never auto-linked, failed, or released by Turn/Archive events; explicit release is required and may duplicate work. Only a prepared batch with no persisted send attempt gets a two-minute grace, released after a successful refresh shows the Agent is not running or initializing. A proven Turn can be released as unresolved after it stops; Archive events resolve only new batches whose delivery state proves they are not in flight. Status/timeline lookup failure or a null Agent snapshot keeps the claim. The Agent's claim is not independent verification, so review the resulting diff before accepting it.
+- **Unfinished comments remain queued.** A comment leaves the queue only through an explicit human acceptance of an Agent-reported `COMPLETED` outcome; the outcome itself never deletes anything. Missing, malformed, duplicate, conflicting, stale, ambiguous, or mismatched-turn outcomes remain pending, and so does every `COMPLETED` outcome until a human accepts it on the visible change block. Acceptance requires the newest owning batch for that comment, an exact match of the visible target and hunk to a fresh snapshot, the same project/workspace/scope/file (rename alias included), the baseline's old-side window, and a current path-independent changed-lines identity (`changedLinesId`) different from the dispatch-time baseline, so a pure rename never counts as an edit. Batches written before version 3 carry no baseline, so their old `COMPLETED` outcomes cannot be accepted until the comment is dispatched again; comments already deleted by older builds cannot be recovered. Review Deck persists a send intent and stable message id before dispatch. A successful `send()` acknowledgment or exact timeline message proves delivery, not completion. The SDK exposes no stable rejection discriminator, so every `send()` failure is conservatively treated as unknown and never retried automatically. Timeline evidence can recover delivery; `unknown` or `accepted` batches without a proven Turn retain their claims across restarts. Active v1 batches without delivery identity are never auto-linked, failed, or released by Turn/Archive events; explicit release is required and may duplicate work. Only a prepared batch with no persisted send attempt gets a two-minute grace, released after a successful refresh shows the Agent is not running or initializing. A proven Turn can be released as unresolved after it stops; Archive events resolve only new batches whose delivery state proves they are not in flight. Status/timeline lookup failure or a null Agent snapshot keeps the claim. The Agent's claim is not independent verification, so review the resulting diff before accepting it.
 - **AI Review recovery is bounded.** After reload, a running review resumes only when its labeled child still matches the stored parent/workspace and is not archived. Runs past the one-hour metadata TTL, missing children, archived children, or prompt/schema-version mismatches are abandoned. The UI's active poll loop has a separate five-minute wait cap. `runs.json` stores metadata only; review content stays in the Agent timeline or optional cache.
 - **Workspace routing is fail-closed.** A batch is bound to one workspace and one Agent in that workspace. Legacy comments without `workspaceId` are assigned only when a complete project workspace list proves their cwd has exactly one owner; ambiguous or unavailable ownership leaves them unassigned. If no eligible Agent exists, Review Deck keeps comments queued and never creates an Agent automatically.
 - **Timeline rows are status records, not review content.** Batch rows update by stable id; AI-review rows report status, finding/high-risk counts, and usage. Neither timeline payload includes comment ids, text, paths, cwd, patches, or full findings.
@@ -172,7 +169,7 @@ Requires **Paseo 0.10.0 or newer** (`>=0.10.0`).
 
 - **Fingerprint-checked Git operations.** Hunk rejection applies a reverse patch only after verifying that the workspace and index still match the reviewed snapshot. If anything changed, the operation is safely refused and the analysis is marked stale.
 - **Re-anchoring and batch preflight are fail-closed.** Unique exact/content/context matches may follow comments; stale or ambiguous anchors are never guessed. Before submission, Review Deck snapshots the current target and resolves every selected comment through the AnchorEngine; a changed selection, stale/ambiguous anchor, or workspace identity fails the whole batch. Unique relocations update only the prompt payload. The Agent must still verify the current fingerprint before editing because Git can change after preflight. Reject/revert independently verify current target and hunk fingerprints.
-- **ReviewBatch downgrade safety.** The v2 store preserves a v1 backup at `~/.paseo/review-deck/review-batches.json.v1.bak`. Stop the plugin before restoring this backup over `review-batches.json` to downgrade; do not copy a v1 backup over a store that has since accepted new batches.
+- **ReviewBatch downgrade safety.** The v3 store preserves a v1 or v2 backup at `~/.paseo/review-deck/review-batches.json.v1.bak` / `.v2.bak`. Stop the plugin before restoring this backup over `review-batches.json` to downgrade; do not copy a legacy backup over a store that has since accepted new batches. A restored v2 store keeps its outcomes but has no baselines, so no acceptance can be recorded until the comment is dispatched again; comments already deleted by an older build cannot be recovered.
 
 ## Installation
 
@@ -181,7 +178,7 @@ Review Deck requires Paseo 0.10.0 or newer (`>=0.10.0`). Installing from npm req
 Install the published npm package:
 
 ```sh
-paseo plugin install npm:@mentalfl0w/review-deck@2.1.0
+paseo plugin install npm:@mentalfl0w/review-deck@2.1.1
 paseo plugin ls
 ```
 
@@ -204,6 +201,16 @@ npm install
 npm run typecheck
 npm test
 ```
+
+Create a disposable Git project for manual UI smoke tests:
+
+```sh
+DEMO_PATH="$(node scripts/create-review-deck-demo.mjs)"
+paseo project create "$DEMO_PATH"
+paseo workspace create --isolation local --path "$DEMO_PATH" --title "Trail Cart Demo"
+```
+
+The fixture has a committed baseline and two changed files. After the smoke test, delete the project from Paseo (this archives its workspaces but leaves files on disk), then remove only the directory printed by the script.
 
 Install and manage a local checkout with the Paseo CLI:
 

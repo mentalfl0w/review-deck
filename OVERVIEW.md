@@ -6,7 +6,7 @@ Review state and queued comments are stored locally under `~/.paseo/review-deck/
 
 Review Deck requires a Paseo workspace, a Git repository, and an Agent. It uses that Agent's provider and model without separate credentials. Paseo 0.10.0+ is supported; npm installation requires Paseo 0.11.0+.
 
-Reviewers submit comments by workspace and track per-comment outcomes. Comments remain queued until the matching Agent turn reports `COMPLETED`.
+Reviewers submit comments by workspace and track per-comment outcomes. An Agent's `COMPLETED` outcome is a claim, not a decision: the comment stays queued until a human accepts it on the change block that was fixed, and only when that block's own changed lines differ from the baseline captured when the comment was dispatched. An unchanged block, an unrelated hunk in the same file, an edited or replaced comment, or a newer batch for the same comment all fail closed and keep the comment queued.
 
 Stale or ambiguous anchors are never guessed. If delivery is uncertain, Review Deck never resends automatically. A reviewer may inspect the timeline and release the claim; duplicate work can result.
 

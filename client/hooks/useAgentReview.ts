@@ -93,7 +93,6 @@ export function useAgentReview(params: {
   const [agentReviewMeta, setAgentReviewMeta] = useState<AiReviewDisplayMetadata | null>(null);
   const [agentReviewBusy, setAgentReviewBusy] = useState(false);
   const [agentFeedback, setAgentFeedback] = useState<AgentFeedbackMap>({});
-  const [findingsOpen, setFindingsOpen] = useState(true);
   // Feedback for the file-scoped revision action (`reviseFileFromComment`),
   // kept separate from the current-block revision map so the two scopes
   // never clobber each other's sending/sent/error state.
@@ -145,7 +144,6 @@ export function useAgentReview(params: {
       });
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setExplanation(result);
-      setFindingsOpen(true);
       setStale(false);
     } catch (error) {
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
@@ -171,7 +169,6 @@ export function useAgentReview(params: {
       });
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
       setExplanation(result);
-      setFindingsOpen(true);
       setStale(false);
     } catch (error) {
       if (run !== analysisRunRef.current || localeRef.current !== requestedLocale) return;
@@ -250,7 +247,6 @@ export function useAgentReview(params: {
           reviewPreset: result.reviewPreset,
           ...(result.findings ? { findings: result.findings } : {}),
         });
-        setFindingsOpen(true);
         setStale(false);
         if (result.status !== "idle") setActionError(t("agentFinishedStatus", { status: result.status }));
       });
@@ -307,7 +303,6 @@ export function useAgentReview(params: {
           usage: result.usage,
           reviewPreset: result.reviewPreset,
         });
-        setFindingsOpen(true);
         setStale(false);
         if (result.status !== "idle") setActionError(t("agentFinishedStatus", { status: result.status }));
       });
@@ -425,7 +420,6 @@ export function useAgentReview(params: {
     setAgentFeedback({});
     setFileReviseFeedback({});
     setAiExplainBusy(null);
-    setFindingsOpen(true);
   }, [setStale]);
 
   return {
@@ -439,8 +433,6 @@ export function useAgentReview(params: {
     agentReviewBusy,
     agentFeedback,
     fileReviseFeedback,
-    findingsOpen,
-    setFindingsOpen,
     explainSelected,
     explainWholeFile,
     explainWithAgent,

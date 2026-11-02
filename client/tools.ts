@@ -178,12 +178,6 @@ export type ProjectIdentity = { projectId: string; displayName: string; rootPath
 export type FileCommentEntry = { hunk: SelectedHunk; decision: ReviewDecision };
 export type AgentFeedbackMap = Record<string, AgentFeedbackState>;
 export type CommentDraftsMap = Record<string, FileCommentDraft>;
-export type ProjectCommentsByTarget = Array<{
-  cwd: string;
-  scope: ReviewScope;
-  targetFingerprint: string;
-  files: Array<{ filePath: string; comments: ProjectReviewComment[] }>;
-}>;
 
 /**
  * One comment whose Agent reported COMPLETED and which no human accepted yet.

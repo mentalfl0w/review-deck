@@ -1,28 +1,13 @@
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import type {
-  ActionableReviewFinding,
-  ExplainHunkAiResult,
-  ExplainHunkResult,
-  LineRangeSelection,
-  PollVerificationRunResult,
-  ReviewAnchor,
-  ReviewAnchorIssue,
-  ReviewScope,
-  PollAiReviewResult,
-  ReviewSections,
-  ReviewVerificationSuggestion,
-} from "../../shared/review";
-import { hunkHeaderParts } from "../diffView";
-import { anchorLineRange, lineSelectionLocationText, lineSelectionRange, type LineSelectionState, type LineSide } from "../lineRange";
+import type { ReviewScope } from "../../shared/review";
 import {
   maxSeverity,
   severityLabelKeys,
   severityOrder,
+  viewModeKeys,
   type AgentFeedbackMap,
   type DiffMode,
-  type FileCommentDraft,
-  type FileCommentEntry,
   type FileViewResult,
   type PanelLayout,
   type PanelTheme,
@@ -31,26 +16,24 @@ import {
   type SelectedHunk,
   type ViewMode,
 } from "../tools";
-import { viewModeKeys } from "../tools";
 import type { TFunc } from "../i18n";
 import type { PanelStyles } from "../styles";
-import { ActionButton, FindingGroup, Segmented, SeverityBadge, StringGroup } from "./ui";
-import type { CapturedVerificationUi, FindingGroupEntry, FindingPromotionResult } from "./ui";
+import { ActionButton, Segmented, SeverityBadge } from "./ui";
 import { HunkCard } from "./HunkCard";
 import { FileView } from "./FileView";
-import { CommentSheet } from "./CommentSheet";
-import { AnchorIssues } from "./AnchorIssues";
-import { AiReviewMeta } from "./AiReviewMeta";
-import { VerificationCommands } from "./VerificationCommands";
+import type { LineSelectionState, LineSide } from "../lineRange";
 
-/** Right-hand canvas: the file header, the change-block card and the comment
- * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentFindings, onPromoteFinding, capturedVerification, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue, pendingCommentReviews, acceptingCommentReviewId, onAcceptCommentReview }: {
+/**
+ * The diff canvas: the selected file's identity and file-level review actions
+ * stay pinned at the top, then the display toolbar, then the change-block card
+ * that owns the remaining height. Analysis, verification and the comment
+ * editor live in the inspector; this zone is the diff.
+ */
+export function FileDetail({ theme, layout, t, styles, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, onExplainWithAgent, fileReviseFeedback, commentBody, onReviseFileFromComment, agentReviewBusy, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, pendingCommentReviews, acceptingCommentReviewId, onAcceptCommentReview }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
   styles: PanelStyles;
-  onHeightChange?: (height: number) => void;
   selected: SelectedHunk | null;
   selectedFile: ReviewFile | null;
   diffMode: DiffMode;
@@ -77,47 +60,12 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   agentsLoading: boolean;
   selectedAgentId: string | null;
   onOpenMore: () => void;
-  commentBody: string;
   aiExplainBusy: string | null;
   onExplainWithAgent: (agentId: string) => void;
-  findingsOpen: boolean;
-  onToggleFindingsOpen: () => void;
-  analysisStale: boolean;
-  explanation: ExplainHunkResult | null;
-  aiExplanation: ExplainHunkAiResult | null;
-  agentReview: string | null;
-  agentSections: ReviewSections | null;
-  agentFindings: ActionableReviewFinding[] | undefined;
-  onPromoteFinding?: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
-  capturedVerification?: CapturedVerificationUi;
-  verificationRuns: Readonly<Record<string, PollVerificationRunResult>>;
-  verificationEnabled: boolean;
-  onRunVerification: (suggestion: ReviewVerificationSuggestion) => Promise<void>;
-  onRefreshVerification: (runId: string) => Promise<void>;
-  onVerificationError: (message: string) => void;
-  agentReviewMeta: Pick<PollAiReviewResult, "provider" | "model" | "thinkingOptionId" | "reviewerPermissionMode" | "resultSource" | "mode" | "depth" | "reviewPreset" | "usage"> | null;
-  agentReviewBusy: boolean;
-  showAiReviewUsage: boolean;
-  activeCommentDraft: FileCommentDraft | undefined;
-  activeSavedComment: FileCommentEntry | null;
-  onCommentBodyChange: (body: string) => void;
-  commentSaving: boolean;
-  commentNotice: string | null;
-  commentAnchorHunk: SelectedHunk | null;
-  commentAnchorHunkId: string;
-  commentAnchorIsCurrent: boolean;
-  commentAnchorMoveArmed: boolean;
-  onReturnToAnchor: (hunkId: string) => void;
-  onMoveAnchor: () => void;
-  otherSavedComments: FileCommentEntry[];
-  otherCommentsOpen: boolean;
-  onToggleOtherComments: () => void;
-  onEditSavedComment: (hunkId: string) => void;
-  onSaveComment: () => void;
-  agentFeedback: AgentFeedbackMap;
   fileReviseFeedback: AgentFeedbackMap;
-  onReviseCurrentFromComment: (agentId: string) => void;
+  commentBody: string;
   onReviseFileFromComment: (agentId: string) => void;
+  agentReviewBusy: boolean;
   /** The live line-range selection of the current change block, its press
    * handlers and the strip actions. */
   lineSelection: LineSelectionState;
@@ -125,16 +73,6 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   onLineTap: (side: LineSide, line: number) => void;
   onClearLineSelection: () => void;
   onCommentLineSelection: () => void;
-  /** Bumped by the strip's comment action; the dock focuses its input on each
-   * new value. */
-  commentRequestNonce: number;
-  /** Unresolved anchors (ambiguous/stale) of the current target. */
-  anchorIssues: ReviewAnchorIssue[];
-  reanchorBusyIssueId: string | null;
-  reanchorNotice: string | null;
-  /** Heal one anchor issue against an explicitly chosen target of the current
-   * snapshot (a resolved candidate, or the current selection). */
-  onReanchorIssue: (issue: ReviewAnchorIssue, target: SelectedHunk, lineRange: LineRangeSelection | null) => void;
   /** Agent-reported completions of this file awaiting a human decision. */
   pendingCommentReviews: PendingCommentReview[];
   acceptingCommentReviewId: string | null;
@@ -145,301 +83,173 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
     setConfirmRevert(false);
   }, [selectedFile?.path]);
   if (!selected || !selectedFile) {
-    return <Text style={styles.empty}>{t("noReviewableHunk")}</Text>;
+    return (
+      <View style={styles.detailCanvas}>
+        <Text style={styles.empty}>{t("noReviewableHunk")}</Text>
+      </View>
+    );
   }
   const selectedFileSeverity = severityOrder.find((candidate) => selectedFile.hunks.some((hunk) => maxSeverity(hunk) === candidate)) ?? "informational";
   const selectedMeta = {
     language: selected.language ?? selectedFile.language,
     functionHint: selected.functionHint,
   };
-  // Anchor issues are shown for the file being reviewed, and their candidates
-  // are resolved against THIS file's hunks: a candidate the current snapshot no
-  // longer contains is presented as unavailable instead of being re-anchored
-  // onto stale geometry.
-  const issuesForFile = anchorIssues.filter((issue) =>
-    issue.filePath === selectedFile.path ||
-    issue.filePath === selectedFile.oldPath ||
-    issue.candidates.some((candidate) => candidate.filePath === selectedFile.path));
-  const hunkLabels: Record<string, string> = Object.fromEntries(
-    selectedFile.hunks.map((hunk): [string, string] => [hunk.id, hunkHeaderParts(hunk.header).range]),
-  );
-  const selectedLineRange = lineSelectionRange(lineSelection);
-  const selectionLabel = selectedLineRange ? lineSelectionLocationText(t, selectedLineRange) : null;
-  const visibleAgentFindings = agentFindings?.filter((finding) => finding.filePath === selectedFile.path) ?? [];
-  const reanchorTo = (issue: ReviewAnchorIssue, candidate: ReviewAnchor | null) => {
-    // No candidate: the manual path, anchored to what the user selected in the
-    // diff right now (the card only offers it for the same file).
-    if (!candidate) {
-      onReanchorIssue(issue, selected, selectedLineRange);
-      return;
-    }
-    const target = candidate.kind === "file"
-      ? undefined
-      : selectedFile.hunks.find((hunk) => hunk.id === candidate.hunkId);
-    if (target) onReanchorIssue(issue, target, anchorLineRange(candidate));
-  };
+  const viewModeOptions = viewModeKeys.map((option) => ({
+    value: option.value,
+    label: t(option.key),
+    tooltip: t(option.value === "diff" ? "viewModeDiffHint" : option.value === "blockFile" ? "viewModeBlockFileHint" : "viewModeFullChangesHint"),
+  }));
   return (
     <View style={styles.detailCanvas}>
-      <View style={styles.detailInner} onLayout={(event) => onHeightChange?.(event.nativeEvent.layout.height)}>
-        {layout.compact ? (
-          <View style={styles.backRow}>
+      {layout.compact ? (
+        <View style={[styles.backRow, styles.compactBackRow]}>
           <Pressable accessibilityRole="button" onPress={onBack} style={styles.topButton}>
             <Text style={styles.topButtonText}>‹ {t("backToFiles")}</Text>
           </Pressable>
         </View>
       ) : null}
-
-        <View style={styles.fileHeader}>
-          <View style={styles.fileHeaderTop}>
-            <View style={{ flex: 1, minWidth: 180, gap: 3 }}>
-              <Text style={styles.sectionEyebrow}>{t("fileDetail")}</Text>
-              <Text selectable numberOfLines={layout.compact ? 2 : 1} ellipsizeMode="middle" style={styles.fileHeaderPath}>{selectedFile.path}</Text>
-            </View>
-            <SeverityBadge
-              severity={selectedFileSeverity}
-              label={t(severityLabelKeys[selectedFileSeverity])}
-              theme={theme}
-              compact={layout.compact}
-            />
+      <View style={styles.canvasHeader}>
+        <View style={styles.fileHeaderTop}>
+          <View style={styles.fileHeaderTitle}>
+            <Text style={styles.sectionEyebrow}>{t("fileDetail")}</Text>
+            <Text selectable numberOfLines={layout.compact ? 2 : 1} ellipsizeMode="middle" style={styles.fileHeaderPath}>{selectedFile.path}</Text>
           </View>
-          <Text numberOfLines={1} style={styles.sectionSummary}>
-            {t("fileChangeSummary", {
-              hunks: selectedFile.hunks.length,
-              additions: selectedFile.additions,
-              deletions: selectedFile.deletions,
-            })}
-          </Text>
-          <View style={styles.fileActionRow}>
-            <ActionButton
-              variant="secondary"
-              label={fileReviewed ? t("markFileReviewedDone") : t("markFileReviewed")}
-              disabled={fileReviewed}
-              onPress={onMarkFileReviewed}
-              theme={theme}
-              layout={layout}
-            />
-            <ActionButton
-              variant="secondary"
-              label={t("ruleAnalyzeFile")}
-              tooltip={t("ruleAnalyzeFileHint")}
-              onPress={onExplainFile}
-              theme={theme}
-              layout={layout}
-            />
-            <ActionButton
-              variant="secondary"
-              label={agentReviewBusy ? t("aiReviewRunning") : t("agentFileReviewLabel")}
-              tooltip={agentsLoading ? t("agentsLoading") : selectedAgentId ? t("agentFileReviewHint") : t("agentActionNoAgentHint")}
-              disabled={agentsLoading || !selectedAgentId || agentReviewBusy}
-              onPress={() => { if (selectedAgentId) void onRunAgentReview(selectedAgentId, selectedFile.path); }}
-              theme={theme}
-              layout={layout}
-            />
-            <ActionButton
-              variant="secondary"
-              disabled={agentsLoading || !selectedAgentId || fileReviseFeedback[selectedAgentId]?.phase === "sending" || commentBody.trim().length === 0}
-              label={fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sending" ? t("reviseFileCommentBusyLabel") : t("reviseFileCommentLabel")}
-              tooltip={agentsLoading ? t("agentsLoading") : !selectedAgentId ? t("agentActionNoAgentHint") : commentBody.trim().length === 0 ? t("reviseFileCommentNoCommentHint") : t("reviseFileCommentHint")}
-              onPress={() => { if (selectedAgentId) void onReviseFileFromComment(selectedAgentId); }}
-              theme={theme}
-              layout={layout}
-            />
-            <ActionButton
-              variant={confirmRevert ? "danger" : "ghost"}
-              label={confirmRevert ? t("revertFileConfirm") : t("revertFile")}
-              onPress={() => {
-                if (confirmRevert) {
-                  setConfirmRevert(false);
-                  onRevertFile();
-                } else {
-                  setConfirmRevert(true);
-                }
-              }}
-              theme={theme}
-              layout={layout}
-            />
-          </View>
-          {revertNotice ? <Text style={styles.fileStatusAccent}>{revertNotice}</Text> : null}
-          {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sent" ? <Text style={styles.feedbackSent}>✓ {t("reviseFileSent")}</Text> : null}
-          {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "error" ? (
-            <Text style={styles.feedbackError}>{fileReviseFeedback[selectedAgentId ?? ""]?.message ?? t("reviseFileSendFailed")}</Text>
-          ) : null}
-          {selectedMeta?.functionHint || selectedMeta?.language || selectedFile.language ? (
-            <View style={styles.tagRow}>
-              {selectedMeta?.language || selectedFile.language ? <Text style={styles.tagPill}>{selectedMeta?.language ?? selectedFile.language}</Text> : null}
-              {selectedMeta?.functionHint ? <Text style={styles.tagPill} numberOfLines={1}>{selectedMeta.functionHint}</Text> : null}
-            </View>
-          ) : null}
+          <SeverityBadge
+            severity={selectedFileSeverity}
+            label={t(severityLabelKeys[selectedFileSeverity])}
+            theme={theme}
+            compact={layout.compact}
+          />
         </View>
-        <View style={styles.diffLayoutRow}>
-          <Text style={styles.label}>{t("diffLayout")}</Text>
+        <Text numberOfLines={1} style={styles.sectionSummary}>
+          {t("fileChangeSummary", {
+            hunks: selectedFile.hunks.length,
+            additions: selectedFile.additions,
+            deletions: selectedFile.deletions,
+          })}
+        </Text>
+        {selectedMeta?.functionHint || selectedMeta?.language || selectedFile.language ? (
+          <View style={styles.tagRow}>
+            {selectedMeta?.language || selectedFile.language ? <Text style={styles.tagPill}>{selectedMeta?.language ?? selectedFile.language}</Text> : null}
+            {selectedMeta?.functionHint ? <Text style={styles.tagPill} numberOfLines={1}>{selectedMeta.functionHint}</Text> : null}
+          </View>
+        ) : null}
+        <View style={styles.fileActionRow}>
+          <Text style={styles.label}>{t("fileActionsLabel")}</Text>
+          <ActionButton
+            variant="secondary"
+            label={fileReviewed ? t("markFileReviewedDone") : t("markFileReviewed")}
+            tooltip={fileReviewed ? t("markFileReviewedDoneHint") : t("markFileReviewedHint")}
+            disabled={fileReviewed}
+            onPress={onMarkFileReviewed}
+            theme={theme}
+            layout={layout}
+          />
+          <ActionButton
+            variant="secondary"
+            label={t("ruleAnalyzeFile")}
+            tooltip={t("ruleAnalyzeFileHint")}
+            onPress={onExplainFile}
+            theme={theme}
+            layout={layout}
+          />
+          <ActionButton
+            variant="secondary"
+            label={agentReviewBusy ? t("aiReviewRunning") : t("agentFileReviewLabel")}
+            tooltip={agentsLoading ? t("agentsLoading") : selectedAgentId ? t("agentFileReviewHint") : t("agentActionNoAgentHint")}
+            disabled={agentsLoading || !selectedAgentId || agentReviewBusy}
+            onPress={() => { if (selectedAgentId) void onRunAgentReview(selectedAgentId, selectedFile.path); }}
+            theme={theme}
+            layout={layout}
+          />
+          <ActionButton
+            variant="secondary"
+            disabled={agentsLoading || !selectedAgentId || fileReviseFeedback[selectedAgentId]?.phase === "sending" || commentBody.trim().length === 0}
+            label={fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sending" ? t("reviseFileCommentBusyLabel") : t("reviseFileCommentLabel")}
+            tooltip={agentsLoading ? t("agentsLoading") : !selectedAgentId ? t("agentActionNoAgentHint") : commentBody.trim().length === 0 ? t("reviseFileCommentNoCommentHint") : t("reviseFileCommentHint")}
+            onPress={() => { if (selectedAgentId) void onReviseFileFromComment(selectedAgentId); }}
+            theme={theme}
+            layout={layout}
+          />
+          <View style={styles.blockActionPush} />
+          <ActionButton
+            variant={confirmRevert ? "danger" : "ghost"}
+            label={confirmRevert ? t("revertFileConfirm") : t("revertFile")}
+            tooltip={confirmRevert ? t("revertFileConfirmHint") : t("revertFileHint")}
+            onPress={() => {
+              if (confirmRevert) {
+                setConfirmRevert(false);
+                onRevertFile();
+              } else {
+                setConfirmRevert(true);
+              }
+            }}
+            theme={theme}
+            layout={layout}
+          />
+        </View>
+        {!agentsLoading && !selectedAgentId ? (
+          <Text style={styles.blockActionReason}>{t("agentActionNoAgentHint")}</Text>
+        ) : null}
+        {revertNotice ? <Text style={styles.fileStatusAccent}>{revertNotice}</Text> : null}
+        {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "sent" ? <Text style={styles.feedbackSent}>✓ {t("reviseFileSent")}</Text> : null}
+        {fileReviseFeedback[selectedAgentId ?? ""]?.phase === "error" ? (
+          <Text style={styles.feedbackError}>{fileReviseFeedback[selectedAgentId ?? ""]?.message ?? t("reviseFileSendFailed")}</Text>
+        ) : null}
+      </View>
+      <View style={styles.canvasToolbar}>
+        <View style={styles.toolbarGroup}>
+          <Text style={styles.toolbarLabel}>{t("viewRangeLabel")}</Text>
           <Segmented
-            options={viewModeKeys.map((option) => ({
-              value: option.value,
-              label: t(option.key),
-              tooltip: t(option.value === "diff" ? "viewModeDiffHint" : option.value === "blockFile" ? "viewModeBlockFileHint" : "viewModeFullChangesHint"),
-            }))}
+            options={viewModeOptions}
             value={viewMode}
             onChange={onViewModeChange}
             theme={theme}
             layout={layout}
           />
         </View>
+      </View>
 
-        {viewMode === "fullChanges" ? (
-          <ScrollView style={styles.diffScroll} contentContainerStyle={styles.diffScrollContent} nestedScrollEnabled showsVerticalScrollIndicator>
-            <FileView t={t} styles={styles} result={fileViewResult} loading={fileViewLoading} error={fileViewError} selectedHunkId={selected.id} />
-          </ScrollView>
-        ) : (
-          <HunkCard
-            theme={theme}
-            layout={layout}
-            t={t}
-            styles={styles}
-            file={selectedFile}
-            hunk={selected}
-            onSelectHunk={onSelectHunk}
-            diffMode={diffMode}
-            onDiffModeChange={onDiffModeChange}
-            viewMode={viewMode}
-            fileViewResult={fileViewResult}
-            fileViewLoading={fileViewLoading}
-            fileViewError={fileViewError}
-            scope={scope}
-            currentHunkHasComment={currentHunkHasComment}
-            reviewed={reviewed}
-            onMarkReviewed={onMarkReviewed}
-            onExplain={onExplain}
-            onReject={onReject}
-            agentsLoading={agentsLoading}
-            selectedAgentId={selectedAgentId}
-            aiExplainBusy={aiExplainBusy}
-            onExplainWithAgent={onExplainWithAgent}
-            onOpenMore={onOpenMore}
-            findingsOpen={findingsOpen}
-            onToggleFindingsOpen={onToggleFindingsOpen}
-            analysisStale={analysisStale}
-            explanation={explanation}
-            aiExplanation={aiExplanation}
-            showAiReviewUsage={showAiReviewUsage}
-            selection={lineSelection}
-            onLinePress={onLinePress}
-            onLineTap={onLineTap}
-            onClearSelection={onClearLineSelection}
-            onCommentSelection={onCommentLineSelection}
-            onPromoteFinding={onPromoteFinding}
-            promotionEnabled={verificationEnabled}
-            capturedVerification={capturedVerification}
-            pendingCommentReviews={pendingCommentReviews}
-            acceptingCommentReviewId={acceptingCommentReviewId}
-            onAcceptCommentReview={onAcceptCommentReview}
-          />
-        )}
-
-        {agentReview ? (
-          <View style={styles.analysisBlock}>
-            <Text style={styles.label}>
-              {agentReviewMeta
-                ? t("aiReviewLabel", { provider: agentReviewMeta.provider, model: agentReviewMeta.model })
-                : t("aiReview")}
-            </Text>
-            {agentReviewMeta ? <AiReviewMeta details={agentReviewMeta} showUsage={showAiReviewUsage} t={t} styles={styles} /> : null}
-            {agentSections && (
-              agentSections.summary ||
-              agentFindings !== undefined ||
-              agentSections.verifiedFacts.length > 0 ||
-              agentSections.aiInference.length > 0 ||
-              agentSections.humanVerificationRecommended.length > 0 ||
-              (agentSections.verificationCommands?.length ?? 0) > 0
-            ) ? (
-              <>
-                {agentSections.summary ? <Text selectable style={styles.scopeDesc}>{agentSections.summary}</Text> : null}
-                {agentFindings !== undefined ? (
-                  visibleAgentFindings.length > 0 ? (
-                    <>
-                      <FindingGroup label={t("findingsVerified")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "verified_fact")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
-                      <FindingGroup label={t("findingsInference")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "ai_inference")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
-                      <FindingGroup label={t("findingsHuman")} findings={visibleAgentFindings.filter((finding) => finding.evidenceKind === "human_verification_recommended")} t={t} theme={theme} layout={layout} styles={styles} onPromote={onPromoteFinding} promotionEnabled={verificationEnabled} capturedVerification={capturedVerification} />
-                    </>
-                  ) : <Text style={styles.muted}>{t("noFindings")}</Text>
-                ) : (
-                  <>
-                    <StringGroup label={t("findingsVerified")} items={agentSections.verifiedFacts} t={t} styles={styles} />
-                    <StringGroup label={t("findingsInference")} items={agentSections.aiInference} t={t} styles={styles} />
-                    <StringGroup label={t("findingsHuman")} items={agentSections.humanVerificationRecommended} t={t} styles={styles} />
-                  </>
-                )}
-                <VerificationCommands
-                  theme={theme}
-                  layout={layout}
-                  t={t}
-                  styles={styles}
-                  commands={agentSections.verificationCommands ?? []}
-                  runs={verificationRuns}
-                  enabled={verificationEnabled}
-                  onRun={onRunVerification}
-                  onError={onVerificationError}
-                  onRefresh={onRefreshVerification}
-                />
-              </>
-            ) : <Text selectable style={styles.rawReview}>{agentReview}</Text>}
-          </View>
-        ) : null}
-        <View style={styles.commentArea}>
-        <AnchorIssues
+      {viewMode === "fullChanges" ? (
+        <ScrollView style={styles.canvasScroll} contentContainerStyle={styles.canvasScrollContent} nestedScrollEnabled showsVerticalScrollIndicator>
+          <FileView t={t} styles={styles} result={fileViewResult} loading={fileViewLoading} error={fileViewError} selectedHunkId={selected.id} />
+        </ScrollView>
+      ) : (
+        <HunkCard
           theme={theme}
           layout={layout}
           t={t}
           styles={styles}
-          issues={issuesForFile}
-          hunkLabels={hunkLabels}
-          selectedFilePath={selectedFile.path}
-          selectionHunkId={selected.id}
-          selectionLabel={selectionLabel}
-          selectionPending={lineSelection?.awaitingEnd ?? false}
-          busyIssueId={reanchorBusyIssueId}
-          notice={reanchorNotice}
-          onSelectCandidate={(_issue, candidate) => {
-            // Candidates are hunk or range anchors by construction; a file
-            // anchor carries no change block to jump to.
-            if (candidate.kind !== "file") onSelectHunk(candidate.hunkId);
-          }}
-          onReanchor={reanchorTo}
-        />
-        <CommentSheet
-          theme={theme}
-          layout={layout}
-          t={t}
-          styles={styles}
-          selected={selected}
-          activeCommentDraft={activeCommentDraft}
-          activeSavedComment={activeSavedComment}
-          commentBody={commentBody}
-          onCommentBodyChange={onCommentBodyChange}
-          commentSaving={commentSaving}
-          commentNotice={commentNotice}
-          commentAnchorHunk={commentAnchorHunk}
-          commentAnchorHunkId={commentAnchorHunkId}
-          commentAnchorIsCurrent={commentAnchorIsCurrent}
-          commentAnchorMoveArmed={commentAnchorMoveArmed}
-          onReturnToAnchor={onReturnToAnchor}
-          onMoveAnchor={onMoveAnchor}
-          otherSavedComments={otherSavedComments}
-          otherCommentsOpen={otherCommentsOpen}
-          onToggleOtherComments={onToggleOtherComments}
-          onEditSavedComment={onEditSavedComment}
-          onSaveComment={onSaveComment}
+          file={selectedFile}
+          hunk={selected}
+          onSelectHunk={onSelectHunk}
+          diffMode={diffMode}
+          onDiffModeChange={onDiffModeChange}
+          viewMode={viewMode}
+          fileViewResult={fileViewResult}
+          fileViewLoading={fileViewLoading}
+          fileViewError={fileViewError}
+          scope={scope}
+          currentHunkHasComment={currentHunkHasComment}
+          reviewed={reviewed}
+          onMarkReviewed={onMarkReviewed}
+          onExplain={onExplain}
+          onReject={onReject}
           agentsLoading={agentsLoading}
           selectedAgentId={selectedAgentId}
-          agentFeedback={agentFeedback}
-          onReviseCurrentFromComment={onReviseCurrentFromComment}
-          selection={selectedLineRange}
-          selectionPending={lineSelection?.awaitingEnd ?? false}
-          selectionText={selectionLabel}
-          commentRequestNonce={commentRequestNonce}
-          />
-        </View>
-      </View>
+          aiExplainBusy={aiExplainBusy}
+          onExplainWithAgent={onExplainWithAgent}
+          onOpenMore={onOpenMore}
+          selection={lineSelection}
+          onLinePress={onLinePress}
+          onLineTap={onLineTap}
+          onClearSelection={onClearLineSelection}
+          onCommentSelection={onCommentLineSelection}
+          pendingCommentReviews={pendingCommentReviews}
+          acceptingCommentReviewId={acceptingCommentReviewId}
+          onAcceptCommentReview={onAcceptCommentReview}
+        />
+      )}
     </View>
   );
 }

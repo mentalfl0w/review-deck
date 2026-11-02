@@ -5,9 +5,7 @@ import {
   processProjectReview,
   releaseUnknownReviewBatch,
   type ProcessProjectReviewResult,
-  type ProjectReviewComment,
   type ProjectReviewSummary,
-  type ReviewScope,
 } from "../../shared/review";
 import type { AgentEntry } from "../tools";
 import { canSubmitProjectReviewGroup, groupProjectReviewComments, type WorkspaceDirectoryOwner } from "../project-review-workspaces";
@@ -224,31 +222,6 @@ export function useProjectComments(params: {
     projectComments.commentCount > 0 &&
     workspaceGroups.some(canSubmitProjectReviewGroup) &&
     !processingProject;
-  const commentsByTarget = useMemo(() => {
-    const targets = new Map<string, {
-      cwd: string;
-      scope: ReviewScope;
-      targetFingerprint: string;
-      files: Map<string, { filePath: string; comments: ProjectReviewComment[] }>;
-    }>();
-    for (const comment of projectComments?.comments ?? []) {
-      const targetKey = `${comment.cwd}\u0000${comment.scope}\u0000${comment.targetFingerprint}`;
-      const target = targets.get(targetKey) ?? {
-        cwd: comment.cwd,
-        scope: comment.scope,
-        targetFingerprint: comment.targetFingerprint,
-        files: new Map<string, { filePath: string; comments: ProjectReviewComment[] }>(),
-      };
-      const file = target.files.get(comment.filePath) ?? { filePath: comment.filePath, comments: [] };
-      file.comments.push(comment);
-      target.files.set(comment.filePath, file);
-      targets.set(targetKey, target);
-    }
-    return Array.from(targets.values(), (target) => ({
-      ...target,
-      files: Array.from(target.files.values()),
-    }));
-  }, [projectComments]);
 
   return {
     projectComments,
@@ -267,6 +240,5 @@ export function useProjectComments(params: {
     openProjectQueue,
     releaseUnknownBatch,
     canProcessProject,
-    commentsByTarget,
   };
 }

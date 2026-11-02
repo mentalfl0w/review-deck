@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRpc, useSettings, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
-import { Pressable, ScrollView, Text, View } from "react-native";
+import { ScrollView, Text, View, type LayoutChangeEvent } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n";
 import { scopeKeys, type DiffMode, type PendingCommentReview, type ViewMode } from "./tools";
 import { buildPanelStyles } from "./styles";
+import { resolveReviewPanelLayoutMode } from "./review-panel-layout";
 import { useReviewScope } from "./hooks/useReviewScope";
 import { useReviewSnapshot } from "./hooks/useReviewSnapshot";
 import { useLineSelection } from "./hooks/useLineSelection";
@@ -19,6 +20,8 @@ import { useProcessVerification } from "./hooks/useProcessVerification";
 import { ContextBar } from "./components/ContextBar";
 import { FileNavigator } from "./components/FileNavigator";
 import { FileDetail } from "./components/FileDetail";
+import { ReviewInspector, type AnchorIssueTarget, type InspectorTab } from "./components/ReviewInspector";
+import { ActionButton } from "./components/ui";
 import { QueueModal } from "./components/QueueModal";
 import { MoreModal } from "./components/MoreModal";
 import { ManageModal } from "./components/ManageModal";
@@ -47,12 +50,27 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
   const locale = manualLocale ?? (configuredLocale === "auto" ? detectLocale() : configuredLocale);
   const t = useMemo(() => makeT(locale), [locale]);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [shellSize, setShellSize] = useState({ width: 0, height: 0 });
+  const panelMode = resolveReviewPanelLayoutMode(layout.compact, shellSize.width, shellSize.height);
+  const compact = panelMode === "compact";
+  const panelLayout = useMemo(
+    () => (compact && !layout.compact ? { ...layout, compact: true } : layout),
+    [compact, layout],
+  );
+  const handleShellLayout = useCallback((event: LayoutChangeEvent) => {
+    const { width, height } = event.nativeEvent.layout;
+    setShellSize((current) =>
+      Math.abs(current.width - width) > 1 || Math.abs(current.height - height) > 1
+        ? { width, height }
+        : current,
+    );
+  }, []);
   const configuredDiffMode = settings.status === "ready" ? settings.values.diffMode : "auto";
   const showAiReviewUsage = settings.status === "ready" ? settings.values.showAiReviewUsage : true;
   const defaultReviewPreset: AiReviewBudgetPreset =
     settings.status === "ready" ? settings.values.defaultReviewPreset : "balanced";
   const defaultDiffMode: DiffMode = configuredDiffMode === "auto"
-    ? (layout.compact ? "unified" : "split")
+    ? (compact ? "unified" : "split")
     : configuredDiffMode;
   const diffModeManuallySelected = useRef(false);
   const [diffMode, setDiffMode] = useState<DiffMode>(defaultDiffMode);
@@ -64,7 +82,10 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     setDiffMode(mode);
   }, []);
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
-  const [compactFilesOpen, setCompactFilesOpen] = useState(layout.compact);
+  const [compactFilesOpen, setCompactFilesOpen] = useState(compact);
+  useEffect(() => {
+    if (compact) setCompactFilesOpen(true);
+  }, [compact]);
   const [moreOpen, setMoreOpen] = useState(false);
   const [previewUrlDraft, setPreviewUrlDraft] = useState("");
   const previewUrlProjectRef = useRef<string | null>(null);
@@ -77,10 +98,9 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
   const initialQueueOpenedForRef = useRef<number | null>(null);
   const autoRunTargetedStartedRef = useRef<number | null>(null);
   const markReadRpc = useRpc(markWorkspaceReviewResultsRead);
-  const [detailHeight, setDetailHeight] = useState(0);
-  const handleDetailHeightChange = useCallback((height: number) => {
-    setDetailHeight((currentHeight) => Math.abs(currentHeight - height) > 1 ? height : currentHeight);
-  }, []);
+  // Contextual inspector tab and the measured shell width that decides whether
+  // the inspector can sit beside the canvas without starving it.
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("comment");
   const scopeApi = useReviewScope(workspaceId);
   const previewProjectId = scopeApi.effectiveProjectId;
   const configuredPreviewUrl = settings.status === "ready" && previewProjectId
@@ -204,6 +224,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
   const [commentRequestNonce, setCommentRequestNonce] = useState(0);
   const requestCommentOnSelection = useCallback(() => {
     setCommentRequestNonce((current) => current + 1);
+    setInspectorTab("comment");
   }, []);
   const commentsApi = useProjectComments({
     effectiveProjectId: scopeApi.effectiveProjectId,
@@ -268,8 +289,21 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
   ) => {
     const depthOverride = requestedDepth ?? reviewDepthOverride;
     setReviewDepthOverride(null);
+    setInspectorTab("analysis");
     void agentApi.runAgentReview(agentId, filePath, depthOverride ?? undefined);
   }, [agentApi.runAgentReview, reviewDepthOverride]);
+  const explainSelected = useCallback(() => {
+    setInspectorTab("analysis");
+    void agentApi.explainSelected();
+  }, [agentApi.explainSelected]);
+  const explainFile = useCallback(() => {
+    setInspectorTab("analysis");
+    void agentApi.explainWholeFile();
+  }, [agentApi.explainWholeFile]);
+  const explainWithAgent = useCallback((agentId: string) => {
+    setInspectorTab("analysis");
+    void agentApi.explainWithAgent(agentId);
+  }, [agentApi.explainWithAgent]);
   useEffect(() => {
     if (
       targetedReviewRequestId === null ||
@@ -372,7 +406,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     actionsApi.stageSavedCommentDraft(actionsApi.activeCommentKey, saved.hunk.id, saved.decision.comment);
   }, [actionsApi.activeCommentKey, actionsApi.selectedFileComments, actionsApi.stageSavedCommentDraft, selectHunk]);
 
-  const styles = useMemo(() => buildPanelStyles(theme, layout), [layout.compact, theme]);
+  const styles = useMemo(() => buildPanelStyles(theme, panelLayout), [panelLayout, theme]);
   // A workspace launch request may prefer its originating Agent. Apply that
   // preference once per request after the registry settles, then preserve the
   // user's choice from More until another launch arrives.
@@ -416,12 +450,12 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
   const activeWorkspaceStatus = scopeApi.workspace?.status ?? "";
   const projectCommentCount = commentsApi.projectComments?.commentCount ?? 0;
   // Files whose saved comments could not be re-anchored on their own. This is
-  // the cross-file entry point: the re-anchor card lives in the file detail,
-  // so an issue of a file the user is not looking at would otherwise be
-  // invisible. Each entry jumps to the file's first change block.
-  const anchorIssueFiles = useMemo(() => {
+  // the cross-file entry point: the re-anchor card lives in the inspector's
+  // comment tab, so an issue of a file the user is not looking at would
+  // otherwise be invisible. Each entry jumps to the file's first change block.
+  const anchorIssueTargets = useMemo(() => {
     const files = snapshotApi.snapshot?.files ?? [];
-    const paths: string[] = [];
+    const targets: AnchorIssueTarget[] = [];
     for (const issue of snapshotApi.anchorIssues) {
       const candidatePath = issue.candidates.find((candidate) =>
         files.some((file) => file.path === candidate.filePath))?.filePath;
@@ -430,10 +464,35 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
         (files.some((file) => file.path === issue.filePath) ? issue.filePath : undefined) ??
         renamedPath ??
         issue.filePath;
-      if (!paths.includes(path)) paths.push(path);
+      if (targets.some((target) => target.path === path)) continue;
+      targets.push({ path, hunkId: files.find((file) => file.path === path)?.hunks[0]?.id ?? null });
     }
-    return paths;
+    return targets;
   }, [snapshotApi.anchorIssues, snapshotApi.snapshot]);
+
+  /**
+   * Queue navigation: a completed comment of THIS workspace is locatable only
+   * while its dispatch-time window still overlaps a change block of the
+   * current snapshot. The map is rebuilt from the same reviews the block card
+   * offers for acceptance, so the queue can link to that block without ever
+   * accepting anything itself.
+   */
+  const queueJumpTargets = useMemo(() => {
+    const targets = new Map<string, string>();
+    const files = snapshotApi.snapshot?.files ?? [];
+    for (const [filePath, reviews] of pendingCommentReviewsByFile) {
+      const file = files.find((candidate) => candidate.path === filePath);
+      if (!file) continue;
+      for (const review of reviews) {
+        const baselineEnd = review.baseline.oldStart + Math.max(review.baseline.oldCount, 1) - 1;
+        const hunk = file.hunks.find((candidate) =>
+          review.baseline.oldStart <= candidate.oldStart + Math.max(candidate.oldCount, 1) - 1 &&
+          candidate.oldStart <= baselineEnd);
+        if (hunk) targets.set(review.commentId, hunk.id);
+      }
+    }
+    return targets;
+  }, [pendingCommentReviewsByFile, snapshotApi.snapshot]);
   const analysisStale = snapshotApi.stale && (agentApi.explanation !== null || agentApi.aiExplanation !== null || agentApi.agentReview !== null);
 
   if (!scopeApi.workspace) {
@@ -454,122 +513,12 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     );
   }
 
-  const fileNavigator = snapshotApi.snapshot ? (
-    <FileNavigator
-      key="file-navigator"
-      theme={theme}
-      layout={layout}
-      t={t}
-      styles={styles}
-      paneHeight={layout.compact ? undefined : detailHeight}
-      snapshot={snapshotApi.snapshot}
-      decisions={snapshotApi.decisions}
-      fileCommentDrafts={actionsApi.fileCommentDrafts}
-      selectedFile={snapshotApi.selectedFile}
-      selected={snapshotApi.selected}
-      onSelectHunk={selectHunk}
-      onClose={() => setCompactFilesOpen(false)}
-    />
-  ) : null;
-
-  const fileDetail = (
-    <FileDetail
-      key="file-detail"
-      theme={theme}
-      layout={layout}
-      t={t}
-      styles={styles}
-      onHeightChange={handleDetailHeightChange}
-      selected={snapshotApi.selected}
-      selectedFile={snapshotApi.selectedFile}
-      diffMode={diffMode}
-      onDiffModeChange={selectDiffMode}
-      viewMode={viewMode}
-      onViewModeChange={setViewMode}
-      fileViewResult={fileViewApi.result}
-      fileViewLoading={fileViewApi.loading}
-      fileViewError={fileViewApi.error}
-      onBack={() => setCompactFilesOpen(true)}
-      onSelectHunk={selectHunk}
-      scope={scopeApi.scope}
-      currentHunkHasComment={actionsApi.currentHunkHasComment}
-      reviewed={snapshotApi.decisions.some((decision) => decision.hunkId === snapshotApi.selected?.id)}
-      fileReviewed={snapshotApi.selectedFile ? snapshotApi.selectedFile.hunks.every((hunk) => snapshotApi.decisions.some((decision) => decision.hunkId === hunk.id)) : false}
-      onMarkFileReviewed={() => void actionsApi.markFileReviewed()}
-      onExplainFile={() => void agentApi.explainWholeFile()}
-      onRunAgentReview={runReviewForAgent}
-      onRevertFile={() => void actionsApi.revertFileReview()}
-      revertNotice={actionsApi.revertNotice}
-      onMarkReviewed={() => void actionsApi.markReviewed()}
-      onExplain={() => void agentApi.explainSelected()}
-      onReject={() => void actionsApi.rejectSelected()}
-      agentsLoading={agentsApi.agentsLoading}
-      selectedAgentId={selectedAgentId}
-      onOpenMore={() => setMoreOpen(true)}
-      agentFeedback={agentApi.agentFeedback}
-      fileReviseFeedback={agentApi.fileReviseFeedback}
-      aiExplainBusy={agentApi.aiExplainBusy}
-      commentBody={actionsApi.commentBody}
-      commentAnchorIsCurrent={actionsApi.commentAnchorIsCurrent}
-      onExplainWithAgent={agentApi.explainWithAgent}
-      onReviseCurrentFromComment={agentApi.reviseCurrentFromComment}
-      onReviseFileFromComment={agentApi.reviseFileFromComment}
-      findingsOpen={agentApi.findingsOpen}
-      onToggleFindingsOpen={() => agentApi.setFindingsOpen((open) => !open)}
-      analysisStale={analysisStale}
-      explanation={agentApi.explanation}
-      aiExplanation={agentApi.aiExplanation}
-      agentReview={agentApi.agentReview}
-      agentSections={agentApi.agentSections}
-      agentFindings={agentApi.agentReviewFindings}
-      capturedVerification={processVerificationApi}
-      onPromoteFinding={actionsApi.promoteFinding}
-      agentReviewMeta={agentApi.agentReviewMeta}
-      agentReviewBusy={agentApi.agentReviewBusy}
-      verificationRuns={verificationApi.runs}
-      verificationEnabled={Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale && !analysisStale)}
-      onRunVerification={verificationApi.start}
-      onRefreshVerification={verificationApi.refresh}
-      onVerificationError={setActionError}
-      showAiReviewUsage={showAiReviewUsage}
-      activeCommentDraft={actionsApi.activeCommentDraft}
-      activeSavedComment={actionsApi.activeSavedComment}
-      onCommentBodyChange={actionsApi.setCommentBody}
-      commentSaving={actionsApi.commentSaving}
-      commentNotice={actionsApi.commentNotice}
-      commentAnchorHunk={actionsApi.commentAnchorHunk}
-      commentAnchorHunkId={actionsApi.commentAnchorHunkId}
-      commentAnchorMoveArmed={actionsApi.commentAnchorMoveArmed}
-      onReturnToAnchor={selectHunk}
-      onMoveAnchor={actionsApi.moveCommentAnchorToSelected}
-      otherSavedComments={actionsApi.otherSavedComments}
-      otherCommentsOpen={actionsApi.otherCommentsOpen}
-      onToggleOtherComments={() => actionsApi.setOtherCommentsOpen((open) => !open)}
-      onEditSavedComment={editSavedFileComment}
-      onSaveComment={() => void actionsApi.saveComment()}
-      lineSelection={lineSelectionApi.state}
-      onLinePress={selectLine}
-      onLineTap={tapLine}
-      onClearLineSelection={clearLineSelection}
-      onCommentLineSelection={requestCommentOnSelection}
-      commentRequestNonce={commentRequestNonce}
-      anchorIssues={snapshotApi.anchorIssues}
-      reanchorBusyIssueId={actionsApi.reanchorBusyIssueId}
-      reanchorNotice={actionsApi.reanchorNotice}
-      onReanchorIssue={(issue, target, range) => void actionsApi.reanchorIssue(issue, target, range)}
-      pendingCommentReviews={snapshotApi.selectedFile
-        ? pendingCommentReviewsByFile.get(snapshotApi.selectedFile.path) ?? []
-        : []}
-      acceptingCommentReviewId={actionsApi.acceptingCommentReviewId}
-      onAcceptCommentReview={(review) => void actionsApi.acceptCommentReview(review)}
-    />
-  );
-
-  const mainContent = [
+  const firstAnchorHunkId = anchorIssueTargets.find((target) => target.hunkId !== null)?.hunkId ?? null;
+  const narrowDesktop = panelMode === "narrow";
+  const contextBar = (
     <ContextBar
-      key="context"
       theme={theme}
-      layout={layout}
+      layout={panelLayout}
       t={t}
       styles={styles}
       onToggleLocale={() => {
@@ -587,81 +536,227 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
       stale={snapshotApi.stale}
       loading={snapshotApi.loading}
       snapshot={snapshotApi.snapshot}
-    />,
+    />
+  );
+  const fileNavigator = snapshotApi.snapshot ? (
+    <FileNavigator
+      key="file-navigator"
+      theme={theme}
+      layout={panelLayout}
+      t={t}
+      styles={styles}
+      snapshot={snapshotApi.snapshot}
+      decisions={snapshotApi.decisions}
+      fileCommentDrafts={actionsApi.fileCommentDrafts}
+      selectedFile={snapshotApi.selectedFile}
+      selected={snapshotApi.selected}
+      onSelectHunk={selectHunk}
+      onClose={() => setCompactFilesOpen(false)}
+    />
+  ) : null;
 
-    snapshotApi.stale ? (
-      <View key="stale" style={styles.staleStrip}>
-        <Text style={styles.staleStripText}>{t("staleBanner")}</Text>
-      </View>
-    ) : null,
-    anchorIssueFiles.length > 0 ? (
-      <View key="anchor-issues" style={styles.anchorIssuesCard}>
-        <Text style={styles.anchorIssueWarning}>{t("anchorIssueWarning")}</Text>
-        <Text style={styles.sectionSummary}>{t("anchorIssuesSummary", { count: snapshotApi.anchorIssues.length })}</Text>
-        <View style={styles.actionRow}>
-          {anchorIssueFiles.map((path) => {
-            // A file the current snapshot no longer contains has no change
-            // block to jump to; the path stays listed so the issue is not lost.
-            const firstHunk = snapshotApi.snapshot?.files.find((file) => file.path === path)?.hunks[0];
-            return firstHunk ? (
-              <Pressable
-                key={path}
-                accessibilityRole="button"
-                onPress={() => {
-                  selectHunk(firstHunk.id);
-                  setCompactFilesOpen(false);
-                }}
-                style={styles.topButton}
-              >
-                <Text numberOfLines={1} ellipsizeMode="middle" style={styles.topButtonText}>{path}</Text>
-              </Pressable>
-            ) : <Text key={path} numberOfLines={1} ellipsizeMode="middle" style={styles.muted}>{path}</Text>;
-          })}
-        </View>
-      </View>
-    ) : null,
-    actionError ? (
-      <View key="action-error" style={styles.errorCard}>
-        <Text style={styles.errorText}>{actionError}</Text>
-      </View>
-    ) : null,
+  const pendingCommentReviews = snapshotApi.selectedFile
+    ? pendingCommentReviewsByFile.get(snapshotApi.selectedFile.path) ?? []
+    : [];
 
-    snapshotApi.snapshot ? (
-      layout.compact ? (
-        compactFilesOpen ? fileNavigator : fileDetail
-      ) : (
-        <View key="workbench" style={styles.workbench}>
-          {fileNavigator}
-          {fileDetail}
+  const fileDetail = (
+    <FileDetail
+      key="file-detail"
+      theme={theme}
+      layout={panelLayout}
+      t={t}
+      styles={styles}
+      selected={snapshotApi.selected}
+      selectedFile={snapshotApi.selectedFile}
+      diffMode={diffMode}
+      onDiffModeChange={selectDiffMode}
+      viewMode={viewMode}
+      onViewModeChange={setViewMode}
+      fileViewResult={fileViewApi.result}
+      fileViewLoading={fileViewApi.loading}
+      fileViewError={fileViewApi.error}
+      onBack={() => setCompactFilesOpen(true)}
+      onSelectHunk={selectHunk}
+      scope={scopeApi.scope}
+      currentHunkHasComment={actionsApi.currentHunkHasComment}
+      reviewed={snapshotApi.decisions.some((decision) => decision.hunkId === snapshotApi.selected?.id)}
+      fileReviewed={snapshotApi.selectedFile ? snapshotApi.selectedFile.hunks.every((hunk) => snapshotApi.decisions.some((decision) => decision.hunkId === hunk.id)) : false}
+      onMarkFileReviewed={() => void actionsApi.markFileReviewed()}
+      onExplainFile={explainFile}
+      onRunAgentReview={runReviewForAgent}
+      onRevertFile={() => void actionsApi.revertFileReview()}
+      revertNotice={actionsApi.revertNotice}
+      onMarkReviewed={() => void actionsApi.markReviewed()}
+      onExplain={explainSelected}
+      onReject={() => void actionsApi.rejectSelected()}
+      agentsLoading={agentsApi.agentsLoading}
+      selectedAgentId={selectedAgentId}
+      onOpenMore={() => setMoreOpen(true)}
+      aiExplainBusy={agentApi.aiExplainBusy}
+      onExplainWithAgent={explainWithAgent}
+      fileReviseFeedback={agentApi.fileReviseFeedback}
+      commentBody={actionsApi.commentBody}
+      onReviseFileFromComment={agentApi.reviseFileFromComment}
+      agentReviewBusy={agentApi.agentReviewBusy}
+      lineSelection={lineSelectionApi.state}
+      onLinePress={selectLine}
+      onLineTap={tapLine}
+      onClearLineSelection={clearLineSelection}
+      onCommentLineSelection={requestCommentOnSelection}
+      pendingCommentReviews={pendingCommentReviews}
+      acceptingCommentReviewId={actionsApi.acceptingCommentReviewId}
+      onAcceptCommentReview={(review) => void actionsApi.acceptCommentReview(review)}
+    />
+  );
+
+  const inspector = (
+    <ReviewInspector
+      theme={theme}
+      layout={panelLayout}
+      t={t}
+      styles={styles}
+      tab={inspectorTab}
+      onTabChange={setInspectorTab}
+      narrow={narrowDesktop}
+      selected={snapshotApi.selected}
+      selectedFile={snapshotApi.selectedFile}
+      analysisStale={analysisStale}
+      explanation={agentApi.explanation}
+      aiExplanation={agentApi.aiExplanation}
+      agentReview={agentApi.agentReview}
+      agentSections={agentApi.agentSections}
+      agentFindings={agentApi.agentReviewFindings}
+      agentReviewMeta={agentApi.agentReviewMeta}
+      showAiReviewUsage={showAiReviewUsage}
+      onPromoteFinding={actionsApi.promoteFinding}
+      capturedVerification={processVerificationApi}
+      verificationRuns={verificationApi.runs}
+      verificationEnabled={Boolean(snapshotApi.snapshot && !snapshotApi.loading && !snapshotApi.stale && !analysisStale)}
+      onRunVerification={verificationApi.start}
+      onRefreshVerification={verificationApi.refresh}
+      onVerificationError={setActionError}
+      lineSelection={lineSelectionApi.state}
+      activeCommentDraft={actionsApi.activeCommentDraft}
+      activeSavedComment={actionsApi.activeSavedComment}
+      commentBody={actionsApi.commentBody}
+      onCommentBodyChange={actionsApi.setCommentBody}
+      commentSaving={actionsApi.commentSaving}
+      commentNotice={actionsApi.commentNotice}
+      commentAnchorHunk={actionsApi.commentAnchorHunk}
+      commentAnchorHunkId={actionsApi.commentAnchorHunkId}
+      commentAnchorIsCurrent={actionsApi.commentAnchorIsCurrent}
+      commentAnchorMoveArmed={actionsApi.commentAnchorMoveArmed}
+      onReturnToAnchor={selectHunk}
+      onMoveAnchor={actionsApi.moveCommentAnchorToSelected}
+      otherSavedComments={actionsApi.otherSavedComments}
+      otherCommentsOpen={actionsApi.otherCommentsOpen}
+      onToggleOtherComments={() => actionsApi.setOtherCommentsOpen((open) => !open)}
+      onEditSavedComment={editSavedFileComment}
+      onSaveComment={() => void actionsApi.saveComment()}
+      agentsLoading={agentsApi.agentsLoading}
+      selectedAgentId={selectedAgentId}
+      agentFeedback={agentApi.agentFeedback}
+      onReviseCurrentFromComment={agentApi.reviseCurrentFromComment}
+      commentRequestNonce={commentRequestNonce}
+      anchorIssues={snapshotApi.anchorIssues}
+      reanchorBusyIssueId={actionsApi.reanchorBusyIssueId}
+      reanchorNotice={actionsApi.reanchorNotice}
+      onReanchorIssue={(issue, target, range) => void actionsApi.reanchorIssue(issue, target, range)}
+      onSelectHunk={selectHunk}
+      anchorIssueTargets={anchorIssueTargets}
+    />
+  );
+
+  const statusStrips = (
+    <>
+      {snapshotApi.stale ? (
+        <View style={styles.staleStrip}>
+          <Text style={styles.staleStripText}>{t("staleBanner")}</Text>
         </View>
-      )
-    ) : (
-      <View key="empty" style={styles.emptyState}>
-        {snapshotApi.loading ? (
-          <View style={styles.loadingTrack}>
-            <View style={styles.loadingFill} />
-          </View>
-        ) : null}
-        <Text style={styles.empty}>{snapshotApi.loading ? t("readingGitState") : scopeApi.reviewCwd ? t("noSnapshot") : t("selectWorkspaceToStart")}</Text>
-      </View>
-    ),
-  ];
+      ) : null}
+      {anchorIssueTargets.length > 0 ? (
+        <View style={styles.noticeStrip}>
+          <Text style={styles.noticeStripText}>{t("anchorIssueWarning")}</Text>
+          <Text style={styles.routeMeta}>{t("anchorIssuesSummary", { count: snapshotApi.anchorIssues.length })}</Text>
+          {firstAnchorHunkId ? (
+            <ActionButton
+              variant="ghost"
+              label={t("anchorIssueFileOpen")}
+              tooltip={t("anchorIssueFileOpenHint")}
+              onPress={() => {
+                if (!firstAnchorHunkId) return;
+                selectHunk(firstAnchorHunkId);
+                setCompactFilesOpen(false);
+              }}
+              theme={theme}
+              layout={panelLayout}
+            />
+          ) : null}
+        </View>
+      ) : null}
+      {actionError ? (
+        <View style={[styles.errorCard, styles.statusError]}>
+          <Text style={styles.errorText}>{actionError}</Text>
+        </View>
+      ) : null}
+    </>
+  );
+
+  const emptyContent = (
+    <View style={styles.emptyState}>
+      {snapshotApi.loading ? (
+        <View style={styles.loadingTrack}>
+          <View style={styles.loadingFill} />
+        </View>
+      ) : null}
+      <Text style={styles.empty}>{snapshotApi.loading ? t("readingGitState") : scopeApi.reviewCwd ? t("noSnapshot") : t("selectWorkspaceToStart")}</Text>
+    </View>
+  );
 
   return (
     <>
-      {layout.compact ? (
-        <ScrollView style={styles.root} contentContainerStyle={styles.content} stickyHeaderIndices={[0]}>
-          {mainContent}
+      {compact ? (
+        <ScrollView style={styles.root} contentContainerStyle={styles.content} stickyHeaderIndices={[0]} onLayout={handleShellLayout}>
+          {contextBar}
+          {statusStrips}
+          {snapshotApi.snapshot
+            ? compactFilesOpen
+              ? fileNavigator
+              : (
+                <>
+                  {fileDetail}
+                  {inspector}
+                </>
+              )
+            : emptyContent}
         </ScrollView>
       ) : (
-        <ScrollView style={styles.root} contentContainerStyle={styles.desktopShell}>
-          {mainContent}
-        </ScrollView>
+        <View style={styles.shell} onLayout={handleShellLayout}>
+          {contextBar}
+          {statusStrips}
+          {snapshotApi.snapshot ? (
+            narrowDesktop ? (
+              <View style={styles.workbenchNarrow}>
+                <View style={styles.workbenchRow}>
+                  {fileNavigator}
+                  {fileDetail}
+                </View>
+                {inspector}
+              </View>
+            ) : (
+              <View style={styles.workbenchRow}>
+                {fileNavigator}
+                {fileDetail}
+                {inspector}
+              </View>
+            )
+          ) : emptyContent}
+        </View>
       )}
 
       <QueueModal
         theme={theme}
-        layout={layout}
+        layout={panelLayout}
         t={t}
         styles={styles}
         open={commentsApi.queueOpen}
@@ -670,7 +765,6 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
         projectCommentsLoading={commentsApi.projectCommentsLoading}
         projectCommentsError={commentsApi.projectCommentsError}
         onRefresh={() => void commentsApi.refreshProjectComments()}
-        commentsByTarget={commentsApi.commentsByTarget}
         commentReviewsById={commentReviewsById}
         projectIdentity={scopeApi.projectIdentity}
         effectiveProjectId={scopeApi.effectiveProjectId}
@@ -684,11 +778,20 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
         processResult={commentsApi.processResult}
         processError={commentsApi.processError}
         projectNotice={commentsApi.projectNotice}
+        currentWorkspaceId={scopeApi.selectedWorkspaceId}
+        jumpTargetsByCommentId={queueJumpTargets}
+        onJumpToComment={(commentId) => {
+          const hunkId = queueJumpTargets.get(commentId);
+          if (!hunkId) return;
+          selectHunk(hunkId);
+          setCompactFilesOpen(false);
+          commentsApi.setQueueOpen(false);
+        }}
       />
 
       <MoreModal
         theme={theme}
-        layout={layout}
+        layout={panelLayout}
         t={t}
         styles={styles}
         open={moreOpen}
@@ -735,7 +838,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
 
       <ManageModal
         theme={theme}
-        layout={layout}
+        layout={panelLayout}
         t={t}
         styles={styles}
         open={actionsApi.manageOpen}

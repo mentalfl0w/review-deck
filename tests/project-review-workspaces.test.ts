@@ -4,6 +4,7 @@ import { extname } from "node:path";
 import type {
   canSubmitProjectReviewGroup as CanSubmitProjectReviewGroup,
   groupProjectReviewComments as GroupProjectReviewComments,
+  currentPathForReviewBaseline as CurrentPathForReviewBaseline,
 } from "../client/project-review-workspaces";
 import type { AgentEntry } from "../client/tools";
 import type { ProjectReviewComment } from "../shared/review";
@@ -21,9 +22,31 @@ const requireFromRepo = createRequire(import.meta.url);
 const loadedProjectWorkspaceModule = requireFromRepo("../client/project-review-workspaces.ts") as {
   groupProjectReviewComments: typeof GroupProjectReviewComments;
   canSubmitProjectReviewGroup: typeof CanSubmitProjectReviewGroup;
+  currentPathForReviewBaseline: typeof CurrentPathForReviewBaseline;
 };
 const groupProjectReviewComments = loadedProjectWorkspaceModule.groupProjectReviewComments;
 const canSubmitProjectReviewGroup = loadedProjectWorkspaceModule.canSubmitProjectReviewGroup;
+const currentPathForReviewBaseline = loadedProjectWorkspaceModule.currentPathForReviewBaseline;
+
+assert.equal(
+  currentPathForReviewBaseline(
+    { filePath: "src/old.ts" },
+    [{ path: "src/new.ts", oldPath: "src/old.ts" }],
+  ),
+  "src/new.ts",
+  "a rename after dispatch resolves the review to the current file path",
+);
+assert.equal(
+  currentPathForReviewBaseline(
+    { filePath: "src/old.ts" },
+    [
+      { path: "src/new-a.ts", oldPath: "src/old.ts" },
+      { path: "src/new-b.ts", oldPath: "src/old.ts" },
+    ],
+  ),
+  null,
+  "an ambiguous rename is not offered for acceptance",
+);
 
 const comment = (id: string, cwd: string, workspaceId?: string): ProjectReviewComment => ({
   id,

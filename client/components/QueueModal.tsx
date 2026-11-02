@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { Modal, Pressable, ScrollView, Text, View } from "react-native";
-import type { ProcessProjectReviewResult, ProjectReviewSummary } from "../../shared/review";
+import type { ProcessProjectReviewResult, ProjectCommentReview, ProjectReviewSummary } from "../../shared/review";
 import { anchorLocationText } from "../lineRange";
 import {
   anchorStateBadgeKeys,
   anchorStateBadgeTextKeys,
   anchorStateLabelKeys,
+  commentReviewOutcomeLabelKeys,
   scopeLabelKeys,
   type PanelLayout,
   type PanelTheme,
@@ -31,6 +32,7 @@ export function QueueModal({
   projectCommentsError,
   onRefresh,
   commentsByTarget,
+  commentReviewsById,
   projectIdentity,
   effectiveProjectId,
   workspaceGroups,
@@ -55,6 +57,7 @@ export function QueueModal({
   projectCommentsError: string | null;
   onRefresh: () => void;
   commentsByTarget: ProjectCommentsByTarget;
+  commentReviewsById: ReadonlyMap<string, ProjectCommentReview>;
   projectIdentity: ProjectIdentity | null;
   effectiveProjectId: string;
   workspaceGroups: ProjectReviewWorkspaceGroup[];
@@ -173,29 +176,48 @@ export function QueueModal({
                             <Text selectable numberOfLines={2} ellipsizeMode="middle" style={styles.filePath}>{file.filePath}</Text>
                             <Text style={styles.fileMeta}>{t("projectFileComments", { count: file.comments.length })}</Text>
                           </View>
-                          {file.comments.map((comment) => (
-                            <View key={comment.id} style={styles.queueComment}>
-                              <Text selectable numberOfLines={4} style={styles.body}>{comment.comment}</Text>
-                              <View style={styles.savedMetaRow}>
-                                <Text style={styles.routeMeta}>
-                                  {t(comment.findingSource === "deterministic_rule" ? "findingSourceRule" : comment.findingSource === "ai_review" ? "findingSourceAi" : "findingSourceHuman")}
-                                </Text>
-                                {comment.anchor ? (
-                                  <Text selectable numberOfLines={1} ellipsizeMode="middle" style={styles.anchorMeta}>
-                                    {anchorLocationText(t, comment.anchor, comment.hunkHeader)}
+                          {file.comments.map((comment) => {
+                            const review = commentReviewsById.get(comment.id);
+                            const reviewText = review === undefined
+                              ? null
+                              : review.acceptedAt !== undefined
+                                ? t("commentReviewAccepted", { acceptedAt: review.acceptedAt })
+                                : review.outcome === "completed" && review.baseline === null
+                                  ? t("commentReviewAwaitingRedispatch")
+                                  : review.outcome !== undefined
+                                    ? t(commentReviewOutcomeLabelKeys[review.outcome])
+                                    : t("commentReviewInFlight");
+                            return (
+                              <View key={comment.id} style={styles.queueComment}>
+                                <Text selectable numberOfLines={4} style={styles.body}>{comment.comment}</Text>
+                                <View style={styles.savedMetaRow}>
+                                  <Text style={styles.routeMeta}>
+                                    {t(comment.findingSource === "deterministic_rule" ? "findingSourceRule" : comment.findingSource === "ai_review" ? "findingSourceAi" : "findingSourceHuman")}
                                   </Text>
-                                ) : null}
-                                {comment.anchorState ? (
-                                  <View style={[styles.anchorStateBadge, styles[anchorStateBadgeKeys[comment.anchorState]]]}>
-                                    <Text style={[styles.anchorStateBadgeText, styles[anchorStateBadgeTextKeys[comment.anchorState]]]}>
-                                      {t(anchorStateLabelKeys[comment.anchorState])}
+                                  {comment.anchor ? (
+                                    <Text selectable numberOfLines={1} ellipsizeMode="middle" style={styles.anchorMeta}>
+                                      {anchorLocationText(t, comment.anchor, comment.hunkHeader)}
                                     </Text>
-                                  </View>
-                                ) : null}
-                                <Text style={styles.routeMeta}>{t("projectCommentSavedAt", { savedAt: comment.savedAt })}</Text>
+                                  ) : null}
+                                  {comment.anchorState ? (
+                                    <View style={[styles.anchorStateBadge, styles[anchorStateBadgeKeys[comment.anchorState]]]}>
+                                      <Text style={[styles.anchorStateBadgeText, styles[anchorStateBadgeTextKeys[comment.anchorState]]]}>
+                                        {t(anchorStateLabelKeys[comment.anchorState])}
+                                      </Text>
+                                    </View>
+                                  ) : null}
+                                  {reviewText ? (
+                                    <Text style={review?.acceptedAt !== undefined || review?.outcome === "completed"
+                                      ? styles.commentReviewAwaitingText
+                                      : styles.routeMeta}>
+                                      {reviewText}
+                                    </Text>
+                                  ) : null}
+                                  <Text style={styles.routeMeta}>{t("projectCommentSavedAt", { savedAt: comment.savedAt })}</Text>
+                                </View>
                               </View>
-                            </View>
-                          ))}
+                            );
+                          })}
                         </View>
                       ))}
                     </View>

@@ -35,10 +35,22 @@ export function hunkContentId(path: string, patch: string): string {
  * target drift (revert skip lists).
  */
 export function hunkChangeId(path: string, patch: string): string {
+  return sha256(canonicalJson({ path, changes: hunkChangedLines(patch) }));
+}
+
+/**
+ * The same identity without the file path. A rename rewrites `hunkChangeId`
+ * while not touching a single changed line, so "did this block actually
+ * change?" must compare this value, not the path-scoped one.
+ */
+export function hunkChangedLinesId(patch: string): string {
+  return sha256(canonicalJson(hunkChangedLines(patch)));
+}
+
+function hunkChangedLines(patch: string): string[] {
   const lines = patch.split("\n");
   const headerAt = lines.findIndex((line) => line.startsWith("@@ "));
-  const changes = (headerAt === -1 ? lines : lines.slice(headerAt + 1)).filter(
+  return (headerAt === -1 ? lines : lines.slice(headerAt + 1)).filter(
     (line) => line.startsWith("+") || line.startsWith("-"),
   );
-  return sha256(canonicalJson({ path, changes }));
 }

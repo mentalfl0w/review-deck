@@ -1,6 +1,6 @@
 {
   "name": "@mentalfl0w/review-deck",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Human-in-the-loop code review workspace for Paseo with inline file comments and project-level AI processing.",
   "license": "MIT",
   "author": "mentalfl0w",
@@ -15,6 +15,7 @@
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
+    "README.zh-CN.md",
     "index.client.tsx",
     "index.server.ts",
     "client/**/*.ts",

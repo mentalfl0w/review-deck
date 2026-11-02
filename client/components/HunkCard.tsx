@@ -16,6 +16,7 @@ import {
   type FileViewResult,
   type PanelLayout,
   type PanelTheme,
+  type PendingCommentReview,
   type ReviewFile,
   type SelectedHunk,
   type ViewMode,
@@ -31,7 +32,7 @@ import { AiReviewMeta } from "./AiReviewMeta";
 
 /** A single change block: navigation, diff mode, review/reject/explain
  * actions, the diff or file-context body and the findings disclosure. */
-export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, showAiReviewUsage, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection, onPromoteFinding, capturedVerification, promotionEnabled }: {
+export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, diffMode, onDiffModeChange, viewMode, fileViewResult, fileViewLoading, fileViewError, scope, currentHunkHasComment, reviewed, onMarkReviewed, onExplain, onReject, agentsLoading, selectedAgentId, aiExplainBusy, onExplainWithAgent, onOpenMore, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, showAiReviewUsage, selection, onLinePress, onLineTap, onClearSelection, onCommentSelection, onPromoteFinding, capturedVerification, promotionEnabled, pendingCommentReviews, acceptingCommentReviewId, onAcceptCommentReview }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -70,6 +71,10 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   onPromoteFinding?: (finding: FindingGroupEntry, comment: string) => Promise<FindingPromotionResult>;
   capturedVerification?: CapturedVerificationUi;
   promotionEnabled: boolean;
+  /** Agent-reported completions of this file awaiting a human decision. */
+  pendingCommentReviews: readonly PendingCommentReview[];
+  acceptingCommentReviewId: string | null;
+  onAcceptCommentReview: (review: PendingCommentReview) => void;
 }) {
   const selectedHeader = hunkHeaderParts(hunk.header);
   const selectedHunkIndex = file.hunks.findIndex((candidate) => candidate.id === hunk.id);
@@ -90,6 +95,14 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
   // selected nothing (or the machine dropped the selection), a single-line
   // range while the compact pairing still awaits its end tap.
   const selectionRange = lineSelectionRange(selection);
+  // A pending acceptance is offered only on a block that overlaps the change
+  // window the comment was dispatched against. An unrelated hunk in the same
+  // file proves nothing, and the server enforces the same overlap rule.
+  const hunkPendingReviews = pendingCommentReviews.filter((review) => {
+    const baselineEnd = review.baseline.oldStart + Math.max(review.baseline.oldCount, 1) - 1;
+    const blockEnd = hunk.oldStart + Math.max(hunk.oldCount, 1) - 1;
+    return review.baseline.oldStart <= blockEnd && hunk.oldStart <= baselineEnd;
+  });
   const diffContent = viewMode === "blockFile" ? (
     <FileView
       t={t}
@@ -184,6 +197,28 @@ export function HunkCard({ theme, layout, t, styles, file, hunk, onSelectHunk, d
             ) : null}
           </View>
         </View>
+        {hunkPendingReviews.length > 0 ? (
+          <View style={styles.group}>
+            <Text style={styles.groupLabel}>{t("pendingCommentReviews")}</Text>
+            <Text style={styles.scopeDesc}>{t("pendingCommentReviewsHint")}</Text>
+            {hunkPendingReviews.map((review) => (
+              <View key={review.commentId} style={styles.queueComment}>
+                <Text selectable numberOfLines={4} style={styles.body}>{review.comment}</Text>
+                <View style={styles.actionRow}>
+                  <ActionButton
+                    variant="primary"
+                    label={acceptingCommentReviewId === review.commentId ? t("acceptCommentReviewBusy") : t("acceptCommentReview")}
+                    tooltip={t("acceptCommentReviewHint")}
+                    disabled={acceptingCommentReviewId !== null}
+                    onPress={() => onAcceptCommentReview(review)}
+                    theme={theme}
+                    layout={layout}
+                  />
+                </View>
+              </View>
+            ))}
+          </View>
+        ) : null}
         {viewMode === "diff" && !layout.compact ? (
           <View style={styles.diffLayoutRow}>
             <Text style={styles.label}>{t("diffLayout")}</Text>

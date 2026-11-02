@@ -7,14 +7,16 @@ import { z } from "zod";
 import {
   reviewBatchSchema,
   reviewBatchV1PayloadSchema,
+  reviewBatchV2Schema,
   type ReviewBatch,
   type ReviewBatchStatus,
 } from "../../shared/review-batch";
 import { createMutex, type Mutex } from "../util/mutex";
 
 /** Envelope version written to disk. */
-export const REVIEW_BATCH_VERSION = 2;
-const LEGACY_REVIEW_BATCH_VERSION = 1;
+export const REVIEW_BATCH_VERSION = 3;
+const V1_REVIEW_BATCH_VERSION = 1;
+const V2_REVIEW_BATCH_VERSION = 2;
 
 export type ReviewBatchEnvelope = {
   version: typeof REVIEW_BATCH_VERSION;
@@ -58,15 +60,20 @@ const ACTIVE_BY_STATUS: Record<ReviewBatchStatus, boolean> = {
 };
 
 /**
- * Both supported on-disk envelopes are strict. Version 1 is read only to
- * migrate it; only version 2 is written.
+ * Every supported on-disk envelope is strict. Versions 1 and 2 are read only to
+ * migrate them; only version 3 is written.
  */
 const reviewBatchEnvelopeV1Schema = z
-  .object({ version: z.literal(LEGACY_REVIEW_BATCH_VERSION), batches: z.array(reviewBatchV1PayloadSchema) })
+  .object({ version: z.literal(V1_REVIEW_BATCH_VERSION), batches: z.array(reviewBatchV1PayloadSchema) })
+  .strict();
+const reviewBatchEnvelopeV2Schema = z
+  .object({ version: z.literal(V2_REVIEW_BATCH_VERSION), batches: z.array(reviewBatchV2Schema) })
   .strict();
 const reviewBatchEnvelopeSchema = z
   .object({ version: z.literal(REVIEW_BATCH_VERSION), batches: z.array(reviewBatchSchema) })
   .strict();
+
+type StoredBatchVersion = typeof V1_REVIEW_BATCH_VERSION | typeof V2_REVIEW_BATCH_VERSION | typeof REVIEW_BATCH_VERSION;
 
 /** Minimal probe: does the document declare an envelope version at all? */
 const reviewBatchVersionMarkerSchema = z.object({ version: z.number() });
@@ -107,10 +114,13 @@ function assertActiveUniqueness(others: readonly ReviewBatch[], candidate: Revie
  * Persistence for ReviewBatches: one JSON file holding every batch, oldest
  * first, terminal batches included.
  *
- * The strict version-2 envelope is the only format this build writes. A
- * validated version-1 store is copied byte-for-byte to
- * `review-batches.json.v1.bak` before it is atomically rewritten; malformed,
- * unsupported, or damaged data is never replaced.
+ * The strict version-3 envelope is the only format this build writes. A
+ * validated version-1 or version-2 store is copied byte-for-byte to
+ * `review-batches.json.v1.bak` / `.v2.bak` before it is atomically rewritten;
+ * malformed, unsupported, or damaged data is never replaced. Migration never
+ * invents dispatch-time baselines: an old COMPLETED outcome stays an
+ * Agent-reported claim and cannot be accepted by a human until the comment is
+ * dispatched again under the current format.
  *
  * Every operation runs inside one critical section. Writes use a UUID temp
  * file in the same directory and atomically rename it into place. Batch ids
@@ -252,13 +262,13 @@ export class ReviewBatchStore {
       });
     }
     const document = this.parse(raw);
-    return document.version === LEGACY_REVIEW_BATCH_VERSION
-      ? this.migrateLegacy(raw, document.batches)
-      : document.batches;
+    return document.version === REVIEW_BATCH_VERSION
+      ? document.batches
+      : this.migrate(raw, document.batches, document.version);
   }
 
-  /** Parse a strict v1 or v2 envelope without touching the file. */
-  private parse(raw: string): { version: 1 | 2; batches: ReviewBatch[] } {
+  /** Parse a strict v1, v2, or v3 envelope without touching the file. */
+  private parse(raw: string): { version: StoredBatchVersion; batches: ReviewBatch[] } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -276,9 +286,9 @@ export class ReviewBatchStore {
       );
     }
 
-    let version: 1 | 2;
+    let version: StoredBatchVersion;
     let batches: ReviewBatch[];
-    if (marked.data.version === LEGACY_REVIEW_BATCH_VERSION) {
+    if (marked.data.version === V1_REVIEW_BATCH_VERSION) {
       const legacy = reviewBatchEnvelopeV1Schema.safeParse(parsed);
       if (!legacy.success) {
         throw new ReviewBatchStoreError(
@@ -286,10 +296,12 @@ export class ReviewBatchStore {
           { cause: legacy.error },
         );
       }
-      version = LEGACY_REVIEW_BATCH_VERSION;
+      version = V1_REVIEW_BATCH_VERSION;
       batches = [];
       for (const legacyBatch of legacy.data.batches) {
-        const validated = reviewBatchSchema.safeParse(legacyBatch);
+        // Re-validate through the lifecycle refinements the bare v1 payload
+        // schema does not carry; a v1 record is a valid v2/v3 record otherwise.
+        const validated = reviewBatchV2Schema.safeParse(legacyBatch);
         if (!validated.success) {
           throw new ReviewBatchStoreError(
             `ReviewBatch store at ${this.storagePath} has an invalid version 1 batch; the file was left untouched.`,
@@ -298,6 +310,16 @@ export class ReviewBatchStore {
         }
         batches.push(validated.data);
       }
+    } else if (marked.data.version === V2_REVIEW_BATCH_VERSION) {
+      const envelope = reviewBatchEnvelopeV2Schema.safeParse(parsed);
+      if (!envelope.success) {
+        throw new ReviewBatchStoreError(
+          `ReviewBatch store at ${this.storagePath} has an invalid version ${V2_REVIEW_BATCH_VERSION} envelope; the file was left untouched.`,
+          { cause: envelope.error },
+        );
+      }
+      version = V2_REVIEW_BATCH_VERSION;
+      batches = envelope.data.batches;
     } else if (marked.data.version === REVIEW_BATCH_VERSION) {
       const envelope = reviewBatchEnvelopeSchema.safeParse(parsed);
       if (!envelope.success) {
@@ -310,7 +332,7 @@ export class ReviewBatchStore {
       batches = envelope.data.batches;
     } else {
       throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads versions ${LEGACY_REVIEW_BATCH_VERSION} and ${REVIEW_BATCH_VERSION} and left the file untouched.`,
+        `ReviewBatch store at ${this.storagePath} uses unsupported version ${marked.data.version}; this build reads versions ${V1_REVIEW_BATCH_VERSION}, ${V2_REVIEW_BATCH_VERSION}, and ${REVIEW_BATCH_VERSION} and left the file untouched.`,
       );
     }
 
@@ -335,8 +357,13 @@ export class ReviewBatchStore {
     return { version, batches };
   }
 
-  /** Preserve the exact legacy bytes before atomically rewriting v2. */
-  private async migrateLegacy(raw: string, batches: ReviewBatch[]): Promise<ReviewBatch[]> {
+  /**
+   * Preserve the exact legacy bytes before atomically rewriting the current
+   * version. Migration never invents baselines or acceptances: an older record
+   * keeps its Agent-reported outcomes, and human acceptance stays unavailable
+   * for it until the comment is dispatched again.
+   */
+  private async migrate(raw: string, batches: ReviewBatch[], version: StoredBatchVersion): Promise<ReviewBatch[]> {
     let current: string;
     try {
       current = await readFile(this.storagePath, "utf8");
@@ -350,11 +377,11 @@ export class ReviewBatchStore {
       const latest = this.parse(current);
       if (latest.version === REVIEW_BATCH_VERSION) return latest.batches;
       throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} changed during version 1 migration; the file was left untouched. Retry after inspecting the store.`,
+        `ReviewBatch store at ${this.storagePath} changed during version ${version} migration; the file was left untouched. Retry after inspecting the store.`,
       );
     }
 
-    await this.backupLegacy(raw);
+    await this.backupLegacy(raw, version);
     let rechecked: string;
     try {
       rechecked = await readFile(this.storagePath, "utf8");
@@ -368,16 +395,16 @@ export class ReviewBatchStore {
       const latest = this.parse(rechecked);
       if (latest.version === REVIEW_BATCH_VERSION) return latest.batches;
       throw new ReviewBatchStoreError(
-        `ReviewBatch store at ${this.storagePath} changed during version 1 migration; the file was left untouched. Retry after inspecting the store.`,
+        `ReviewBatch store at ${this.storagePath} changed during version ${version} migration; the file was left untouched. Retry after inspecting the store.`,
       );
     }
     await this.write(batches);
     return batches;
   }
 
-  /** Create a non-overwritable, read-only copy of the v1 bytes beside the store. */
-  private async backupLegacy(raw: string): Promise<void> {
-    const backupPath = `${this.storagePath}.v1.bak`;
+  /** Create a non-overwritable, read-only copy of the legacy bytes beside the store. */
+  private async backupLegacy(raw: string, version: StoredBatchVersion): Promise<void> {
+    const backupPath = `${this.storagePath}.v${version}.bak`;
     if (await this.verifyLegacyBackup(backupPath, raw)) return;
 
     const temporary = `${backupPath}.${randomUUID()}.tmp`;
@@ -389,7 +416,7 @@ export class ReviewBatchStore {
       if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST" && await this.verifyLegacyBackup(backupPath, raw)) {
         return;
       }
-      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be created.`, { cause: error });
+      throw new ReviewBatchStoreError(`Version ${version} backup for ${this.storagePath} could not be created.`, { cause: error });
     } finally {
       await unlink(temporary).catch(() => undefined);
     }
@@ -401,11 +428,11 @@ export class ReviewBatchStore {
       metadata = await lstat(backupPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
-      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be inspected.`, { cause: error });
+      throw new ReviewBatchStoreError(`Legacy backup for ${this.storagePath} could not be inspected.`, { cause: error });
     }
     if (!metadata.isFile() || (metadata.mode & 0o222) !== 0) {
       throw new ReviewBatchStoreError(
-        `Version 1 backup for ${this.storagePath} already exists but is not a read-only regular file; migration was refused.`,
+        `Legacy backup for ${this.storagePath} already exists but is not a read-only regular file; migration was refused.`,
       );
     }
     let existing: string;
@@ -413,11 +440,11 @@ export class ReviewBatchStore {
       existing = await readFile(backupPath, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
-      throw new ReviewBatchStoreError(`Version 1 backup for ${this.storagePath} could not be read.`, { cause: error });
+      throw new ReviewBatchStoreError(`Legacy backup for ${this.storagePath} could not be read.`, { cause: error });
     }
     if (existing !== raw) {
       throw new ReviewBatchStoreError(
-        `Version 1 backup for ${this.storagePath} already exists with different contents; migration was refused.`,
+        `Legacy backup for ${this.storagePath} already exists with different contents; migration was refused.`,
       );
     }
     return true;

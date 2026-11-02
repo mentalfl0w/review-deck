@@ -26,6 +26,7 @@ import {
   type FileViewResult,
   type PanelLayout,
   type PanelTheme,
+  type PendingCommentReview,
   type ReviewFile,
   type SelectedHunk,
   type ViewMode,
@@ -44,7 +45,7 @@ import { VerificationCommands } from "./VerificationCommands";
 
 /** Right-hand canvas: the file header, the change-block card and the comment
  * dock. Renders the no-reviewable-hunk placeholder when nothing is selected. */
-export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentFindings, onPromoteFinding, capturedVerification, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue }: {
+export function FileDetail({ theme, layout, t, styles, onHeightChange, selected, selectedFile, diffMode, onDiffModeChange, viewMode, onViewModeChange, fileViewResult, fileViewLoading, fileViewError, onBack, onSelectHunk, scope, currentHunkHasComment, reviewed, fileReviewed, onMarkReviewed, onMarkFileReviewed, onExplainFile, onRunAgentReview, onRevertFile, revertNotice, onExplain, onReject, agentsLoading, selectedAgentId, onOpenMore, aiExplainBusy, commentBody, onExplainWithAgent, findingsOpen, onToggleFindingsOpen, analysisStale, explanation, aiExplanation, agentReview, agentSections, agentFindings, onPromoteFinding, capturedVerification, agentReviewMeta, agentReviewBusy, verificationRuns, verificationEnabled, onRunVerification, onRefreshVerification, onVerificationError, showAiReviewUsage, activeCommentDraft, activeSavedComment, onCommentBodyChange, commentSaving, commentNotice, commentAnchorHunk, commentAnchorHunkId, commentAnchorIsCurrent, commentAnchorMoveArmed, onReturnToAnchor, onMoveAnchor, otherSavedComments, otherCommentsOpen, onToggleOtherComments, onEditSavedComment, onSaveComment, agentFeedback, fileReviseFeedback, onReviseCurrentFromComment, onReviseFileFromComment, lineSelection, onLinePress, onLineTap, onClearLineSelection, onCommentLineSelection, commentRequestNonce, anchorIssues, reanchorBusyIssueId, reanchorNotice, onReanchorIssue, pendingCommentReviews, acceptingCommentReviewId, onAcceptCommentReview }: {
   theme: PanelTheme;
   layout: PanelLayout;
   t: TFunc;
@@ -134,6 +135,10 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
   /** Heal one anchor issue against an explicitly chosen target of the current
    * snapshot (a resolved candidate, or the current selection). */
   onReanchorIssue: (issue: ReviewAnchorIssue, target: SelectedHunk, lineRange: LineRangeSelection | null) => void;
+  /** Agent-reported completions of this file awaiting a human decision. */
+  pendingCommentReviews: PendingCommentReview[];
+  acceptingCommentReviewId: string | null;
+  onAcceptCommentReview: (review: PendingCommentReview) => void;
 }) {
   const [confirmRevert, setConfirmRevert] = useState(false);
   useEffect(() => {
@@ -325,6 +330,9 @@ export function FileDetail({ theme, layout, t, styles, onHeightChange, selected,
             onPromoteFinding={onPromoteFinding}
             promotionEnabled={verificationEnabled}
             capturedVerification={capturedVerification}
+            pendingCommentReviews={pendingCommentReviews}
+            acceptingCommentReviewId={acceptingCommentReviewId}
+            onAcceptCommentReview={onAcceptCommentReview}
           />
         )}
 

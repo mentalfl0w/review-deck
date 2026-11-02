@@ -194,6 +194,7 @@ export function buildPanelStyles(theme: PanelTheme, layout: PanelLayout) {
     anchorStateBadgeTextRelocated: { color: c.accent },
     anchorStateBadgeTextAmbiguous: { color: c.statusDanger },
     anchorStateBadgeTextStale: { color: c.statusDanger },
+    commentReviewAwaitingText: { color: c.accent, fontSize: 10.5, lineHeight: 15, fontWeight: "700" },
     statusText: { color: c.accent, fontSize: 11, lineHeight: 15, fontWeight: "600" },
     otherCommentsScroll: { maxHeight: 144, flexGrow: 0 },
     otherCommentRow: { gap: 5, paddingVertical: 8, borderTopWidth: 1, borderTopColor: withAlpha(c.foregroundMuted, 0.14) },

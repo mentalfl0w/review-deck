@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRpc, useSettings, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { detectLocale, makeT, type Locale } from "./i18n";
-import { scopeKeys, type DiffMode, type ViewMode } from "./tools";
+import { scopeKeys, type DiffMode, type PendingCommentReview, type ViewMode } from "./tools";
 import { buildPanelStyles } from "./styles";
 import { useReviewScope } from "./hooks/useReviewScope";
 import { useReviewSnapshot } from "./hooks/useReviewSnapshot";
@@ -11,6 +11,7 @@ import type { LineSide } from "./lineRange";
 import { useAgents } from "./hooks/useAgents";
 import { useProjectComments } from "./hooks/useProjectComments";
 import { useReviewActions } from "./hooks/useReviewActions";
+import { currentPathForReviewBaseline } from "./project-review-workspaces";
 import { useAgentReview } from "./hooks/useAgentReview";
 import { useFileView } from "./hooks/useFileView";
 import { useVerification } from "./hooks/useVerification";
@@ -25,7 +26,7 @@ import { isReviewPreviewUrl, reviewDeckSettings, setProjectPreviewUrl } from "..
 import type { ReviewPanelLaunchRequest } from "./review-panel-launch";
 import { markWorkspaceReviewResultsRead } from "../shared/review-activity";
 import { getReviewEntryStatusStore } from "./review-entry-status-store";
-import type { AiReviewBudgetPreset, AiReviewDepth, ReviewRequest } from "../shared/review";
+import type { AiReviewBudgetPreset, AiReviewDepth, ProjectCommentReview, ReviewRequest } from "../shared/review";
 
 /** Review Deck's single workspace-scoped tab receives transient launch intent
  * from the Header, Command Center, timeline, or Agent Composer. */
@@ -314,6 +315,47 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
     fullChanges: viewMode === "fullChanges",
   });
 
+  /**
+   * Agent-reported completions that no human accepted yet, restricted to the
+   * review context on screen (same workspace, scope, directory, and file — the
+   * baseline's rename alias included). The card only surfaces them on the
+   * change block they can plausibly refer to; the server re-proves the exact
+   * target, hunk, and changed lines before deleting anything.
+   */
+  const pendingCommentReviewsByFile = useMemo(() => {
+    const grouped = new Map<string, PendingCommentReview[]>();
+    const envelope = commentsApi.projectComments;
+    if (!envelope || !scopeApi.reviewCwd) return grouped;
+    const bodies = new Map<string, string>(envelope.comments.map((comment) => [comment.id, comment.comment]));
+    const cwd = scopeApi.reviewCwd.replace(/\\/g, "/").replace(/\/+$/, "");
+    for (const review of envelope.reviews) {
+      if (review.outcome !== "completed" || review.acceptedAt !== undefined || !review.baseline) continue;
+      if (review.baseline.scope !== scopeApi.scope) continue;
+      if (review.baseline.cwd.replace(/\\/g, "/").replace(/\/+$/, "") !== cwd) continue;
+      if (scopeApi.selectedWorkspaceId && review.workspaceId !== scopeApi.selectedWorkspaceId) continue;
+      const body = bodies.get(review.commentId);
+      if (body === undefined) continue;
+      const pending: PendingCommentReview = {
+        commentId: review.commentId,
+        batchId: review.batchId,
+        comment: body,
+        baseline: review.baseline,
+      };
+      const filePath = currentPathForReviewBaseline(review.baseline, snapshotApi.snapshot?.files ?? []);
+      if (filePath === null) continue;
+      const list = grouped.get(filePath) ?? [];
+      list.push(pending);
+      grouped.set(filePath, list);
+    }
+    return grouped;
+  }, [commentsApi.projectComments, scopeApi.reviewCwd, scopeApi.scope, scopeApi.selectedWorkspaceId, snapshotApi.snapshot]);
+  const commentReviewsById = useMemo(
+    () => new Map<string, ProjectCommentReview>(
+      (commentsApi.projectComments?.reviews ?? []).map((review) => [review.commentId, review]),
+    ),
+    [commentsApi.projectComments],
+  );
+
   // Selecting a hunk discards analysis and comment UI that belonged to the
   // previous hunk (was one combined callback before the decomposition).
   const selectHunk = useCallback((hunkId: string) => {
@@ -515,6 +557,11 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
       reanchorBusyIssueId={actionsApi.reanchorBusyIssueId}
       reanchorNotice={actionsApi.reanchorNotice}
       onReanchorIssue={(issue, target, range) => void actionsApi.reanchorIssue(issue, target, range)}
+      pendingCommentReviews={snapshotApi.selectedFile
+        ? pendingCommentReviewsByFile.get(snapshotApi.selectedFile.path) ?? []
+        : []}
+      acceptingCommentReviewId={actionsApi.acceptingCommentReviewId}
+      onAcceptCommentReview={(review) => void actionsApi.acceptCommentReview(review)}
     />
   );
 
@@ -624,6 +671,7 @@ export function ReviewDeckPanel({ theme, layout, workspaceId, navigation, launch
         projectCommentsError={commentsApi.projectCommentsError}
         onRefresh={() => void commentsApi.refreshProjectComments()}
         commentsByTarget={commentsApi.commentsByTarget}
+        commentReviewsById={commentReviewsById}
         projectIdentity={scopeApi.projectIdentity}
         effectiveProjectId={scopeApi.effectiveProjectId}
         workspaceGroups={commentsApi.workspaceGroups}

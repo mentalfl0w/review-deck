@@ -1,6 +1,12 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { activeReviewBatchSchema, reviewBatchSchema } from "./review-batch";
+import {
+  activeReviewBatchSchema,
+  reviewBatchBaselineSchema,
+  reviewBatchSchema,
+  reviewBatchStatusSchema,
+  reviewCommentOutcomeSchema,
+} from "./review-batch";
 
 export const reviewScopeSchema = z.enum(["working", "staged", "branch", "commits"]);
 export type ReviewScope = z.infer<typeof reviewScopeSchema>;
@@ -677,6 +683,25 @@ export const projectReviewCommentSchema = z.object({
 });
 export type ProjectReviewComment = z.infer<typeof projectReviewCommentSchema>;
 
+/**
+ * The newest ReviewBatch state of one queued comment, as the queue and the
+ * change-block card need it: the Agent's own outcome, the dispatch-time
+ * baseline that human acceptance compares against, and whether a human already
+ * accepted it. `outcome` is absent while the batch has not finished.
+ */
+export const projectCommentReviewSchema = z.object({
+  commentId: z.string().min(1),
+  batchId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  status: reviewBatchStatusSchema,
+  outcome: reviewCommentOutcomeSchema.optional(),
+  /** null when the batch predates dispatch-time baselines (acceptance disabled). */
+  baseline: reviewBatchBaselineSchema.nullable(),
+  acceptedAt: z.iso.datetime().optional(),
+}).strict();
+export type ProjectCommentReview = z.infer<typeof projectCommentReviewSchema>;
+
 export const projectReviewSummarySchema = z.object({
   projectId: z.string(),
   projectName: z.string().optional(),
@@ -685,6 +710,7 @@ export const projectReviewSummarySchema = z.object({
   fileCount: z.number().int().nonnegative(),
   targetCount: z.number().int().nonnegative(),
   comments: z.array(projectReviewCommentSchema),
+  reviews: z.array(projectCommentReviewSchema),
   batches: z.array(activeReviewBatchSchema),
 });
 export type ProjectReviewSummary = z.infer<typeof projectReviewSummarySchema>;
@@ -733,8 +759,9 @@ export const promoteFindingToQueue = defineRpc({
   }).strict(),
 });
 
-// Submit one workspace's selected comments as a persisted ReviewBatch. Comments
-// remain queued until the Agent's turn reports explicit COMPLETED outcomes.
+// Submit one workspace's selected comments as a persisted ReviewBatch. The
+// Agent's per-comment COMPLETED outcome records a claim only; a human review of
+// the current change block is required before any comment leaves the queue.
 export const processProjectReviewResultSchema = reviewBatchSchema;
 export type ProcessProjectReviewResult = z.infer<typeof processProjectReviewResultSchema>;
 
@@ -748,6 +775,32 @@ export const processProjectReview = defineRpc({
     commentIds: z.array(z.string().min(1)).min(1),
   }),
   output: processProjectReviewResultSchema,
+});
+/**
+ * Human acceptance of ONE Agent-reported completion, taken from the change
+ * block the reviewer is looking at. The request carries that exact target and
+ * hunk; the server re-snapshots and fails closed unless the newest owning batch
+ * reported COMPLETED, the block still matches exactly, and its own changed
+ * lines differ from the dispatch-time baseline.
+ */
+export const acceptProjectReviewComment = defineRpc({
+  name: "review-deck.accept-project-review-comment",
+  input: z.object({
+    projectId: z.string().min(1),
+    batchId: z.string().min(1),
+    commentId: z.string().min(1),
+    pathFilter: z.string().trim().min(1).optional(),
+    expectedTargetFingerprint: z.string().min(1),
+    expectedFilePath: z.string().min(1),
+    expectedHunkId: z.string().min(1),
+    expectedHunkFingerprint: z.string().min(1),
+  }).strict(),
+  output: z.object({
+    batchId: z.string().min(1),
+    commentId: z.string().min(1),
+    acceptedAt: z.iso.datetime(),
+    cleared: z.number().int().nonnegative(),
+  }).strict(),
 });
 // Explicitly releases an ambiguous delivery claim after the user accepts the duplicate-risk warning.
 export const releaseUnknownReviewBatch = defineRpc({

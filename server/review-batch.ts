@@ -87,7 +87,7 @@ export function buildReviewBatchPrompt(input: {
     patchContexts.join("\n\n"),
     `COMMENTS IN ORIGINAL REVIEW ORDER (${input.comments.length}):`,
     commentList.join("\n\n"),
-    "Mark COMPLETED only when the requested change is finished. Mark STALE when fingerprints do not match, FAILED when you attempted but could not finish, and UNRESOLVED when you did not address the comment. Only an explicit COMPLETED outcome may remove a comment from Review Deck.",
+    "Mark COMPLETED only when the requested change is finished. Mark STALE when fingerprints do not match, FAILED when you attempted but could not finish, and UNRESOLVED when you did not address the comment. A COMPLETED outcome never removes a comment from Review Deck: it records your claim, and a human decides after reviewing the current change block.",
     "At the very end, add a machine-parseable outcomes section with exactly one line per listed comment id, using this heading and exact line format:",
     "COMMENT OUTCOMES",
     "- <comment-id> | COMPLETED | optional short detail",

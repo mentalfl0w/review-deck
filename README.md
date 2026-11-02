@@ -17,7 +17,7 @@ Review Deck helps you review a Paseo Agent's changes without losing context. Bro
 
 Rule signals, AI findings, and command output help with the review; none replaces the human decision.
 
-Use the wide two-pane layout on desktop or the file-by-file drill-down on a compact screen.
+On desktop, keep the changed-file list, diff, and inspector in view. Short or compact screens switch to a file-by-file drill-down.
 
 ## See it in action
 
@@ -178,7 +178,7 @@ Review Deck requires Paseo 0.10.0 or newer (`>=0.10.0`). Installing from npm req
 Install the published npm package:
 
 ```sh
-paseo plugin install npm:@mentalfl0w/review-deck@2.1.1
+paseo plugin install npm:@mentalfl0w/review-deck@2.2.0
 paseo plugin ls
 ```
 

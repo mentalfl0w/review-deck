@@ -17,7 +17,7 @@ Review Deck 是一个面向 Paseo 的人机协同代码审阅插件。Agent 在 
 
 Rule signals、AI findings 和命令输出都只是辅助，最终由人决定。
 
-桌面端使用左右双栏；窄屏按文件逐级进入。
+桌面端同时显示文件列表、diff 和检查面板；窄屏或较矮窗口会切换为按文件逐级浏览。
 
 ## 实际界面
 
@@ -177,7 +177,7 @@ Review Deck 需要 Paseo 0.10.0 或更高版本（`>=0.10.0`）。从 npm 安装
 安装已发布的 npm 包：
 
 ```sh
-paseo plugin install npm:@mentalfl0w/review-deck@2.1.1
+paseo plugin install npm:@mentalfl0w/review-deck@2.2.0
 paseo plugin ls
 ```
 

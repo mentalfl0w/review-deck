@@ -1,10 +1,12 @@
 /**
- * Persistence contract for ReviewBatches (v2).
+ * Persistence contract for ReviewBatches (v3).
  *
- * `review-batches.json` is a strict version-2 envelope holding every batch,
- * oldest first. A validated version-1 envelope is backed up byte-for-byte to
- * `.v1.bak` before migration; malformed or future data stays byte-identical.
- * Only ENOENT means "nothing stored yet".
+ * `review-batches.json` is a strict version-3 envelope holding every batch,
+ * oldest first, plus the dispatch-time baseline and the human acceptance of
+ * each comment. A validated version-1 or version-2 envelope is backed up
+ * byte-for-byte to `.v1.bak` / `.v2.bak` before migration; malformed or future
+ * data stays byte-identical. Migration never invents a baseline, so an old
+ * COMPLETED outcome stays unaccepted until the comment is dispatched again.
  *
  * Writes are serialized per store instance and land through a same-directory
  * temp file renamed into place, so concurrent creates cannot lose entries and
@@ -19,7 +21,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
-import type { ReviewBatch } from "../shared/review-batch";
+import type { ReviewBatch, ReviewBatchBaseline } from "../shared/review-batch";
 import type { ReviewBatchStoreOptions } from "../server/persistence/ReviewBatchStore";
 
 type Store = {
@@ -82,6 +84,36 @@ const finished = (id: string, overrides: Partial<ReviewBatch> = {}): ReviewBatch
     ...overrides,
   });
 
+const baseline = (commentId: string): ReviewBatchBaseline => ({
+  commentId,
+  projectId: "project-1",
+  workspaceId: `workspace-${commentId.replace(/^comment-/, "")}`,
+  cwd: "/tmp/worktree",
+  scope: "working",
+  filePath: "src/app.ts",
+  targetFingerprint: "target-1",
+  hunkId: "H-aaaaaaaaaa",
+  hunkFingerprint: "fingerprint-1",
+  hunkChangeId: "change-1",
+  changedLinesId: "lines-1",
+  oldStart: 3,
+  oldCount: 1,
+  newStart: 3,
+  newCount: 2,
+});
+
+const acceptance = (commentId: string) => ({
+  commentId,
+  acceptedAt: LATER,
+  targetFingerprint: "target-2",
+  filePath: "src/app.ts",
+  hunkId: "H-bbbbbbbbbb",
+  hunkFingerprint: "fingerprint-2",
+  hunkChangeId: "change-2",
+  changedLinesId: "lines-2",
+  baselineHunkChangeId: "change-1",
+});
+
 const readRaw = (path: string) => readFile(path, "utf8");
 const readStore = async (path: string) =>
   JSON.parse(await readFile(path, "utf8")) as { version: number; batches: ReviewBatch[] };
@@ -98,7 +130,7 @@ try {
   // -------------------------------------------------------------------------
   // 0. Contract constants: the default path sits beside the review store.
   // -------------------------------------------------------------------------
-  assert.strictEqual(REVIEW_BATCH_VERSION, 2);
+  assert.strictEqual(REVIEW_BATCH_VERSION, 3);
   assert.ok(DEFAULT_REVIEW_BATCH_PATH.endsWith(join("review-deck", "review-batches.json")));
   // All three constructor forms are accepted; the no-arg form is never written.
   assert.ok(new ReviewBatchStore() instanceof ReviewBatchStore);
@@ -123,12 +155,30 @@ try {
   const migratedLegacy = await store(legacyPath).list();
   assert.deepStrictEqual(migratedLegacy, [legacyBatch], "v1 data migrates without inventing delivery identity");
   assert.equal("delivery" in migratedLegacy[0]!, false);
-  assert.deepStrictEqual(await readStore(legacyPath), { version: 2, batches: [legacyBatch] });
+  assert.deepStrictEqual(await readStore(legacyPath), { version: 3, batches: [legacyBatch] });
   const legacyBackupPath = `${legacyPath}.v1.bak`;
   assert.equal(await readRaw(legacyBackupPath), legacyRaw, "the exact v1 bytes are retained for downgrade recovery");
   assert.equal((await stat(legacyBackupPath)).mode & 0o222, 0, "the migration backup is read-only");
   assert.deepStrictEqual(await store(legacyPath).list(), [legacyBatch], "repeated reads do not change migrated records");
   assert.equal(await readRaw(legacyBackupPath), legacyRaw, "repeated reads never replace the v1 backup");
+
+  // A version-2 store keeps its Agent outcomes but gains no baseline and no
+  // acceptance: an old COMPLETED result is not human-verified.
+  const v2Path = join(root, "legacy-v2", "review-batches.json");
+  const v2Batch = finished("legacy-v2");
+  const v2Raw = `${JSON.stringify({ version: 2, batches: [v2Batch] }, null, 2)}\n`;
+  await mkdir(dirname(v2Path), { recursive: true });
+  await writeFile(v2Path, v2Raw, "utf8");
+  const migratedV2 = await store(v2Path).list();
+  assert.deepStrictEqual(migratedV2, [v2Batch], "v2 data migrates with its recorded outcomes intact");
+  assert.equal("baselines" in migratedV2[0]!, false, "migration never invents a dispatch-time baseline");
+  assert.equal("acceptances" in migratedV2[0]!, false, "migration never invents a human acceptance");
+  assert.deepStrictEqual(await readStore(v2Path), { version: 3, batches: [v2Batch] });
+  const v2BackupPath = `${v2Path}.v2.bak`;
+  assert.equal(await readRaw(v2BackupPath), v2Raw, "the exact v2 bytes are retained for downgrade recovery");
+  assert.equal((await stat(v2BackupPath)).mode & 0o222, 0, "the v2 migration backup is read-only");
+  assert.deepStrictEqual(await store(v2Path).list(), [v2Batch], "repeated reads do not change migrated v2 records");
+  assert.equal(await readRaw(v2BackupPath), v2Raw, "repeated reads never replace the v2 backup");
 
   const backupConflictPath = join(root, "backup-conflict", "review-batches.json");
   const backupConflictRaw = `${JSON.stringify({ version: 1, batches: [batch("legacy-conflict")] })}\n`;
@@ -154,7 +204,7 @@ try {
 
 
   // -------------------------------------------------------------------------
-  // 2. create writes a strict version-2 envelope and the batch is durable
+  // 2. create writes a strict version-3 envelope and the batch is durable
   //    across instances; queries filter by project and by activity.
   // -------------------------------------------------------------------------
   assert.deepStrictEqual(await fresh.create(batch("batch-1")), batch("batch-1"));
@@ -231,6 +281,21 @@ try {
   assert.deepStrictEqual(await identityStore.list(), [identityBatch], "message identity is unique and immutable");
 
 
+  // A dispatch-time baseline and a human acceptance round-trip unchanged.
+  const acceptedPath = join(root, "accepted", "review-batches.json");
+  const acceptedStore = store(acceptedPath);
+  const acceptedBatch = batch("accepted-1", {
+    status: "completed",
+    submittedAt: ISO,
+    completedAt: LATER,
+    outcomes: { "comment-accepted-1": "completed" },
+    baselines: { "comment-accepted-1": baseline("comment-accepted-1") },
+    acceptances: { "comment-accepted-1": acceptance("comment-accepted-1") },
+  });
+  await acceptedStore.create(acceptedBatch);
+  assert.deepStrictEqual(await acceptedStore.list(), [acceptedBatch]);
+  assert.deepStrictEqual(await store(acceptedPath).list(), [acceptedBatch], "v3 baselines/acceptances survive a reload");
+
   // -------------------------------------------------------------------------
   // 3. create validates before touching the file: an invalid batch neither
   //    lands nor creates a store, and never disturbs a valid one.
@@ -247,6 +312,29 @@ try {
     { ...batch("batch-x"), status: "queued" },
     { ...batch("batch-x"), status: "submitted" },
     { ...batch("batch-x"), status: "completed", submittedAt: ISO, outcomes: { "comment-x": "completed" } },
+    batch("batch-x", {
+      status: "completed",
+      submittedAt: ISO,
+      completedAt: LATER,
+      outcomes: { "comment-batch-x": "completed" },
+      acceptances: { "comment-batch-x": acceptance("comment-batch-x") },
+    }),
+    batch("batch-x", {
+      workspaceId: "workspace-x",
+      commentIds: ["comment-x"],
+      status: "completed",
+      submittedAt: ISO,
+      completedAt: LATER,
+      outcomes: { "comment-x": "completed" },
+      baselines: { "comment-x": baseline("comment-x") },
+      acceptances: {
+        "comment-x": {
+          ...acceptance("comment-x"),
+          changedLinesId: "lines-1",
+          baselineHunkChangeId: "change-1",
+        },
+      },
+    }),
     // `failed` is the one terminal status that does not need submittedAt.
     { ...batch("batch-x"), status: "failed", completedAt: LATER },
     batch("batch-x", { completedAt: LATER }),
@@ -452,6 +540,11 @@ try {
     JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [batch("dup"), batch("dup", { agentId: "agent-dup-2" })] }),
     JSON.stringify({ version: 1, batches: [{ ...batch("legacy-invalid"), futureField: true }] }),
     JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), delivery: { messageId: "", phase: "unknown", attempts: 0, updatedAt: ISO } }] }),
+    // A baseline must belong to the batch and carry the dispatch-time change id.
+    JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), baselines: { "comment-x": { commentId: "comment-x", projectId: "project-1", workspaceId: "workspace-x", cwd: "/tmp", scope: "working", filePath: "a.ts", targetFingerprint: "t", hunkId: "h", hunkFingerprint: "f", oldStart: 1, oldCount: 1, newStart: 1, newCount: 1 } } }] }),
+    JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), baselines: { "comment-other": { commentId: "comment-other", projectId: "project-1", workspaceId: "workspace-x", cwd: "/tmp", scope: "working", filePath: "a.ts", targetFingerprint: "t", hunkId: "h", hunkFingerprint: "f", hunkChangeId: "c", changedLinesId: "l", oldStart: 1, oldCount: 1, newStart: 1, newCount: 1 } } }] }),
+    // An acceptance needs a completed Agent outcome for the same comment.
+    JSON.stringify({ version: REVIEW_BATCH_VERSION, batches: [{ ...batch("x"), status: "completed", submittedAt: ISO, completedAt: LATER, outcomes: { "comment-x": "stale" }, acceptances: { "comment-x": { commentId: "comment-x", acceptedAt: LATER, targetFingerprint: "t", filePath: "a.ts", hunkId: "h", hunkFingerprint: "f", hunkChangeId: "c", baselineHunkChangeId: "b" } } }] }),
   ];
   for (const document of damagedDocuments) {
     await writeFile(damagedPath, document, "utf8");

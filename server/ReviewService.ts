@@ -22,6 +22,7 @@ import type {
   ListVerificationRunsResult,
   ProcessProjectReviewResult,
   ProcessVerificationResult,
+  ProjectCommentReview,
   ProjectReviewComment,
   ProjectReviewSummary,
   ReviewAnchor,
@@ -50,6 +51,8 @@ import {
   reviewBatchTimelineVersion,
   type ActiveReviewBatch,
   type ReviewBatch,
+  type ReviewBatchBaseline,
+  type ReviewCommentAcceptance,
   type ReviewCommentOutcome,
 } from "../shared/review-batch";
 import {
@@ -59,13 +62,14 @@ import {
   type ReviewWorkspaceIndicators,
   type WorkspaceReviewSummary,
 } from "../shared/review-activity";
-import { canonicalJson, hunkChangeId, hunkContentId, sha256 } from "./util/crypto";
+import { canonicalJson, hunkChangeId, hunkChangedLinesId, hunkContentId, sha256 } from "./util/crypto";
 import {
   buildLineRangeAnchor,
   currentHunkDescriptors,
   ownershipMismatch,
   resolveAnchor,
   type AnchorResolution,
+  type HunkDescriptor,
   type OwnershipConstraints,
 } from "./AnchorEngine";
 import { createMutex, RepoMutexRegistry } from "./util/mutex";
@@ -1744,21 +1748,20 @@ export class ReviewService {
   }
 
   /**
-   * List a project's queued comments and in-flight batches. Completed outcomes
-   * are reconciled against the queue before the summary is returned.
+   * List a project's queued comments and in-flight batches, plus the latest
+   * per-comment review state (Agent outcome and human acceptance).
+   *
+   * Queue loading repairs only HUMAN decisions: a comment is removed only when
+   * the newest ReviewBatch that owns it carries a durable acceptance record and
+   * the previous delete was interrupted. Agent outcomes never remove anything.
    */
   async listProjectReviewComments(
     projectId: string,
     context?: PluginHandlerContext,
   ): Promise<ProjectReviewSummary | null> {
     if (context) await this.reconcileStalledReviewBatches(projectId, context);
+    await this.clearHumanAcceptedProjectReviewComments(projectId);
     const storedBatches = await this.reviewBatchStore.listByProject(projectId);
-    const completedCommentIds = [...new Set(storedBatches
-      .filter((batch) => !isActiveReviewBatch(batch.status))
-      .flatMap((batch) => batch.commentIds.filter((commentId) => batch.outcomes[commentId] === "completed")))];
-    if (completedCommentIds.length > 0) {
-      await this.clearProjectReviewComments(projectId, completedCommentIds);
-    }
     const [file, activeBatches] = await Promise.all([
       this.store.load(),
       this.reviewBatchStore.listActiveByProject(projectId),
@@ -1774,6 +1777,7 @@ export class ReviewService {
       fileCount: new Set(comments.map((comment) => comment.filePath)).size,
       targetCount: new Set(comments.map((comment) => comment.targetFingerprint)).size,
       comments,
+      reviews: this.projectCommentReviews(comments, storedBatches),
       batches: activeBatches.map((batch): ActiveReviewBatch => ({
         id: batch.id,
         workspaceId: batch.workspaceId,
@@ -1783,6 +1787,56 @@ export class ReviewService {
         ...(batch.delivery ? { delivery: batch.delivery } : {}),
       })),
     };
+  }
+
+  /**
+   * The newest ReviewBatch that mentions each queued comment, with its Agent
+   * outcome and the human acceptance, if any. Only the newest batch speaks for
+   * a comment: an older batch's acceptance or completion can neither be
+   * replayed nor accepted after a newer dispatch took the comment over.
+   */
+  private projectCommentReviews(
+    comments: readonly ProjectReviewComment[],
+    batches: readonly ReviewBatch[],
+  ): ProjectCommentReview[] {
+    const queued = new Set(comments.map((comment) => comment.id));
+    const reviews: ProjectCommentReview[] = [];
+    for (const [commentId, batch] of latestBatchesByComment(batches)) {
+      if (!queued.has(commentId)) continue;
+      const outcome = batch.outcomes[commentId];
+      const acceptance = batch.acceptances?.[commentId];
+      reviews.push({
+        commentId,
+        batchId: batch.id,
+        workspaceId: batch.workspaceId,
+        agentId: batch.agentId,
+        status: batch.status,
+        ...(outcome !== undefined ? { outcome } : {}),
+        baseline: batch.baselines?.[commentId] ?? null,
+        ...(acceptance !== undefined ? { acceptedAt: acceptance.acceptedAt } : {}),
+      });
+    }
+    return reviews.sort((left, right) => left.commentId.localeCompare(right.commentId));
+  }
+
+  /**
+   * Idempotent repair of an interrupted post-acceptance cleanup. Re-read the
+   * latest batches while holding the comment-store lock so a newer dispatch
+   * cannot race an old acceptance into deleting its comment.
+   */
+  private async clearHumanAcceptedProjectReviewComments(projectId: string): Promise<number> {
+    return this.store.runExclusive(async () => {
+      const batches = await this.reviewBatchStore.listByProject(projectId);
+      const acceptedIds: string[] = [];
+      for (const [commentId, batch] of latestBatchesByComment(batches)) {
+        if (batch.acceptances?.[commentId] !== undefined) acceptedIds.push(commentId);
+      }
+      if (acceptedIds.length === 0) return 0;
+      const file = await this.store.load();
+      const cleared = this.clearProjectReviewCommentsFromFile(file, projectId, acceptedIds);
+      if (cleared > 0) await this.store.save(file);
+      return cleared;
+    });
   }
 
   private async reconcileStalledReviewBatches(projectId: string, context: PluginHandlerContext): Promise<void> {
@@ -1888,12 +1942,11 @@ export class ReviewService {
   }
 
   /**
-   * Count one project's saved review comments. The count-only sibling of
-   * listProjectReviewComments for the client's project badge: it applies the
-   * same comment predicate (projectId + commented + non-blank body) but never
-   * materializes a comment row, so no comment body leaves the state store.
+   * Count one project's queued review comments without materializing comment
+   * rows. Repair only durable human acceptances before publishing the count.
    */
   async getProjectReviewCommentCount(projectId: string): Promise<{ commentCount: number }> {
+    await this.clearHumanAcceptedProjectReviewComments(projectId);
     const file = await this.store.load();
     return { commentCount: this.countProjectComments(file, projectId) };
   }
@@ -2078,6 +2131,8 @@ export class ReviewService {
     identity: { workspaceId: string; projectId: string; directory: string },
     context: PluginHandlerContext,
   ): Promise<ReviewWorkspaceIndicators> {
+    await this.clearHumanAcceptedProjectReviewComments(identity.projectId);
+
     const [file, batches, runs] = await Promise.all([
       this.store.load(),
       this.reviewBatchStore.list(),
@@ -2245,16 +2300,36 @@ export class ReviewService {
     ]);
   }
 
+  /** Every hunk of one snapshot as an anchor descriptor, in file order. */
+  private snapshotDescriptors(snapshot: ReviewSnapshot): HunkDescriptor[] {
+    return currentHunkDescriptors(
+      snapshot.targetFingerprint,
+      snapshot.files.flatMap((file) =>
+        file.hunks.map((hunk) => ({
+          hunkId: hunk.id,
+          filePath: hunk.filePath,
+          ...(file.oldPath !== undefined ? { oldPath: file.oldPath } : {}),
+          hunkHeader: hunk.header,
+          hunkPatch: hunk.patch,
+        })),
+      ),
+    );
+  }
+
   /**
    * Resolve every selected comment against a fresh snapshot before dispatch.
    * This is read-only: stale or ambiguous anchors fail the whole batch, while
    * unique relocations are reflected only in the prompt payload.
+   *
+   * Each result also carries the dispatch-time BASELINE: the exact hunk change
+   * identity the comment was resolved to. Human acceptance later compares the
+   * current hunk against it, so this is the only moment the baseline is known.
    */
   private async preflightProjectReviewComments(
     comments: readonly ProjectReviewComment[],
     selectedIds: ReadonlySet<string>,
     identity: { projectId: string; workspaceId: string; directory: string },
-  ): Promise<ProjectReviewComment[]> {
+  ): Promise<Array<{ comment: ProjectReviewComment; baseline: ReviewBatchBaseline }>> {
     const state = await this.store.load();
     const currentComments = sortProjectComments(this.projectComments(state, identity.projectId))
       .filter((comment) => selectedIds.has(comment.id));
@@ -2300,7 +2375,7 @@ export class ReviewService {
       targets.set(key, target);
     }
 
-    const preflighted = new Map<string, ProjectReviewComment>();
+    const preflighted = new Map<string, { comment: ProjectReviewComment; baseline: ReviewBatchBaseline }>();
     const constraints: OwnershipConstraints = {
       projectId: identity.projectId,
       workspaceId: identity.workspaceId,
@@ -2317,7 +2392,7 @@ export class ReviewService {
           hunkPatch: hunk.patch,
         })),
       );
-      const descriptors = currentHunkDescriptors(snapshot.targetFingerprint, currentHunks);
+      const descriptors = this.snapshotDescriptors(snapshot);
       const fileViews = await this.loadAnchorFileViews({
         targetFingerprint: snapshot.targetFingerprint,
         currentHunks,
@@ -2346,21 +2421,43 @@ export class ReviewService {
         }
         const descriptor = resolution.descriptor;
         preflighted.set(comment.id, {
-          ...comment,
-          targetFingerprint: snapshot.targetFingerprint,
-          hunkId: descriptor.hunk.hunkId,
-          hunkFingerprint: descriptor.fingerprint,
-          filePath: descriptor.hunk.filePath,
-          hunkHeader: descriptor.hunk.hunkHeader,
-          hunkPatch: descriptor.hunk.hunkPatch,
-          anchor: resolution.anchor ?? entry.anchor ?? {
-            kind: "hunk",
-            filePath: descriptor.hunk.filePath,
+          comment: {
+            ...comment,
+            targetFingerprint: snapshot.targetFingerprint,
             hunkId: descriptor.hunk.hunkId,
             hunkFingerprint: descriptor.fingerprint,
-            contentId: descriptor.contentId,
+            filePath: descriptor.hunk.filePath,
+            hunkHeader: descriptor.hunk.hunkHeader,
+            hunkPatch: descriptor.hunk.hunkPatch,
+            anchor: resolution.anchor ?? entry.anchor ?? {
+              kind: "hunk",
+              filePath: descriptor.hunk.filePath,
+              hunkId: descriptor.hunk.hunkId,
+              hunkFingerprint: descriptor.fingerprint,
+              contentId: descriptor.contentId,
+            },
+            anchorState: resolution.state,
           },
-          anchorState: resolution.state,
+          baseline: {
+            commentId: comment.id,
+            projectId: identity.projectId,
+            workspaceId: identity.workspaceId,
+            cwd: identity.directory,
+            scope: comment.scope,
+            ...(comment.baseRef !== undefined ? { baseRef: comment.baseRef } : {}),
+            ...(comment.headRef !== undefined ? { headRef: comment.headRef } : {}),
+            filePath: descriptor.hunk.filePath,
+            ...(descriptor.hunk.oldPath !== undefined ? { oldPath: descriptor.hunk.oldPath } : {}),
+            targetFingerprint: snapshot.targetFingerprint,
+            hunkId: descriptor.hunk.hunkId,
+            hunkFingerprint: descriptor.fingerprint,
+            hunkChangeId: descriptor.changeId,
+            changedLinesId: hunkChangedLinesId(descriptor.hunk.hunkPatch),
+            oldStart: descriptor.range.oldStart,
+            oldCount: descriptor.range.oldCount,
+            newStart: descriptor.range.newStart,
+            newCount: descriptor.range.newCount,
+          },
         });
       }
     }
@@ -2391,7 +2488,8 @@ export class ReviewService {
 
   /**
    * Submit exactly one workspace's selected comments. Their records remain in
-   * the queue until the matching Agent turn explicitly reports COMPLETED.
+   * the queue until a human reviews the changed block and accepts the Agent's
+   * COMPLETED report; the Agent's outcome alone never removes a comment.
    */
   async processProjectReview(
     input: {
@@ -2416,6 +2514,8 @@ export class ReviewService {
     }
 
 
+    await this.clearHumanAcceptedProjectReviewComments(input.projectId);
+
     const file = await this.store.load();
     let comments = sortProjectComments(this.projectComments(file, input.projectId))
       .filter((comment) => requestedIds.has(comment.id));
@@ -2435,8 +2535,11 @@ export class ReviewService {
       }
     }
     const selectedComments = comments;
-    comments = await this.preflightProjectReviewComments(comments, requestedIds, identity);
-
+    const preflighted = await this.preflightProjectReviewComments(comments, requestedIds, identity);
+    const dispatchedComments = preflighted.map((entry) => entry.comment);
+    const baselines = Object.fromEntries(
+      preflighted.map((entry) => [entry.baseline.commentId, entry.baseline]),
+    );
 
     const batchId = randomUUID();
     const createdAt = new Date().toISOString();
@@ -2447,19 +2550,20 @@ export class ReviewService {
       projectId: input.projectId,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
-      commentIds: comments.map((comment) => comment.id),
+      commentIds: dispatchedComments.map((comment) => comment.id),
       status: "draft",
       outcomes: {},
+      baselines,
       delivery: { messageId, phase: "prepared", attempts: 0, updatedAt: createdAt },
     };
-    const { projectName } = this.projectCommentIdentity(comments);
+    const { projectName } = this.projectCommentIdentity(dispatchedComments);
     const prompt = buildReviewBatchPrompt({
       batchId: batch.id,
       projectId: input.projectId,
       ...(projectName !== undefined ? { projectName } : {}),
       workspaceId: input.workspaceId,
       workspaceCwd: input.workspaceCwd,
-      comments,
+      comments: dispatchedComments,
     });
 
     const currentIdentity = await this.resolveWorkspaceIdentity(input.workspaceId, context);
@@ -2619,6 +2723,239 @@ export class ReviewService {
     }
     if (updated.submittedAt) await this.appendReviewBatchTimeline(updated, context);
     return { batchId: updated.id, released: true };
+  }
+
+  /**
+   * The ONLY path that removes a comment because an Agent reported it fixed.
+   *
+   * The reviewer sends the exact target and change block they are looking at;
+   * the server then re-proves everything from durable state and a fresh
+   * snapshot, and fails closed at every mismatch:
+   *
+   * 1. the named batch is the NEWEST batch that owns the comment (a superseded
+   *    batch can never clear a comment a newer dispatch took over);
+   * 2. the batch is terminal and the Agent's own outcome for the comment is
+   *    COMPLETED — every other outcome leaves the comment queued;
+   * 3. the batch recorded a dispatch-time baseline (older batches did not, so
+   *    their COMPLETED results are not acceptable until re-dispatched);
+   * 4. the original comment id is still the exact queued record with the same
+   *    project/workspace/scope/cwd ownership (an edited comment has a new id);
+   * 5. the client's target fingerprint and hunk id/fingerprint still match a
+   *    fresh snapshot exactly, and that block is in the baseline's file (or its
+   *    rename alias) and covers the baseline's old-side position;
+   * 6. the block's own changed-line identity DIFFERS from the baseline, so an
+   *    unchanged block — or an unrelated hunk elsewhere — proves nothing.
+   *
+   * The acceptance is persisted before the comment is deleted, so an
+   * interrupted cleanup is completed by the idempotent queue-load repair
+   * instead of being re-decided.
+   */
+  async acceptProjectReviewComment(
+    input: {
+      projectId: string;
+      batchId: string;
+      commentId: string;
+      pathFilter?: string;
+      expectedTargetFingerprint: string;
+      expectedFilePath: string;
+      expectedHunkId: string;
+      expectedHunkFingerprint: string;
+    },
+    context: PluginHandlerContext,
+  ): Promise<{ batchId: string; commentId: string; acceptedAt: string; cleared: number }> {
+    const batches = await this.reviewBatchStore.listByProject(input.projectId);
+    const batch = batches.find((entry) => entry.id === input.batchId);
+    if (!batch) throw new Error("The ReviewBatch is no longer stored for this project. Refresh the queue.");
+    if (!batch.commentIds.includes(input.commentId)) {
+      throw new Error("The comment does not belong to this ReviewBatch.");
+    }
+    if (latestBatchesByComment(batches).get(input.commentId)?.id !== batch.id) {
+      throw new Error("A newer ReviewBatch already owns this comment; accept it from that batch instead.");
+    }
+    if (isActiveReviewBatch(batch.status)) {
+      throw new Error("The ReviewBatch is still running; wait for the Agent to finish before accepting comments.");
+    }
+    if (batch.outcomes[input.commentId] !== "completed") {
+      throw new Error("Only a comment the Agent reported COMPLETED can be accepted.");
+    }
+    const baseline = batch.baselines?.[input.commentId];
+    if (!baseline) {
+      throw new Error(
+        "This ReviewBatch recorded no dispatch-time baseline for the comment, so acceptance is unavailable. Dispatch the comment again.",
+      );
+    }
+    const previousAcceptance = batch.acceptances?.[input.commentId];
+    if (previousAcceptance) {
+      const cleared = await this.clearAcceptedProjectReviewComment(
+        input.projectId,
+        batch.id,
+        input.commentId,
+      );
+      return {
+        batchId: batch.id,
+        commentId: input.commentId,
+        acceptedAt: previousAcceptance.acceptedAt,
+        cleared,
+      };
+    }
+
+    const identity = await this.resolveWorkspaceIdentity(batch.workspaceId, context);
+    if (
+      identity.projectId !== batch.projectId ||
+      identity.workspaceId !== baseline.workspaceId ||
+      !(await this.directoriesMatch(identity.directory, baseline.cwd))
+    ) {
+      throw new Error("The batch workspace no longer owns the dispatch directory; refresh Review Deck before accepting.");
+    }
+
+    const file = await this.store.load();
+    const entries = Object.values(file).flat().filter((entry) => entry.id === input.commentId);
+    if (entries.length !== 1) {
+      throw new Error("The comment is no longer queued under its original identity. Refresh the queue.");
+    }
+    const entry = entries[0]!;
+    if (this.projectCommentBody(entry, input.projectId) === null) {
+      throw new Error("The comment is no longer a queued comment of this project.");
+    }
+    if (ownershipMismatch(entry, {
+      projectId: baseline.projectId,
+      workspaceId: baseline.workspaceId,
+      cwd: baseline.cwd,
+      scope: baseline.scope,
+    }) !== null) {
+      throw new Error("The comment no longer belongs to the workspace and review scope its batch was dispatched for.");
+    }
+
+    const request: ReviewRequest = {
+      cwd: identity.directory,
+      scope: baseline.scope,
+      ...(baseline.baseRef !== undefined ? { baseRef: baseline.baseRef } : {}),
+      ...(baseline.headRef !== undefined ? { headRef: baseline.headRef } : {}),
+      ...(input.pathFilter !== undefined ? { filePath: input.pathFilter } : {}),
+    };
+    const snapshot = await this.createSnapshot(request);
+    if (snapshot.targetFingerprint !== input.expectedTargetFingerprint) {
+      throw new Error("The review target changed after this change block was shown. Refresh Review Deck and review it again.");
+    }
+    const descriptor = this.snapshotDescriptors(snapshot)
+      .find((candidate) => candidate.hunk.hunkId === input.expectedHunkId);
+    if (
+      !descriptor ||
+      descriptor.fingerprint !== input.expectedHunkFingerprint ||
+      descriptor.hunk.filePath !== input.expectedFilePath
+    ) {
+      throw new Error("The visible change block no longer matches this target. Refresh Review Deck and retry.");
+    }
+    const baselinePath = baseline.filePath;
+    const visiblePath = descriptor.hunk.filePath;
+    if (
+      baselinePath !== visiblePath &&
+      baselinePath !== descriptor.hunk.oldPath &&
+      baseline.oldPath !== visiblePath
+    ) {
+      throw new Error("The visible change block belongs to a different file than the comment's baseline.");
+    }
+    if (hunkChangedLinesId(descriptor.hunk.hunkPatch) === baseline.changedLinesId) {
+      throw new Error("This change block's own changed lines are unchanged since dispatch; there is nothing to accept yet.");
+    }
+    if (!changeWindowsOverlap(
+      { start: baseline.oldStart, count: baseline.oldCount },
+      { start: descriptor.range.oldStart, count: descriptor.range.oldCount },
+    )) {
+      throw new Error("This change block does not cover the comment's original change. Open the block that was fixed.");
+    }
+
+    const acceptance: ReviewCommentAcceptance = {
+      commentId: input.commentId,
+      acceptedAt: new Date().toISOString(),
+      targetFingerprint: snapshot.targetFingerprint,
+      filePath: visiblePath,
+      hunkId: descriptor.hunk.hunkId,
+      hunkFingerprint: descriptor.fingerprint,
+      hunkChangeId: descriptor.changeId,
+      changedLinesId: hunkChangedLinesId(descriptor.hunk.hunkPatch),
+      baselineHunkChangeId: baseline.hunkChangeId,
+    };
+    return this.store.runExclusive(async () => {
+      // Dispatch also takes the StateStore lock before creating a batch. Repeat
+      // the latest-owner check here so it cannot slip between validation and
+      // deleting the comment.
+      const latestBatches = await this.reviewBatchStore.listByProject(input.projectId);
+      const currentBatch = latestBatches.find((candidate) => candidate.id === batch.id);
+      if (!currentBatch || latestBatchesByComment(latestBatches).get(input.commentId)?.id !== batch.id) {
+        throw new Error("A newer ReviewBatch was dispatched for this comment; the comment remains queued.");
+      }
+      if (
+        isActiveReviewBatch(currentBatch.status) ||
+        currentBatch.outcomes[input.commentId] !== "completed" ||
+        canonicalJson(currentBatch.baselines?.[input.commentId] ?? null) !== canonicalJson(baseline)
+      ) {
+        throw new Error("The ReviewBatch changed while this comment was being reviewed. Refresh Review Deck.");
+      }
+
+      const currentFile = await this.store.load();
+      const currentEntries = Object.values(currentFile).flat().filter((candidate) => candidate.id === input.commentId);
+      if (currentEntries.length !== 1 || this.projectCommentBody(currentEntries[0]!, input.projectId) === null) {
+        throw new Error("The comment changed while it was being reviewed. Refresh Review Deck.");
+      }
+      if (ownershipMismatch(currentEntries[0]!, {
+        projectId: baseline.projectId,
+        workspaceId: baseline.workspaceId,
+        cwd: baseline.cwd,
+        scope: baseline.scope,
+      }) !== null) {
+        throw new Error("The comment's workspace ownership changed while it was being reviewed.");
+      }
+
+      const existingAcceptance = currentBatch.acceptances?.[input.commentId];
+      if (existingAcceptance) {
+        const cleared = this.clearProjectReviewCommentsFromFile(currentFile, input.projectId, [input.commentId]);
+        if (cleared > 0) await this.store.save(currentFile);
+        return {
+          batchId: batch.id,
+          commentId: input.commentId,
+          acceptedAt: existingAcceptance.acceptedAt,
+          cleared,
+        };
+      }
+
+      const updated = await this.reviewBatchStore.update(batch.id, (current) => {
+        if (current.acceptances?.[input.commentId]) return current;
+        if (
+          current.outcomes[input.commentId] !== "completed" ||
+          canonicalJson(current.baselines?.[input.commentId] ?? null) !== canonicalJson(baseline)
+        ) return current;
+        return { ...current, acceptances: { ...current.acceptances, [input.commentId]: acceptance } };
+      });
+      const persisted = updated?.acceptances?.[input.commentId];
+      if (!updated || !persisted) {
+        throw new Error("The ReviewBatch refused the acceptance; the comment remains queued.");
+      }
+      const cleared = this.clearProjectReviewCommentsFromFile(currentFile, input.projectId, [input.commentId]);
+      if (cleared === 0) {
+        throw new Error("The acceptance was recorded, but the original comment is no longer queued.");
+      }
+      await this.store.save(currentFile);
+      return { batchId: batch.id, commentId: input.commentId, acceptedAt: persisted.acceptedAt, cleared };
+    });
+  }
+  private async clearAcceptedProjectReviewComment(
+    projectId: string,
+    batchId: string,
+    commentId: string,
+  ): Promise<number> {
+    return this.store.runExclusive(async () => {
+      const batches = await this.reviewBatchStore.listByProject(projectId);
+      const batch = batches.find((candidate) => candidate.id === batchId);
+      if (
+        !batch?.acceptances?.[commentId] ||
+        latestBatchesByComment(batches).get(commentId)?.id !== batchId
+      ) return 0;
+      const file = await this.store.load();
+      const cleared = this.clearProjectReviewCommentsFromFile(file, projectId, [commentId]);
+      if (cleared > 0) await this.store.save(file);
+      return cleared;
+    });
   }
 
 
@@ -2802,11 +3139,11 @@ export class ReviewService {
       });
       if (!finalized || !updated) continue;
 
-      const completedCommentIds = batch.commentIds.filter((commentId) => updated.outcomes[commentId] === "completed");
+      // The Agent's COMPLETED outcome is a claim, not a human decision. It ends
+      // the batch lifecycle and records the per-comment outcome, but the
+      // comment stays queued: only `acceptProjectReviewComment` (a human looking
+      // at the current change block) may delete it.
       await this.appendReviewBatchTimeline(updated, context);
-      if (completedCommentIds.length > 0) {
-        await this.clearProjectReviewComments(updated.projectId, completedCommentIds);
-      }
     }
   }
   private async appendReviewBatchTimeline(
@@ -2831,35 +3168,38 @@ export class ReviewService {
   }
 
   /**
-   * Remove only the named completed comments. A comment edited while its batch
-   * ran receives a new id and therefore remains queued for the next batch.
+   * Remove only the named comments, by exact original id. Reserved for ids a
+   * durable human acceptance already covers (the acceptance RPC and its
+   * idempotent queue-load repair); an Agent outcome never reaches this method.
+   * A comment edited while its batch ran receives a new id and therefore
+   * remains queued for the next batch.
    */
-  async clearProjectReviewComments(projectId: string, commentIds: readonly string[]): Promise<number> {
-    const completedIds = new Set(commentIds);
-    if (completedIds.size === 0) return 0;
-    return this.store.runExclusive(async () => {
-      const file = await this.store.load();
-      let cleared = 0;
-      for (const [targetFingerprint, entries] of Object.entries(file)) {
-        const next = entries.filter((entry) => {
-          if (
-            entry.projectId !== projectId ||
-            !entry.id ||
-            !completedIds.has(entry.id) ||
-            this.projectCommentBody(entry, projectId) === null
-          ) return true;
-          cleared++;
-          return false;
-        });
-        if (next.length === entries.length) continue;
-        if (next.length === 0) delete file[targetFingerprint];
-        else file[targetFingerprint] = next;
-      }
-      if (cleared === 0) return 0;
-      await this.store.save(file);
-      return cleared;
-    });
+  private clearProjectReviewCommentsFromFile(
+    file: StateFile,
+    projectId: string,
+    commentIds: readonly string[],
+  ): number {
+    const acceptedIds = new Set(commentIds);
+    if (acceptedIds.size === 0) return 0;
+    let cleared = 0;
+    for (const [targetFingerprint, entries] of Object.entries(file)) {
+      const next = entries.filter((entry) => {
+        if (
+          entry.projectId !== projectId ||
+          !entry.id ||
+          !acceptedIds.has(entry.id) ||
+          this.projectCommentBody(entry, projectId) === null
+        ) return true;
+        cleared++;
+        return false;
+      });
+      if (next.length === entries.length) continue;
+      if (next.length === 0) delete file[targetFingerprint];
+      else file[targetFingerprint] = next;
+    }
+    return cleared;
   }
+
 
   async reverseHunk(request: ReviewRequest, expectedTargetFingerprint: string, hunkId: string, expectedHunkFingerprint: string): Promise<{ targetFingerprint: string; removedHunkId: string }> {
     if (request.scope !== "working" && request.scope !== "staged") {
@@ -4469,4 +4809,26 @@ function sortProjectComments(comments: ProjectReviewComment[]): ProjectReviewCom
   return comments.sort(
     (left, right) => left.filePath.localeCompare(right.filePath) || left.savedAt.localeCompare(right.savedAt),
   );
+}
+
+/** The newest stored batch that mentions each comment (store order is oldest first). */
+function latestBatchesByComment(batches: readonly ReviewBatch[]): Map<string, ReviewBatch> {
+  const latest = new Map<string, ReviewBatch>();
+  for (const batch of batches) {
+    for (const commentId of batch.commentIds) latest.set(commentId, batch);
+  }
+  return latest;
+}
+
+/**
+ * Whether two change windows touch the same position. A zero-length window
+ * (a pure insertion or deletion point) is its own single line.
+ */
+function changeWindowsOverlap(
+  left: { start: number; count: number },
+  right: { start: number; count: number },
+): boolean {
+  const leftEnd = left.start + Math.max(left.count, 1) - 1;
+  const rightEnd = right.start + Math.max(right.count, 1) - 1;
+  return left.start <= rightEnd && right.start <= leftEnd;
 }

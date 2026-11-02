@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { ReviewService } from "./server/ReviewService";
 import {
+  acceptProjectReviewComment,
   clearAiReviewCache,
   clearAllReviewStates,
   clearHunkState,
@@ -97,6 +98,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(markWorkspaceReviewResultsRead, async ({ workspaceId }, context) =>
     reviewService.markWorkspaceReviewResultsRead({ workspaceId }, context));
   server.handle(processProjectReview, async (input, context) => reviewService.processProjectReview(input, context));
+  server.handle(acceptProjectReviewComment, async (input, context) =>
+    reviewService.acceptProjectReviewComment(input, context));
   server.handle(releaseUnknownReviewBatch, async (input, context) => reviewService.releaseUnknownReviewBatch(input, context));
   server.handle(rejectHunk, async (input) =>
     reviewService.reverseHunk(input, input.expectedTargetFingerprint, input.hunkId, input.expectedHunkFingerprint),

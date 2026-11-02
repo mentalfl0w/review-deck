@@ -1,5 +1,5 @@
 import type { ProjectReviewComment } from "../shared/review";
-import type { ActiveReviewBatch } from "../shared/review-batch";
+import type { ActiveReviewBatch, ReviewBatchBaseline } from "../shared/review-batch";
 import type { AgentEntry, ProjectReviewWorkspaceGroup } from "./tools";
 import { isAgentIdleForReviewDispatch } from "./agent-registry";
 
@@ -10,6 +10,25 @@ function normalizeWorkspaceCwd(value: string | null | undefined): string | null 
   return normalized.replace(/\/+$/, "");
 }
 export type WorkspaceDirectoryOwner = { workspaceId: string; directory: string };
+
+/** Find the one current diff file that owns a dispatch-time path or rename alias. */
+export function currentPathForReviewBaseline(
+  baseline: Pick<ReviewBatchBaseline, "filePath" | "oldPath">,
+  files: readonly { path: string; oldPath?: string }[],
+): string | null {
+  let currentPath: string | null = null;
+  for (const file of files) {
+    if (
+      file.path !== baseline.filePath &&
+      file.oldPath !== baseline.filePath &&
+      (baseline.oldPath === undefined ||
+        (file.path !== baseline.oldPath && file.oldPath !== baseline.oldPath))
+    ) continue;
+    if (currentPath !== null && currentPath !== file.path) return null;
+    currentPath = file.path;
+  }
+  return currentPath;
+}
 
 /** Whether the currently selected workspace Agent can receive this queue batch. */
 export function canSubmitProjectReviewGroup(group: ProjectReviewWorkspaceGroup): boolean {

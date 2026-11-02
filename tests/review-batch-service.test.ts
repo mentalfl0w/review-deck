@@ -370,17 +370,22 @@ async function run(): Promise<void> {
       "comment-a3": "completed",
     });
     const after = await stateStore.load();
-    assert.equal(after["target-a1"], undefined, "an explicitly completed comment is removed");
+    assert.deepEqual(after["target-a1"]?.map((entry) => entry.id), ["comment-a1"], "an Agent's COMPLETED outcome never removes a comment");
     assert.deepEqual(after["target-a2"]?.map((entry) => entry.id), ["comment-a2"]);
     assert.deepEqual(after["target-a3"]?.map((entry) => entry.id), ["comment-a3-edited"]);
-    const interruptedCleanup = await stateStore.load();
-    interruptedCleanup["target-a1"] = [commentEntry("comment-a1", "workspace-a", workspaceA)];
-    await stateStore.save(interruptedCleanup);
-    // A terminal outcome is durable, so the next queue read repairs a cleanup
-    // interrupted after the batch record committed.
     const afterSummary = await service.listProjectReviewComments(PROJECT_ID);
-    assert.equal(afterSummary?.commentCount, 5, "only completed ids are removed; a newer replacement comment remains");
-    assert.ok(!afterSummary?.comments.some((comment) => comment.id === "comment-a1"));
+    assert.equal(afterSummary?.commentCount, 6, "queue loading keeps every comment until a human accepts it");
+    assert.ok(afterSummary?.comments.some((comment) => comment.id === "comment-a1"));
+    assert.equal(
+      afterSummary?.reviews.find((review) => review.commentId === "comment-a1")?.outcome,
+      "completed",
+      "the queue reports the Agent's claim without acting on it",
+    );
+    assert.equal(
+      afterSummary?.reviews.find((review) => review.commentId === "comment-a1")?.acceptedAt,
+      undefined,
+      "a completed outcome is not a human acceptance",
+    );
     assert.deepEqual(afterSummary?.batches, [], "terminal batches are not reported as in-flight");
     assert.equal(timelineItems.length, 4);
     assert.equal(timelineItems[0]?.id, timelineItems[3]?.id, "final outcomes replace the same timeline item");
@@ -435,7 +440,10 @@ async function run(): Promise<void> {
     const lateAckResult = await lateAckPromise;
     assert.equal(lateAckResult.status, "completed", "a late ACK cannot regress a terminal batch");
     assert.equal(lateAckResult.delivery?.phase, "accepted");
-    assert.ok(!(await stateStore.load())["target-a2"], "only the matching COMPLETED outcome clears this comment");
+    assert.ok(
+      (await stateStore.load())["target-a2"]?.some((entry) => entry.id === "comment-a2"),
+      "only a human acceptance clears this comment, never a COMPLETED outcome",
+    );
     const legacyBatchPath = join(root, "legacy-active-batch.json");
     const legacyBatch: ReviewBatch = {
       id: "legacy-active",
@@ -564,7 +572,7 @@ async function run(): Promise<void> {
     const finalizedB = (await batchStore.listByProject(PROJECT_ID)).find((batch) => batch.id === batchBId);
     assert.equal(finalizedB?.status, "completed", "a late matching turn can replace an orphan failure with its explicit outcome");
     const recoveredAfterLateTurn = await service.listProjectReviewComments(PROJECT_ID, handlerContext);
-    assert.ok(!recoveredAfterLateTurn?.comments.some((comment) => comment.id === "comment-b1"));
+    assert.ok(recoveredAfterLateTurn?.comments.some((comment) => comment.id === "comment-b1"), "a recovered COMPLETED outcome still waits for a human decision");
     const batchBTimeline = timelineItems.filter((item) => item.id === `review-deck-batch:${batchBId}`);
     assert.ok(batchBTimeline.length >= 3);
     const lastBatchBTimelineItem = batchBTimeline[batchBTimeline.length - 1];
@@ -767,7 +775,7 @@ async function run(): Promise<void> {
     const retriedCCompleted = (await batchStore.listByProject(PROJECT_ID)).find((batch) => batch.id === retriedC.id);
     assert.equal(retriedCCompleted?.status, "completed", "a matching message identity can recover when turn_started was missed");
     assert.equal(retriedCCompleted?.delivery?.phase, "accepted");
-    assert.ok(!(await stateStore.load())["target-c1"]);
+    assert.ok((await stateStore.load())["target-c1"]?.some((entry) => entry.id === "comment-c1"), "a completed batch keeps its comments");
     // A single eligible Agent cannot claim a cwd shared by another workspace.
     const legacyEntry: StateEntry = { ...commentEntry("legacy-shared", "workspace-a", workspaceA), workspaceId: undefined };
     const stateAfterSetup = await stateStore.load();

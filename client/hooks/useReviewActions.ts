@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { useRpc } from "@getpaseo/plugin/client";
 import {
+  acceptProjectReviewComment,
   clearAllReviewStates,
   clearHunkState,
   clearReviewState,
@@ -21,6 +22,7 @@ import {
 import type {
   FileCommentDraft,
   Finding,
+  PendingCommentReview,
   ProjectIdentity,
   ReviewDecision,
   ReviewFile,
@@ -96,7 +98,9 @@ export function useReviewActions(params: {
   const clearAllRpc = useRpc(clearAllReviewStates);
   const revertFileRpc = useRpc(revertFile);
   const promoteFindingRpc = useRpc(promoteFindingToQueue);
+  const acceptCommentReviewRpc = useRpc(acceptProjectReviewComment);
   const [revertNotice, setRevertNotice] = useState<string | null>(null);
+  const [acceptingCommentReviewId, setAcceptingCommentReviewId] = useState<string | null>(null);
   const [reanchorBusyIssueId, setReanchorBusyIssueId] = useState<string | null>(null);
   const [reanchorNotice, setReanchorNotice] = useState<string | null>(null);
   const [fileCommentDrafts, setFileCommentDrafts] = useState<Record<string, FileCommentDraft>>({});
@@ -181,6 +185,43 @@ export function useReviewActions(params: {
       setActionError(error instanceof Error ? error.message : String(error));
     }
   }, [baseRef, decisionRpc, effectiveProjectId, headRef, projectIdentity, refresh, refreshProjectComments, reviewCwd, scope, selected, selectedFileComments, selectedWorkspaceId, snapshot]);
+  /**
+   * Human acceptance of an Agent-reported completion, from the change block on
+   * screen. The server re-snapshots and refuses unless this exact block still
+   * matches and its own changed lines differ from the dispatch-time baseline;
+   * every refusal leaves the comment queued, so the only local effect is a
+   * re-read of the queue and the saved decisions after a success.
+   */
+  const acceptCommentReview = useCallback(async (review: PendingCommentReview) => {
+    if (!reviewCwd || !snapshot || !selected || !effectiveProjectId) return;
+    setAcceptingCommentReviewId(review.commentId);
+    setActionError(null);
+    setCommentNotice(null);
+    try {
+      await acceptCommentReviewRpc({
+        projectId: effectiveProjectId,
+        batchId: review.batchId,
+        commentId: review.commentId,
+        pathFilter: filePath.trim() || undefined,
+        expectedTargetFingerprint: snapshot.targetFingerprint,
+        // The CURRENT path: a renamed file's block is proven against its own
+        // current path, and the server relates it to the baseline's alias.
+        expectedFilePath: selected.filePath,
+        expectedHunkId: selected.id,
+        expectedHunkFingerprint: selected.fingerprint,
+      });
+      setCommentNotice(t("acceptCommentReviewDone"));
+      void refreshProjectComments();
+      // The accepted comment's stored record is gone: re-read decisions so the
+      // dock and the navigator stop offering it.
+      void refresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAcceptingCommentReviewId(null);
+    }
+  }, [acceptCommentReviewRpc, effectiveProjectId, filePath, refresh, refreshProjectComments, reviewCwd, selected, snapshot, t]);
+
   const promoteFinding = useCallback(async (
     finding: Finding | ActionableReviewFinding,
     comment: string,
@@ -615,6 +656,8 @@ export function useReviewActions(params: {
     commentAnchorMoveArmed,
     currentHunkHasComment,
     markReviewed,
+    acceptCommentReview,
+    acceptingCommentReviewId,
     promoteFinding,
     markFileReviewed,
     revertFileReview,

@@ -1,6 +1,6 @@
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import type { AnchorState, ProjectReviewComment, ReviewAnchor, ReviewScope, ReviewSnapshot } from "../shared/review";
-import type { ActiveReviewBatch } from "../shared/review-batch";
+import type { ActiveReviewBatch, ReviewBatchBaseline, ReviewCommentOutcome } from "../shared/review-batch";
 import type { StringKey } from "./i18n";
 
 export type SelectedHunk = ReviewSnapshot["files"][number]["hunks"][number];
@@ -133,6 +133,15 @@ export const anchorStateBadgeTextKeys: Record<AnchorState,
   stale: "anchorStateBadgeTextStale",
 };
 
+/** Queue label of one Agent outcome: COMPLETED reads as pending human work,
+ * every other outcome reads as the Agent's own report. */
+export const commentReviewOutcomeLabelKeys: Record<ReviewCommentOutcome, StringKey> = {
+  completed: "commentReviewAwaitingAcceptance",
+  stale: "commentReviewOutcomeStale",
+  failed: "commentReviewOutcomeFailed",
+  unresolved: "commentReviewOutcomeUnresolved",
+};
+
 export const severityOrder: Severity[] = [
   "critical",
   "high",
@@ -175,6 +184,19 @@ export type ProjectCommentsByTarget = Array<{
   targetFingerprint: string;
   files: Array<{ filePath: string; comments: ProjectReviewComment[] }>;
 }>;
+
+/**
+ * One comment whose Agent reported COMPLETED and which no human accepted yet.
+ * It carries the dispatch-time baseline, so the change-block card can decide
+ * whether the block on screen is the one the comment was resolved to (and the
+ * server re-proves the same thing before anything is deleted).
+ */
+export type PendingCommentReview = {
+  commentId: string;
+  batchId: string;
+  comment: string;
+  baseline: ReviewBatchBaseline;
+};
 
 export type ProjectReviewWorkspaceGroup = {
   key: string;

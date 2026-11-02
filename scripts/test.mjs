@@ -51,6 +51,7 @@ await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests
 await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/anchor-engine.test.js"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/ai-review-service.test.js"]);
 await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/review-batch-service.test.js"]);
+await run(process.execPath, ["node_modules/.cache/review-deck-anchor-tests/tests/review-comment-acceptance.test.js"]);
 const outputDirectory = await mkdtemp(join(tmpdir(), "review-deck-tooltip-"));
 try {
   await run(process.execPath, [
